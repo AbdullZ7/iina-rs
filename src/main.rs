@@ -795,6 +795,11 @@ impl App {
                 g("video-target-params/primaries"), g("video-target-params/gamma"), g("current-vo"), g("gpu-api")
             );
             eprintln!(
+                "[audio] {} {}ch {}  ->  ao={} out={}ch {} Hz",
+                g("audio-codec-name"), g("audio-params/channel-count"), g("audio-params/hr-channels"),
+                g("current-ao"), g("audio-out-params/channel-count"), g("audio-out-params/samplerate")
+            );
+            eprintln!(
                 "[stats] frames={} t={} hwdec={} vo-drop={} dec-drop={} delayed={} vf-fps={} display-fps={} size={}x{}",
                 std::mem::take(&mut self.frames), g("time-pos"), g("hwdec-current"), g("frame-drop-count"), g("decoder-frame-drop-count"),
                 g("vo-delayed-frame-count"), g("estimated-vf-fps"), g("display-fps"), size.width, size.height
