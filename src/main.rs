@@ -285,6 +285,13 @@ impl App {
             use glow::HasContext;
             let gl = egui.painter.gl();
             eprintln!("[gl] {} / {}", unsafe { gl.get_parameter_string(glow::VENDOR) }, unsafe { gl.get_parameter_string(glow::RENDERER) });
+            let ext = gl.supported_extensions();
+            for e in ["GL_EXT_memory_object", "GL_EXT_memory_object_win32", "GL_EXT_semaphore", "GL_EXT_semaphore_win32", "GL_ARB_color_buffer_float"] {
+                eprintln!("[gl] {e}: {}", ext.contains(e));
+            }
+            for f in [c"wglDXOpenDeviceNV", c"wglDXRegisterObjectNV", c"wglDXLockObjectsNV"] {
+                eprintln!("[gl] {}: {}", f.to_string_lossy(), !display.get_proc_address(f).is_null());
+            }
         }
         self.gfx = Some(Gfx { window, surface, context, egui });
         if self.player.fullscreen {
