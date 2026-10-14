@@ -4,10 +4,14 @@
 //! Video is rendered by libmpv's OpenGL render API into the window's default
 //! framebuffer; the egui overlay (controller, sidebar, menus) is drawn on top.
 
+mod assoc;
+mod history;
+mod instance;
 mod keys;
 mod mpv;
 mod settings;
 mod state;
+mod subtitles;
 mod thumbs;
 mod ui;
 
@@ -33,11 +37,13 @@ use winit::window::{Fullscreen, Icon, Window, WindowAttributes, WindowLevel};
 
 const SUB_EXTS: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "idx", "sup", "smi", "lrc"];
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum UserEvent {
     MpvEvents,
     MpvRender,
     ThumbsReady,
+    /// Files handed over by a second instance.
+    OpenPaths(Vec<String>),
     Repaint(Duration),
 }
 
@@ -88,6 +94,10 @@ struct App {
     siblings_for: Option<String>,
     /// Pending single-click pause (delayed so a double click can cancel it).
     click_pause_at: Option<Instant>,
+    history: history::History,
+    /// Last known (path, position, duration) of the current file, for history.
+    last_pos: Option<(String, f64, f64)>,
+    debug_cmds_done: bool,
 }
 
 fn config_dir() -> PathBuf {
@@ -147,6 +157,13 @@ impl App {
         });
 
         let user_conf = std::fs::read_to_string(config_dir.join("input.conf")).ok();
+        let config_dir_for_history = config_dir.clone();
+        if settings.single_instance {
+            let p = proxy.clone();
+            instance::listen(&config_dir, move |args| {
+                let _ = p.send_event(UserEvent::OpenPaths(args));
+            });
+        }
         Ok(Self {
             proxy,
             mpv,
@@ -175,6 +192,9 @@ impl App {
             thumbs: None,
             siblings_for: None,
             click_pause_at: None,
+            history: history::History::load(&config_dir_for_history),
+            last_pos: None,
+            debug_cmds_done: false,
         })
     }
 
@@ -260,11 +280,10 @@ impl App {
         if let Ok(panel) = std::env::var("IINA_RS_PANEL") {
             self.run_app_command(&format!("{panel}-panel"));
         }
-        // Debug aid: IINA_RS_CMD="inspector;preferences" runs app commands at startup.
-        if let Ok(cmds) = std::env::var("IINA_RS_CMD") {
-            for c in cmds.split(';').filter(|c| !c.is_empty()) {
-                self.run_app_command(c);
-            }
+        // Debug aid: IINA_RS_CMD="inspector;preferences" runs app commands once
+        // the first file has loaded (or right away when nothing is opened).
+        if self.pending_open.is_empty() {
+            self.run_debug_cmds();
         }
         let args = std::mem::take(&mut self.pending_open);
         self.open_many(args);
@@ -386,13 +405,47 @@ impl App {
             "reveal" => reveal(arg),
             "about" => self.ui.show_about = true,
             "inspector" => self.ui.show_inspector = !self.ui.show_inspector,
+            "history" => self.ui.show_history = !self.ui.show_history,
+            "history-remove" => self.history.remove(arg),
+            "history-clear" => self.history.clear(),
+            "find-online-subs" => self.open_subtitle_search(),
+            "subs-search" => {
+                let p = self.proxy.clone();
+                subtitles::start_search(self.ui.subs.clone(), self.ui.settings.opensubtitles_key.trim().to_string(), move || {
+                    let _ = p.send_event(UserEvent::MpvRender);
+                });
+            }
+            "subs-download" => {
+                if let Ok(id) = arg.parse::<u64>() {
+                    let p = self.proxy.clone();
+                    let dest = self.config_dir.join("subtitles");
+                    subtitles::start_download(self.ui.subs.clone(), self.ui.settings.opensubtitles_key.trim().to_string(), id, dest, move || {
+                        let _ = p.send_event(UserEvent::MpvRender);
+                    });
+                }
+            }
+            "crop" => self.apply_crop(arg),
+            "assoc-register" => {
+                self.ui.assoc_status = match assoc::register(VIDEO_AUDIO_EXTS) {
+                    Ok(()) => "Registered. Pick IINA-RS under “Open with”, or set it as default in Default apps.".into(),
+                    Err(e) => format!("Failed: {e}"),
+                };
+            }
+            "assoc-unregister" => {
+                self.ui.assoc_status = match assoc::unregister(VIDEO_AUDIO_EXTS) {
+                    Ok(()) => "Removed IINA-RS from “Open with”.".into(),
+                    Err(e) => format!("Failed: {e}"),
+                };
+            }
+            "open-default-apps" => assoc::open_default_apps_settings(),
+            "open-config-dir" => open_folder(&self.config_dir),
             "preferences" => self.ui.show_prefs = true,
             "jump-to" => {
                 if !self.player.idle {
                     self.ui.jump_input = Some(String::new());
                 }
             }
-            "find-online-subs" | "live-text" => {
+            "live-text" => {
                 self.mpv.command(&["show-text", "Not available on this platform yet"]);
             }
             other => eprintln!("unknown app command: {other}"),
@@ -542,13 +595,29 @@ impl App {
                 Event::FileLoaded => {
                     self.add_siblings();
                     self.start_thumbnails();
+                    let path = self.mpv.get_string("path").unwrap_or_default();
+                    let title = self.mpv.get_string("media-title").unwrap_or_default();
+                    let dur = self.mpv.get_string("duration").and_then(|d| d.parse().ok()).unwrap_or(0.0);
+                    if !path.is_empty() {
+                        self.history.opened(&path, &title, dur);
+                    }
+                    self.player.crop_label = "None".into();
                 }
+                Event::EndFile => self.flush_history(),
+                Event::PlaybackRestart if !self.debug_cmds_done => self.run_debug_cmds(),
                 Event::VideoReconfig => {
                     if self.resize_on_video && self.fit_to_video(1.0) {
                         self.resize_on_video = false;
                     }
                 }
                 Event::Property(name, value) => {
+                    if name == "time-pos" {
+                        if let mpv::PropValue::Double(t) = value {
+                            if !self.player.path.is_empty() {
+                                self.last_pos = Some((self.player.path.clone(), t, self.player.duration));
+                            }
+                        }
+                    }
                     let before = (self.player.fullscreen, self.player.ontop, self.player.window_scale);
                     self.player.apply(&name, &value);
                     match name.as_str() {
@@ -652,7 +721,7 @@ impl App {
         let t_mpv = t0.elapsed();
 
         let window = gfx.window.clone();
-        let (player, ui_state, mpv) = (&self.player, &mut self.ui, &self.mpv);
+        let (player, ui_state, mpv, history) = (&self.player, &mut self.ui, &self.mpv, &self.history);
         // Debug aid: IINA_RS_HOVER=0.4 hovers the seek bar at 40% (for snapshots).
         if let (Some(f), Some(r)) = (std::env::var("IINA_RS_HOVER").ok().and_then(|v| v.parse::<f32>().ok()), ui_state.seek_bar_rect) {
             ui_state.last_activity = Instant::now();
@@ -663,7 +732,7 @@ impl App {
         let guard = thumbs.as_ref().map(|t| t.lock().unwrap());
         let mut cmds = Vec::new();
         gfx.egui.run(&window, |ctx| {
-            cmds = ui::draw(ctx, ui_state, player, mpv, guard.as_deref());
+            cmds = ui::draw(ctx, ui_state, player, mpv, guard.as_deref(), history);
         });
         drop(guard);
         gfx.egui.paint(&window);
@@ -713,6 +782,10 @@ impl App {
         for c in cmds {
             self.run_app_command(&c);
         }
+        let ready: Vec<PathBuf> = std::mem::take(&mut self.ui.subs.lock().unwrap().ready);
+        for sub in ready {
+            self.mpv.command(&["sub-add", &sub.to_string_lossy(), "select"]);
+        }
         if self.ui.settings_dirty {
             self.ui.settings_dirty = false;
             self.apply_settings();
@@ -720,6 +793,66 @@ impl App {
         if self.snapshot.is_some() {
             window.request_redraw();
         }
+    }
+
+    fn run_debug_cmds(&mut self) {
+        if std::mem::replace(&mut self.debug_cmds_done, true) {
+            return;
+        }
+        if let Ok(cmds) = std::env::var("IINA_RS_CMD") {
+            for c in cmds.split(';').filter(|c| !c.is_empty()) {
+                self.run_app_command(c);
+            }
+        }
+    }
+
+    fn flush_history(&mut self) {
+        if let Some((path, pos, dur)) = self.last_pos.take() {
+            self.history.update_position(&path, pos, dur);
+            self.history.save();
+        }
+    }
+
+    fn open_subtitle_search(&mut self) {
+        if self.player.idle {
+            return;
+        }
+        let path = self.player.path.clone();
+        // Search text: file name without extension, separators as spaces.
+        let stem = Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let query: String = stem.chars().map(|c| if "._[]()".contains(c) { ' ' } else { c }).collect();
+        {
+            let mut s = self.ui.subs.lock().unwrap();
+            if s.media_path != path {
+                s.results.clear();
+                s.status.clear();
+            }
+            s.media_path = path;
+            s.query = query.split_whitespace().collect::<Vec<_>>().join(" ");
+            s.languages = self.ui.settings.sub_languages.clone();
+        }
+        self.ui.show_subs = true;
+    }
+
+    /// Crops the video to the aspect ratio in `arg` ("<ratio> <label>" or "none None").
+    fn apply_crop(&mut self, arg: &str) {
+        let (ratio, label) = arg.split_once(' ').unwrap_or((arg, arg));
+        if ratio == "none" {
+            self.mpv.set_string("video-crop", "");
+            self.player.crop_label = "None".into();
+            return;
+        }
+        let (Some(w), Some(h), Some(r)) = (
+            self.mpv.get_string("video-params/w").and_then(|s| s.parse::<f64>().ok()),
+            self.mpv.get_string("video-params/h").and_then(|s| s.parse::<f64>().ok()),
+            ratio.parse::<f64>().ok(),
+        ) else {
+            return;
+        };
+        let (cw, ch) = if w / h > r { ((h * r).round(), h) } else { (w, (w / r).round()) };
+        let (x, y) = (((w - cw) / 2.0).round(), ((h - ch) / 2.0).round());
+        self.mpv.set_string("video-crop", &format!("{}x{}+{}+{}", cw as i64, ch as i64, x as i64, y as i64));
+        self.player.crop_label = label.to_string();
     }
 
     fn apply_settings(&mut self) {
@@ -867,6 +1000,13 @@ fn save_snapshot(gl: &glow::Context, size: PhysicalSize<u32>, path: &str) {
     }
 }
 
+fn open_folder(dir: &Path) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+}
+
 fn reveal(path: &str) {
     if path.is_empty() || path.contains("://") {
         return;
@@ -893,6 +1033,15 @@ impl ApplicationHandler<UserEvent> for App {
         match ev {
             UserEvent::MpvEvents => self.handle_mpv_events(el),
             UserEvent::MpvRender | UserEvent::ThumbsReady => self.redraw(),
+            UserEvent::OpenPaths(paths) => {
+                if !paths.is_empty() {
+                    self.open_many(paths);
+                }
+                if let Some(w) = self.window() {
+                    w.set_minimized(false);
+                    w.focus_window();
+                }
+            }
             UserEvent::Repaint(delay) => {
                 if delay.is_zero() {
                     self.redraw();
@@ -1060,6 +1209,10 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
+        self.flush_history();
+        if self.ui.settings.single_instance {
+            instance::release(&self.config_dir);
+        }
         // The render context must be freed while the GL context is current.
         self.mpv.free_render_context();
         if let Some(mut g) = self.gfx.take() {
@@ -1082,6 +1235,25 @@ fn main() {
             }
         } else {
             args.push(a);
+        }
+    }
+    // Hand files to an already running IINA-RS (same window), like IINA does.
+    let cfg = config_dir();
+    if Settings::load(&cfg).single_instance && std::env::var_os("IINA_RS_NEW_INSTANCE").is_none() && mpv_opts.is_empty() {
+        let abs: Vec<String> = args
+            .iter()
+            .map(|a| {
+                if a.contains("://") {
+                    a.clone()
+                } else {
+                    std::fs::canonicalize(a)
+                        .map(|p| p.to_string_lossy().trim_start_matches(r"\\?\").to_string())
+                        .unwrap_or_else(|_| a.clone())
+                }
+            })
+            .collect();
+        if instance::forward(&cfg, &abs) {
+            return;
         }
     }
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");

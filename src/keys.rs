@@ -16,6 +16,7 @@ const DESKTOP_EXTRAS: &str = "
 #@iina Meta+w close-file
 #@iina Meta+i inspector
 #@iina Meta+j jump-to
+#@iina Meta+h history
 #@iina Meta+, preferences
 Meta+q quit
 #@iina F11 toggle-fullscreen

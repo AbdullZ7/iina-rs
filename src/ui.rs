@@ -1,8 +1,10 @@
 //! egui overlay that mimics IINA's floating on-screen controller, sidebar
 //! (playlist / chapters / quick settings) and welcome window.
 
+use crate::history::{self, History};
 use crate::mpv::Mpv;
 use crate::settings::Settings;
+use crate::subtitles;
 use crate::state::{Player, Track};
 use crate::thumbs::Thumbnails;
 use std::collections::HashMap;
@@ -44,6 +46,12 @@ pub struct UiState {
     pub eq: [f32; 10],
     /// Where the seek bar was last drawn (used by the debug hover aid).
     pub seek_bar_rect: Option<Rect>,
+    pub show_history: bool,
+    pub history_filter: String,
+    pub show_subs: bool,
+    pub subs: subtitles::Shared,
+    /// Result message of the last file-association action.
+    pub assoc_status: String,
     thumb_path: String,
     thumb_tex: HashMap<usize, egui::TextureHandle>,
 }
@@ -70,6 +78,11 @@ impl UiState {
             jump_input: None,
             eq: [0.0; 10],
             seek_bar_rect: None,
+            show_history: false,
+            history_filter: String::new(),
+            show_subs: false,
+            subs: Default::default(),
+            assoc_status: String::new(),
             thumb_path: String::new(),
             thumb_tex: HashMap::new(),
         }
@@ -432,7 +445,7 @@ fn seek_preview(ctx: &egui::Context, st: &mut UiState, pl: &Player, thumbs: Opti
 
 /// Draws the whole overlay. Returns app-level commands (same names as the
 /// `#@iina` bindings) to be executed by the window owner.
-pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Option<&Thumbnails>) -> Vec<String> {
+pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Option<&Thumbnails>, hist: &History) -> Vec<String> {
     let mut cmds = Vec::new();
     let now = Instant::now();
     let hide_after = Duration::from_secs_f32(ui_state.settings.osc_hide_secs.max(0.5));
@@ -467,7 +480,9 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
     url_dialog(ctx, ui_state, mpv);
     jump_dialog(ctx, ui_state, pl, mpv);
     inspector(ctx, ui_state, pl, mpv);
-    preferences(ctx, ui_state);
+    preferences(ctx, ui_state, &mut cmds);
+    history_window(ctx, ui_state, hist, &mut cmds);
+    subtitle_search(ctx, ui_state, &mut cmds);
     about(ctx, ui_state);
 
     ui_state.pointer_over_ui = ctx.is_pointer_over_area();
@@ -771,7 +786,7 @@ fn sidebar(ctx: &egui::Context, st: &mut UiState, tab: Tab, pl: &Player, mpv: &M
                         }
                     }
                 }
-                Tab::Video => video_tab(ui, pl, mpv),
+                Tab::Video => video_tab(ui, pl, mpv, cmds),
                 Tab::Audio => audio_tab(ui, st, pl, mpv, cmds),
                 Tab::Subtitles => {
                     ui.label(RichText::new("Subtitle track").strong());
@@ -853,7 +868,7 @@ fn playlist_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
     }
 }
 
-fn video_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv) {
+fn video_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
     ui.label(RichText::new("Video track").strong());
     let tracks: Vec<&Track> = pl.tracks.iter().filter(|t| t.kind == "video").collect();
     let vid = pl.vid.clone();
@@ -874,6 +889,15 @@ fn video_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv) {
             let sel = pl.aspect == val || (val == "no" && (pl.aspect.is_empty() || pl.aspect.starts_with('-')));
             if ui.selectable_label(sel, label).clicked() {
                 mpv.set_string("video-aspect-override", val);
+            }
+        }
+    });
+    ui.label(RichText::new("Crop").color(FG_DIM));
+    ui.horizontal_wrapped(|ui| {
+        for (label, val) in [("None", "none"), ("4:3", "1.3333"), ("16:9", "1.7778"), ("21:9", "2.3333"), ("2.35:1", "2.35"), ("1:1", "1")] {
+            if ui.selectable_label(pl.crop_label == label, label).clicked() {
+                // The app computes the crop rectangle from the video size.
+                cmds.push(format!("crop {val} {label}"));
             }
         }
     });
@@ -992,6 +1016,7 @@ fn context_menu(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut V
                 if !pl.idle {
                     item(ui, if pl.pause { "Play" } else { "Pause" }, "Space", "mpv cycle pause");
                     item(ui, "Jump to…", "Ctrl+J", "jump-to");
+                    item(ui, "Find Online Subtitles…", "Ctrl+Shift+D", "find-online-subs");
                     item(ui, "Take Screenshot", "Ctrl+S", "mpv screenshot");
                     item(ui, "Stop", "Ctrl+W", "close-file");
                     ui.separator();
@@ -1011,6 +1036,7 @@ fn context_menu(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut V
                 }
                 ui.separator();
                 item(ui, "Inspector", "Ctrl+I", "inspector");
+                item(ui, "Playback History", "Ctrl+H", "history");
                 item(ui, "Preferences…", "Ctrl+,", "preferences");
                 item(ui, "About IINA-RS", "", "about");
                 item(ui, "Quit", "Ctrl+Q", "mpv quit");
@@ -1154,16 +1180,19 @@ fn inspector(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv) {
     st.show_inspector = open;
 }
 
-fn preferences(ctx: &egui::Context, st: &mut UiState) {
+fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
     if !st.show_prefs {
         return;
     }
     let mut open = true;
     let before = st.settings.clone();
+    let assoc_status = st.assoc_status.clone();
     egui::Window::new("Preferences")
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
+        .vscroll(true)
+        .max_height((ctx.screen_rect().height() - 90.0).max(200.0))
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
         .show(ctx, |ui| {
             let s = &mut st.settings;
@@ -1171,6 +1200,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState) {
             ui.checkbox(&mut s.resume_playback, "Resume last playback position");
             ui.checkbox(&mut s.auto_add_folder, "Add files in the same folder to the playlist");
             ui.checkbox(&mut s.resize_to_video, "Resize window to video size when opening a file");
+            ui.checkbox(&mut s.single_instance, "Open files in the running window (single instance)");
             ui.add_space(6.0);
             ui.label(RichText::new("UI").strong());
             ui.checkbox(&mut s.thumbnails, "Show thumbnail preview on the seek bar");
@@ -1198,7 +1228,39 @@ fn preferences(ctx: &egui::Context, st: &mut UiState) {
                 }
             });
             ui.add_space(6.0);
-            ui.label(RichText::new("Custom key bindings: input.conf, mpv options: mpv.conf in the settings folder.").size(11.0).color(FG_DIM));
+            ui.label(RichText::new("Online subtitles (OpenSubtitles.com)").strong());
+            ui.horizontal(|ui| {
+                ui.label("API key");
+                ui.add(egui::TextEdit::singleline(&mut s.opensubtitles_key).password(true).desired_width(220.0));
+                ui.hyperlink_to("Get a key", "https://www.opensubtitles.com/consumers");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Languages");
+                ui.add(egui::TextEdit::singleline(&mut s.sub_languages).desired_width(120.0).hint_text("ar,en"));
+            });
+            ui.add_space(6.0);
+            ui.label(RichText::new("System").strong());
+            ui.horizontal(|ui| {
+                if cfg!(windows) {
+                    if ui.button("Add to “Open with”").on_hover_text("Registers IINA-RS for video/audio files for your user account").clicked() {
+                        cmds.push("assoc-register".into());
+                    }
+                    if ui.button("Remove").clicked() {
+                        cmds.push("assoc-unregister".into());
+                    }
+                    if ui.button("Default apps…").clicked() {
+                        cmds.push("open-default-apps".into());
+                    }
+                }
+                if ui.button("Open settings folder").clicked() {
+                    cmds.push("open-config-dir".into());
+                }
+            });
+            if !assoc_status.is_empty() {
+                ui.label(RichText::new(&assoc_status).size(11.0).color(FG_DIM));
+            }
+            ui.add_space(6.0);
+            ui.label(RichText::new("Settings folder: input.conf (key bindings), mpv.conf (mpv options), scripts/ (mpv Lua/JS scripts).").size(11.0).color(FG_DIM));
         });
     if st.settings != before {
         st.settings_dirty = true;
@@ -1227,4 +1289,133 @@ fn about(ctx: &egui::Context, st: &mut UiState) {
             });
         });
     st.show_about = open;
+}
+
+fn history_window(ctx: &egui::Context, st: &mut UiState, hist: &History, cmds: &mut Vec<String>) {
+    if !st.show_history {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("Playback History")
+        .open(&mut open)
+        .default_size(vec2(560.0, 420.0))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut st.history_filter).hint_text("Search…").desired_width(260.0));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Clear History").clicked() {
+                        cmds.push("history-clear".into());
+                    }
+                });
+            });
+            ui.separator();
+            let filter = st.history_filter.to_lowercase();
+            let rows: Vec<&history::Entry> = hist
+                .entries
+                .iter()
+                .filter(|e| filter.is_empty() || e.title.to_lowercase().contains(&filter) || e.path.to_lowercase().contains(&filter))
+                .collect();
+            if rows.is_empty() {
+                ui.label(RichText::new("No history yet.").color(FG_DIM));
+            }
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                for e in rows {
+                    let missing = !e.path.contains("://") && !std::path::Path::new(&e.path).exists();
+                    ui.horizontal(|ui| {
+                        // Progress ring-ish bar, like IINA's history list.
+                        let (r, _) = ui.allocate_exact_size(vec2(36.0, 6.0), Sense::hover());
+                        ui.painter().rect_filled(r, 3.0, TRACK_BG);
+                        ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width() * e.progress(), r.height())), 3.0, FG);
+                        let title = if e.title.is_empty() { file_name(&e.path) } else { e.title.clone() };
+                        let text = RichText::new(title).color(if missing { FG_DIM } else { FG });
+                        let resp = ui.add(egui::Button::new(text).frame(false).truncate()).on_hover_text(&e.path);
+                        if resp.double_clicked() || resp.clicked() {
+                            cmds.push(format!("open-path {}", e.path));
+                        }
+                        resp.context_menu(|ui| {
+                            if ui.button("Play").clicked() {
+                                cmds.push(format!("open-path {}", e.path));
+                                ui.close();
+                            }
+                            if ui.button("Show in Folder").clicked() {
+                                cmds.push(format!("reveal {}", e.path));
+                                ui.close();
+                            }
+                            if ui.button("Remove from History").clicked() {
+                                cmds.push(format!("history-remove {}", e.path));
+                                ui.close();
+                            }
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(history::ago(e.last_played)).size(11.0).color(FG_DIM));
+                            if e.duration > 0.0 {
+                                ui.label(RichText::new(format!("{} / {}", fmt_time(e.position), fmt_time(e.duration))).monospace().size(11.0).color(FG_DIM));
+                            }
+                        });
+                    });
+                }
+            });
+        });
+    st.show_history = open;
+}
+
+fn subtitle_search(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
+    if !st.show_subs {
+        return;
+    }
+    let mut open = true;
+    let no_key = st.settings.opensubtitles_key.trim().is_empty();
+    let shared = st.subs.clone();
+    let mut s = shared.lock().unwrap();
+    egui::Window::new("Find Online Subtitles")
+        .open(&mut open)
+        .default_size(vec2(620.0, 420.0))
+        .show(ctx, |ui| {
+            if no_key {
+                ui.label(RichText::new("An OpenSubtitles.com API key is required. Create a free account and key, then paste it in Preferences.").color(Color32::from_rgb(255, 200, 120)));
+                ui.horizontal(|ui| {
+                    ui.hyperlink_to("Get an API key", "https://www.opensubtitles.com/consumers");
+                    if ui.button("Open Preferences").clicked() {
+                        cmds.push("preferences".into());
+                    }
+                });
+                ui.separator();
+            }
+            ui.horizontal(|ui| {
+                ui.label("Title");
+                let r = ui.add(egui::TextEdit::singleline(&mut s.query).desired_width(280.0));
+                ui.label("Languages");
+                ui.add(egui::TextEdit::singleline(&mut s.languages).desired_width(70.0));
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.add_enabled(!s.busy && !no_key, egui::Button::new("Search")).clicked() || enter) && !s.busy && !no_key {
+                    cmds.push("subs-search".into());
+                }
+            });
+            ui.label(RichText::new(&s.status).size(11.5).color(FG_DIM));
+            ui.separator();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                egui::Grid::new("subs-results").striped(true).num_columns(4).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
+                    for r in s.results.clone() {
+                        ui.label(RichText::new(r.language.to_uppercase()).monospace());
+                        let name = if r.release.is_empty() { r.file_name.clone() } else { r.release.clone() };
+                        let mut label = RichText::new(name);
+                        if r.hash_match {
+                            label = label.color(Color32::from_rgb(140, 220, 140));
+                        }
+                        ui.add(egui::Label::new(label).truncate()).on_hover_text(if r.hash_match {
+                            "Matched by file hash: made for this exact release"
+                        } else {
+                            "Matched by name"
+                        });
+                        ui.label(RichText::new(format!("⬇ {}", r.downloads)).size(11.0).color(FG_DIM));
+                        if ui.add_enabled(!s.busy, egui::Button::new("Download")).clicked() {
+                            cmds.push(format!("subs-download {}", r.file_id));
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+    drop(s);
+    st.show_subs = open;
 }

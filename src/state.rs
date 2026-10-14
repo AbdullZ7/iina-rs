@@ -74,6 +74,8 @@ pub struct Player {
     pub saturation: i64,
     pub gamma: i64,
     pub hue: i64,
+    /// Label of the crop preset in use ("None" when not cropped).
+    pub crop_label: String,
 }
 
 impl Default for Player {
@@ -120,6 +122,7 @@ impl Default for Player {
             saturation: 0,
             gamma: 0,
             hue: 0,
+            crop_label: "None".into(),
         }
     }
 }

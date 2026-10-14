@@ -23,6 +23,12 @@ pub struct Settings {
     pub resize_to_video: bool,
     pub screenshot_dir: String,
     pub volume: f64,
+    /// Open files in the running instance instead of a new window.
+    pub single_instance: bool,
+    /// OpenSubtitles.com API key (https://www.opensubtitles.com/consumers).
+    pub opensubtitles_key: String,
+    /// Preferred subtitle languages for online search, e.g. "ar,en".
+    pub sub_languages: String,
 }
 
 impl Default for Settings {
@@ -38,6 +44,9 @@ impl Default for Settings {
             resize_to_video: true,
             screenshot_dir: dirs::picture_dir().unwrap_or_default().to_string_lossy().into_owned(),
             volume: 100.0,
+            single_instance: true,
+            opensubtitles_key: String::new(),
+            sub_languages: "ar,en".into(),
         }
     }
 }
