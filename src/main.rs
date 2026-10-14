@@ -79,6 +79,10 @@ struct App {
     snapshot: Option<String>,
     started: Instant,
     last_stats: Instant,
+    fs_toggles: u32,
+    /// Window geometry (and maximized flag) to restore when leaving fullscreen.
+    fs_saved: Option<(Geometry, bool)>,
+    frames: u32,
     thumbs: Option<thumbs::Generator>,
     /// File whose folder siblings should be added once it has loaded.
     siblings_for: Option<String>,
@@ -165,6 +169,9 @@ impl App {
             snapshot: std::env::var("IINA_RS_SNAPSHOT").ok(),
             started: Instant::now(),
             last_stats: Instant::now(),
+            fs_toggles: 0,
+            fs_saved: None,
+            frames: 0,
             thumbs: None,
             siblings_for: None,
             click_pause_at: None,
@@ -572,14 +579,51 @@ impl App {
     }
 
     fn apply_fullscreen(&mut self) {
+        dbg_log(format!("apply_fullscreen -> {}", self.player.fullscreen));
         self.ui.fullscreen = self.player.fullscreen;
         if self.player.fullscreen && (self.ui.pip || self.ui.music_mode) {
             self.ui.pip = false;
             self.ui.music_mode = false;
             self.restore_geometry();
         }
-        if let Some(w) = self.window() {
+        let Some(w) = self.window().cloned() else { return };
+        let t = Instant::now();
+        if cfg!(windows) {
+            self.set_fullscreen_windows(&w, self.player.fullscreen);
+        } else {
             w.set_fullscreen(self.player.fullscreen.then_some(Fullscreen::Borderless(None)));
+        }
+        dbg_log(format!("fullscreen switch took {:?}", t.elapsed()));
+    }
+
+    /// Borderless fullscreen done by hand on Windows. A GL window that exactly
+    /// covers the monitor gets promoted by Windows/the driver to a pseudo-
+    /// exclusive "fullscreen optimizations" mode; entering and leaving that mode
+    /// blanks the screen and stalls rendering for ~2 s. Making the window one
+    /// pixel taller than the monitor keeps it a normal composited window.
+    fn set_fullscreen_windows(&mut self, w: &Window, on: bool) {
+        if on {
+            if self.fs_saved.is_some() {
+                return;
+            }
+            let Some(mon) = w.current_monitor() else { return };
+            self.fs_saved = Some((Geometry { pos: w.outer_position().ok(), size: w.inner_size() }, w.is_maximized()));
+            if w.is_maximized() {
+                w.set_maximized(false);
+            }
+            w.set_decorations(false);
+            w.set_outer_position(mon.position());
+            let size = mon.size();
+            let _ = w.request_inner_size(PhysicalSize::new(size.width, size.height + 1));
+        } else if let Some((g, maximized)) = self.fs_saved.take() {
+            w.set_decorations(true);
+            let _ = w.request_inner_size(g.size);
+            if let Some(p) = g.pos {
+                w.set_outer_position(p);
+            }
+            if maximized {
+                w.set_maximized(true);
+            }
         }
     }
 
@@ -596,13 +640,16 @@ impl App {
     // ----------------------------------------------------------- render ---
 
     fn render(&mut self) {
+        self.frames += 1;
         let Some(gfx) = self.gfx.as_mut() else { return };
         let size = gfx.window.inner_size();
         if size.width == 0 || size.height == 0 {
             return;
         }
+        let t0 = Instant::now();
         self.mpv.render_update();
         self.mpv.render(size.width as i32, size.height as i32);
+        let t_mpv = t0.elapsed();
 
         let window = gfx.window.clone();
         let (player, ui_state, mpv) = (&self.player, &mut self.ui, &self.mpv);
@@ -624,8 +671,8 @@ impl App {
             self.last_stats = Instant::now();
             let g = |p: &str| self.mpv.get_string(p).unwrap_or_else(|| "-".into());
             eprintln!(
-                "[stats] t={} hwdec={} vo-drop={} dec-drop={} delayed={} vf-fps={} display-fps={} size={}x{}",
-                g("time-pos"), g("hwdec-current"), g("frame-drop-count"), g("decoder-frame-drop-count"),
+                "[stats] frames={} t={} hwdec={} vo-drop={} dec-drop={} delayed={} vf-fps={} display-fps={} size={}x{}",
+                std::mem::take(&mut self.frames), g("time-pos"), g("hwdec-current"), g("frame-drop-count"), g("decoder-frame-drop-count"),
                 g("vo-delayed-frame-count"), g("estimated-vf-fps"), g("display-fps"), size.width, size.height
             );
         }
@@ -635,8 +682,13 @@ impl App {
             self.snapshot = None;
             self.mpv.command(&["quit"]);
         }
+        let t1 = Instant::now();
         let _ = gfx.surface.swap_buffers(&gfx.context);
         self.mpv.report_swap();
+        let t_swap = t1.elapsed();
+        if t0.elapsed() > Duration::from_millis(60) {
+            dbg_log(format!("slow frame: mpv={:?} ui={:?} swap={:?} size={}x{}", t_mpv, t1 - t0 - t_mpv, t_swap, size.width, size.height));
+        }
 
         // Like IINA, lift subtitles above the controller while it is shown.
         // sub-margin-y is in units of a 720px-tall frame; the bar is ~130pt high.
@@ -793,6 +845,14 @@ const MEDIA_EXTS: &[&str] = &[
     "flac", "m4a", "aac", "ogg", "opus", "wav", "wma", "alac", "ape", "m3u", "m3u8", "pls", "iso",
 ];
 
+fn dbg_log(msg: String) {
+    if std::env::var_os("IINA_RS_DEBUG").is_some() {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let t = START.get_or_init(Instant::now).elapsed().as_secs_f64();
+        eprintln!("[{t:7.3}] {msg}");
+    }
+}
+
 fn save_snapshot(gl: &glow::Context, size: PhysicalSize<u32>, path: &str) {
     use glow::HasContext;
     let (w, h) = (size.width as i32, size.height as i32);
@@ -846,6 +906,18 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // Debug aid: IINA_RS_FS_TOGGLES=n cycles fullscreen every 2 s, n times.
+        if let Some(n) = std::env::var("IINA_RS_FS_TOGGLES").ok().and_then(|v| v.parse::<u32>().ok()) {
+            if self.fs_toggles < n && self.started.elapsed() > Duration::from_secs(2 * (self.fs_toggles as u64 + 1)) {
+                self.fs_toggles += 1;
+                dbg_log(format!("--- toggle #{} ---", self.fs_toggles));
+                self.mpv.command(&["cycle", "fullscreen"]);
+            }
+            let next = self.started + Duration::from_secs(2 * (self.fs_toggles as u64 + 1));
+            if self.repaint_at.is_none_or(|r| next < r) {
+                self.repaint_at = Some(next);
+            }
+        }
         if let Some(t) = self.click_pause_at {
             if t <= Instant::now() {
                 self.click_pause_at = None;
@@ -880,13 +952,17 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Destroyed => el.exit(),
             WindowEvent::Resized(size) => {
+                dbg_log(format!("Resized {}x{} win_fs={} mpv_fs={}", size.width, size.height, gfx.window.fullscreen().is_some(), self.player.fullscreen));
                 if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
                     gfx.surface.resize(&gfx.context, w, h);
                 }
-                // Keep mpv's fullscreen flag in sync if the OS changed it.
-                let fs = gfx.window.fullscreen().is_some();
-                if fs != self.player.fullscreen {
-                    self.mpv.set_flag("fullscreen", fs);
+                // Keep mpv's fullscreen flag in sync if the OS changed it
+                // (only meaningful where winit's own fullscreen is used).
+                if !cfg!(windows) {
+                    let fs = gfx.window.fullscreen().is_some();
+                    if fs != self.player.fullscreen {
+                        self.mpv.set_flag("fullscreen", fs);
+                    }
                 }
                 self.redraw();
             }
