@@ -411,15 +411,18 @@ impl App {
             "find-online-subs" => self.open_subtitle_search(),
             "subs-search" => {
                 let p = self.proxy.clone();
-                subtitles::start_search(self.ui.subs.clone(), self.ui.settings.opensubtitles_key.trim().to_string(), move || {
+                let provider = self.ui.subs.lock().unwrap().provider;
+                let key = self.ui.settings.subtitle_key(provider).to_string();
+                subtitles::start_search(self.ui.subs.clone(), key, move || {
                     let _ = p.send_event(UserEvent::MpvRender);
                 });
             }
             "subs-download" => {
-                if let Ok(id) = arg.parse::<u64>() {
+                if let Ok(index) = arg.parse::<usize>() {
                     let p = self.proxy.clone();
                     let dest = self.config_dir.join("subtitles");
-                    subtitles::start_download(self.ui.subs.clone(), self.ui.settings.opensubtitles_key.trim().to_string(), id, dest, move || {
+                    let keys = (self.ui.settings.subdl_key.trim().to_string(), self.ui.settings.opensubtitles_key.trim().to_string());
+                    subtitles::start_download(self.ui.subs.clone(), index, keys, dest, move || {
                         let _ = p.send_event(UserEvent::MpvRender);
                     });
                 }
@@ -818,9 +821,9 @@ impl App {
             return;
         }
         let path = self.player.path.clone();
-        // Search text: file name without extension, separators as spaces.
-        let stem = Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let query: String = stem.chars().map(|c| if "._[]()".contains(c) { ' ' } else { c }).collect();
+        // Search text: the title parsed from the file name (no year / release tags).
+        let file_name = Path::new(&path).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let query = subtitles::parse_name(&file_name).title;
         {
             let mut s = self.ui.subs.lock().unwrap();
             if s.media_path != path {
@@ -830,6 +833,7 @@ impl App {
             s.media_path = path;
             s.query = query.split_whitespace().collect::<Vec<_>>().join(" ");
             s.languages = self.ui.settings.sub_languages.clone();
+            s.provider = subtitles::Provider::from_name(&self.ui.settings.sub_provider);
         }
         self.ui.show_subs = true;
     }

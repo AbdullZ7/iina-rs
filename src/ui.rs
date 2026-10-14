@@ -1228,11 +1228,16 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
                 }
             });
             ui.add_space(6.0);
-            ui.label(RichText::new("Online subtitles (OpenSubtitles.com)").strong());
-            ui.horizontal(|ui| {
-                ui.label("API key");
+            ui.label(RichText::new("Online subtitles").strong());
+            egui::Grid::new("sub-keys").num_columns(3).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
+                ui.label("SubDL key");
+                ui.add(egui::TextEdit::singleline(&mut s.subdl_key).password(true).desired_width(220.0));
+                ui.hyperlink_to("Get a key", "https://subdl.com/panel/api");
+                ui.end_row();
+                ui.label("OpenSubtitles key");
                 ui.add(egui::TextEdit::singleline(&mut s.opensubtitles_key).password(true).desired_width(220.0));
                 ui.hyperlink_to("Get a key", "https://www.opensubtitles.com/consumers");
+                ui.end_row();
             });
             ui.horizontal(|ui| {
                 ui.label("Languages");
@@ -1364,28 +1369,40 @@ fn subtitle_search(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>
         return;
     }
     let mut open = true;
-    let no_key = st.settings.opensubtitles_key.trim().is_empty();
     let shared = st.subs.clone();
     let mut s = shared.lock().unwrap();
+    let before_provider = s.provider;
     egui::Window::new("Find Online Subtitles")
         .open(&mut open)
-        .default_size(vec2(620.0, 420.0))
+        .default_size(vec2(680.0, 440.0))
         .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Source");
+                for p in subtitles::Provider::ALL {
+                    if ui.selectable_label(s.provider == p, p.name()).clicked() {
+                        s.provider = p;
+                    }
+                }
+            });
+            let no_key = st.settings.subtitle_key(s.provider).is_empty();
             if no_key {
-                ui.label(RichText::new("An OpenSubtitles.com API key is required. Create a free account and key, then paste it in Preferences.").color(Color32::from_rgb(255, 200, 120)));
+                ui.label(
+                    RichText::new(format!("A free {} API key is required. Create one, then paste it in Preferences.", s.provider.name()))
+                        .color(Color32::from_rgb(255, 200, 120)),
+                );
                 ui.horizontal(|ui| {
-                    ui.hyperlink_to("Get an API key", "https://www.opensubtitles.com/consumers");
+                    ui.hyperlink_to("Get an API key", s.provider.key_url());
                     if ui.button("Open Preferences").clicked() {
                         cmds.push("preferences".into());
                     }
                 });
-                ui.separator();
             }
+            ui.separator();
             ui.horizontal(|ui| {
                 ui.label("Title");
-                let r = ui.add(egui::TextEdit::singleline(&mut s.query).desired_width(280.0));
+                let r = ui.add(egui::TextEdit::singleline(&mut s.query).desired_width(300.0));
                 ui.label("Languages");
-                ui.add(egui::TextEdit::singleline(&mut s.languages).desired_width(70.0));
+                ui.add(egui::TextEdit::singleline(&mut s.languages).desired_width(70.0).hint_text("ar,en"));
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if (ui.add_enabled(!s.busy && !no_key, egui::Button::new("Search")).clicked() || enter) && !s.busy && !no_key {
                     cmds.push("subs-search".into());
@@ -1395,27 +1412,43 @@ fn subtitle_search(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 egui::Grid::new("subs-results").striped(true).num_columns(4).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
-                    for r in s.results.clone() {
+                    for (i, r) in s.results.clone().into_iter().enumerate() {
                         ui.label(RichText::new(r.language.to_uppercase()).monospace());
-                        let name = if r.release.is_empty() { r.file_name.clone() } else { r.release.clone() };
-                        let mut label = RichText::new(name);
-                        if r.hash_match {
+                        let mut label = RichText::new(if r.release.is_empty() { "(no release name)".to_string() } else { r.release.clone() });
+                        if r.good_match {
                             label = label.color(Color32::from_rgb(140, 220, 140));
                         }
-                        ui.add(egui::Label::new(label).truncate()).on_hover_text(if r.hash_match {
-                            "Matched by file hash: made for this exact release"
-                        } else {
-                            "Matched by name"
-                        });
-                        ui.label(RichText::new(format!("⬇ {}", r.downloads)).size(11.0).color(FG_DIM));
+                        let mut tip = if r.good_match { "Likely synced to this file".to_string() } else { "Matched by title".to_string() };
+                        if !r.author.is_empty() {
+                            tip.push_str(&format!("\nBy {}", r.author));
+                        }
+                        if r.hearing_impaired {
+                            tip.push_str("\nHearing impaired (SDH)");
+                        }
+                        ui.add(egui::Label::new(label).truncate()).on_hover_text(tip);
+                        let mut meta = String::new();
+                        if r.hearing_impaired {
+                            meta.push_str("HI  ");
+                        }
+                        if let Some(d) = r.downloads {
+                            meta.push_str(&format!("⬇ {d}"));
+                        }
+                        ui.label(RichText::new(meta).size(11.0).color(FG_DIM));
                         if ui.add_enabled(!s.busy, egui::Button::new("Download")).clicked() {
-                            cmds.push(format!("subs-download {}", r.file_id));
+                            cmds.push(format!("subs-download {i}"));
                         }
                         ui.end_row();
                     }
                 });
             });
         });
+    if s.provider != before_provider {
+        // Remember the chosen source; results belong to the previous one.
+        st.settings.sub_provider = s.provider.name().to_string();
+        st.settings_dirty = true;
+        s.results.clear();
+        s.status.clear();
+    }
     drop(s);
     st.show_subs = open;
 }

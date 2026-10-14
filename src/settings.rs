@@ -25,6 +25,10 @@ pub struct Settings {
     pub volume: f64,
     /// Open files in the running instance instead of a new window.
     pub single_instance: bool,
+    /// Online subtitle provider: "SubDL" or "OpenSubtitles".
+    pub sub_provider: String,
+    /// SubDL API key (https://subdl.com/panel/api).
+    pub subdl_key: String,
     /// OpenSubtitles.com API key (https://www.opensubtitles.com/consumers).
     pub opensubtitles_key: String,
     /// Preferred subtitle languages for online search, e.g. "ar,en".
@@ -45,6 +49,8 @@ impl Default for Settings {
             screenshot_dir: dirs::picture_dir().unwrap_or_default().to_string_lossy().into_owned(),
             volume: 100.0,
             single_instance: true,
+            sub_provider: "SubDL".into(),
+            subdl_key: String::new(),
             opensubtitles_key: String::new(),
             sub_languages: "ar,en".into(),
         }
@@ -63,6 +69,13 @@ impl Settings {
     pub fn save(&self, dir: &Path) {
         if let Ok(s) = serde_json::to_string_pretty(self) {
             let _ = std::fs::write(file(dir), s);
+        }
+    }
+
+    pub fn subtitle_key(&self, p: crate::subtitles::Provider) -> &str {
+        match p {
+            crate::subtitles::Provider::SubDL => self.subdl_key.trim(),
+            crate::subtitles::Provider::OpenSubtitles => self.opensubtitles_key.trim(),
         }
     }
 

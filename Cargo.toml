@@ -24,6 +24,7 @@ rfd = "0.15"
 dirs = "6"
 ureq = { version = "2", features = ["json"] }
 rand = "0.9"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
