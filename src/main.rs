@@ -1,0 +1,828 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+//! IINA-RS — an IINA-inspired media player for Windows and Linux.
+//! Video is rendered by libmpv's OpenGL render API into the window's default
+//! framebuffer; the egui overlay (controller, sidebar, menus) is drawn on top.
+
+mod keys;
+mod mpv;
+mod state;
+mod ui;
+
+use glutin::context::{NotCurrentGlContext, PossiblyCurrentContext};
+use glutin::display::{GetGlDisplay, GlDisplay};
+use glutin::surface::{GlSurface, Surface, SwapInterval, WindowSurface};
+use keys::{Binding, Bindings};
+use mpv::{Event, Mpv};
+use state::Player;
+use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use ui::{Tab, UiState};
+use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::ModifiersState;
+use winit::raw_window_handle::HasWindowHandle;
+use winit::window::{Fullscreen, Icon, Window, WindowAttributes, WindowLevel};
+
+const SUB_EXTS: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "idx", "sup", "smi", "lrc"];
+
+#[derive(Debug, Clone, Copy)]
+enum UserEvent {
+    MpvEvents,
+    MpvRender,
+    Repaint(Duration),
+}
+
+struct Gfx {
+    window: Arc<Window>,
+    surface: Surface<WindowSurface>,
+    context: PossiblyCurrentContext,
+    egui: egui_glow::EguiGlow,
+}
+
+/// Saved geometry while in PiP / music mode.
+#[derive(Clone, Copy)]
+struct Geometry {
+    pos: Option<PhysicalPosition<i32>>,
+    size: PhysicalSize<u32>,
+}
+
+struct App {
+    proxy: EventLoopProxy<UserEvent>,
+    mpv: Mpv,
+    gfx: Option<Gfx>,
+    player: Player,
+    ui: UiState,
+    bindings: Bindings,
+    modifiers: ModifiersState,
+    config_dir: PathBuf,
+    pending_open: Vec<String>,
+    resize_on_video: bool,
+    saved_geometry: Option<Geometry>,
+    press: Option<(PhysicalPosition<f64>, Instant)>,
+    last_click: Option<Instant>,
+    last_drop: Option<Instant>,
+    cursor: PhysicalPosition<f64>,
+    cursor_hidden: bool,
+    subs_lifted: bool,
+    repaint_at: Option<Instant>,
+    /// Debug aid: `IINA_RS_SNAPSHOT=out.png` saves the composited frame after
+    /// a few seconds and quits (desktop capture tools often miss GL windows).
+    snapshot: Option<String>,
+    started: Instant,
+}
+
+fn config_dir() -> PathBuf {
+    let dir = dirs::config_dir().unwrap_or_else(std::env::temp_dir).join("iina-rs");
+    let _ = std::fs::create_dir_all(dir.join("watch_later"));
+    dir
+}
+
+fn load_recent(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("recent.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+impl App {
+    fn new(proxy: EventLoopProxy<UserEvent>, args: Vec<String>, mpv_opts: Vec<(String, String)>) -> Result<Self, String> {
+        let config_dir = config_dir();
+        let mut mpv = Mpv::new()?;
+        let cfg = config_dir.to_string_lossy().into_owned();
+        for (k, v) in [
+            ("vo", "libmpv"),
+            ("hwdec", "auto-safe"),
+            ("idle", "yes"),
+            ("keep-open", "yes"),
+            ("force-window", "no"),
+            ("input-default-bindings", "no"),
+            ("input-vo-keyboard", "no"),
+            ("osc", "no"),
+            ("ytdl", "yes"),
+            ("save-position-on-quit", "yes"),
+            ("resume-playback", "yes"),
+            ("watch-later-dir", &format!("{cfg}/watch_later")),
+            ("screenshot-dir", &dirs::picture_dir().unwrap_or_default().to_string_lossy()),
+            ("screenshot-template", "IINA-RS %F %wH.%wM.%wS"),
+            ("osd-font-size", "40"),
+            ("osd-bar", "yes"),
+            ("sub-auto", "fuzzy"),
+            ("audio-file-auto", "fuzzy"),
+            ("config-dir", &cfg),
+            ("config", "yes"),
+            ("terminal", if cfg!(debug_assertions) { "yes" } else { "no" }),
+            ("msg-level", "all=warn"),
+        ] {
+            mpv.set_option(k, v);
+        }
+        // `--name=value` / `--flag` / `--no-flag` arguments are passed to mpv, like iina-cli.
+        for (k, v) in &mpv_opts {
+            mpv.set_option(k, v);
+        }
+        mpv.init()?;
+        state::observe_all(&mpv);
+        let p = proxy.clone();
+        mpv.set_wakeup_callback(move || {
+            let _ = p.send_event(UserEvent::MpvEvents);
+        });
+
+        let user_conf = std::fs::read_to_string(config_dir.join("input.conf")).ok();
+        Ok(Self {
+            proxy,
+            mpv,
+            gfx: None,
+            player: Player::default(),
+            ui: UiState::new(load_recent(&config_dir)),
+            bindings: Bindings::load(user_conf),
+            modifiers: ModifiersState::empty(),
+            config_dir,
+            pending_open: args,
+            resize_on_video: true,
+            saved_geometry: None,
+            press: None,
+            last_click: None,
+            last_drop: None,
+            cursor: PhysicalPosition::new(0.0, 0.0),
+            cursor_hidden: false,
+            subs_lifted: false,
+            repaint_at: None,
+            snapshot: std::env::var("IINA_RS_SNAPSHOT").ok(),
+            started: Instant::now(),
+        })
+    }
+
+    fn window(&self) -> Option<&Arc<Window>> {
+        self.gfx.as_ref().map(|g| &g.window)
+    }
+
+    fn redraw(&self) {
+        if let Some(w) = self.window() {
+            w.request_redraw();
+        }
+    }
+
+    fn create_window(&mut self, el: &ActiveEventLoop) {
+        let icon = Icon::from_rgba(include_bytes!("../assets/icon_64.rgba").to_vec(), 64, 64).ok();
+        let attrs = WindowAttributes::default()
+            .with_title("IINA-RS")
+            .with_inner_size(LogicalSize::new(960.0, 540.0))
+            .with_min_inner_size(LogicalSize::new(320.0, 140.0))
+            .with_window_icon(icon)
+            .with_visible(false);
+        let template = glutin::config::ConfigTemplateBuilder::new().with_depth_size(0).with_stencil_size(0);
+        let (window, config) = glutin_winit::DisplayBuilder::new()
+            .with_preference(glutin_winit::ApiPreference::FallbackEgl)
+            .with_window_attributes(Some(attrs.clone()))
+            .build(el, template, |mut it| it.next().expect("no OpenGL config"))
+            .expect("failed to create OpenGL display");
+        let window = window.unwrap_or_else(|| glutin_winit::finalize_window(el, attrs, &config).expect("window"));
+        let raw = window.window_handle().expect("window handle").as_raw();
+        let display = config.display();
+        let ctx_attrs = glutin::context::ContextAttributesBuilder::new().build(Some(raw));
+        let gles_attrs = glutin::context::ContextAttributesBuilder::new()
+            .with_context_api(glutin::context::ContextApi::Gles(None))
+            .build(Some(raw));
+        let not_current = unsafe {
+            display
+                .create_context(&config, &ctx_attrs)
+                .or_else(|_| display.create_context(&config, &gles_attrs))
+                .expect("failed to create OpenGL context")
+        };
+        let size = window.inner_size();
+        let surf_attrs = glutin::surface::SurfaceAttributesBuilder::<WindowSurface>::new().build(
+            raw,
+            NonZeroU32::new(size.width).unwrap_or(NonZeroU32::MIN),
+            NonZeroU32::new(size.height).unwrap_or(NonZeroU32::MIN),
+        );
+        let surface = unsafe { display.create_window_surface(&config, &surf_attrs).expect("surface") };
+        let context = not_current.make_current(&surface).expect("make_current");
+        let _ = surface.set_swap_interval(&context, SwapInterval::Wait(NonZeroU32::MIN));
+
+        let gl = Arc::new(unsafe { glow::Context::from_loader_function_cstr(|s| display.get_proc_address(s)) });
+        let egui = egui_glow::EguiGlow::new(el, gl, None, None, true);
+        egui_extras::install_image_loaders(&egui.egui_ctx);
+        ui::setup_style(&egui.egui_ctx);
+        let p = self.proxy.clone();
+        egui.egui_ctx.set_request_repaint_callback(move |info| {
+            let _ = p.send_event(UserEvent::Repaint(info.delay));
+        });
+
+        let gl_display = display.clone();
+        let p = self.proxy.clone();
+        if let Err(e) = self.mpv.create_render_context(
+            move |name| gl_display.get_proc_address(name),
+            move || {
+                let _ = p.send_event(UserEvent::MpvRender);
+            },
+        ) {
+            eprintln!("mpv render context: {e}");
+        }
+
+        let window = Arc::new(window);
+        window.set_visible(true);
+        self.gfx = Some(Gfx { window, surface, context, egui });
+
+        if let Ok(panel) = std::env::var("IINA_RS_PANEL") {
+            self.run_app_command(&format!("{panel}-panel"));
+        }
+        let args = std::mem::take(&mut self.pending_open);
+        self.open_many(args);
+    }
+
+    // ---------------------------------------------------------- opening ---
+
+    fn open(&mut self, path: &str, replace_first: bool) {
+        let ext = Path::new(path).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if SUB_EXTS.contains(&ext.as_str()) && !self.player.idle {
+            self.mpv.command(&["sub-add", path, "select"]);
+            return;
+        }
+        let abs = if path.contains("://") {
+            path.to_string()
+        } else {
+            std::fs::canonicalize(path)
+                .map(|p| p.to_string_lossy().trim_start_matches(r"\\?\").to_string())
+                .unwrap_or_else(|_| path.to_string())
+        };
+        if replace_first {
+            if !self.player.idle {
+                self.mpv.command(&["write-watch-later-config"]);
+            }
+            self.mpv.command(&["loadfile", &abs, "replace"]);
+            self.resize_on_video = true;
+        } else {
+            self.mpv.command(&["loadfile", &abs, "append-play"]);
+        }
+        self.add_recent(abs);
+    }
+
+    fn open_many(&mut self, paths: Vec<String>) {
+        for (i, p) in paths.iter().enumerate() {
+            self.open(p, i == 0);
+        }
+    }
+
+    fn add_recent(&mut self, path: String) {
+        let r = &mut self.ui.recent;
+        r.retain(|p| p != &path);
+        r.insert(0, path);
+        r.truncate(15);
+        self.save_recent();
+    }
+
+    fn save_recent(&self) {
+        let _ = std::fs::write(self.config_dir.join("recent.json"), serde_json::to_string_pretty(&self.ui.recent).unwrap());
+    }
+
+    fn pick_files(&self, title: &str, filters: &[(&str, &[&str])]) -> Vec<String> {
+        let mut dlg = rfd::FileDialog::new().set_title(title);
+        for (name, exts) in filters {
+            dlg = dlg.add_filter(*name, exts);
+        }
+        dlg.pick_files().unwrap_or_default().into_iter().map(|p| p.to_string_lossy().into_owned()).collect()
+    }
+
+    // ------------------------------------------------------ app commands ---
+
+    fn run_app_command(&mut self, cmd: &str) {
+        let (name, arg) = cmd.split_once(' ').unwrap_or((cmd, ""));
+        match name {
+            "mpv" => self.mpv.command_string(arg),
+            "open-path" => self.open(arg, true),
+            "open-file" => {
+                let files = self.pick_files("Open", &[("Media", MEDIA_EXTS), ("All files", &["*"])]);
+                self.open_many(files);
+            }
+            "add-files" => {
+                for f in self.pick_files("Add to playlist", &[("Media", MEDIA_EXTS), ("All files", &["*"])]) {
+                    self.open(&f, self.player.idle);
+                }
+            }
+            "add-sub" => {
+                for f in self.pick_files("Load subtitle", &[("Subtitles", SUB_EXTS), ("All files", &["*"])]) {
+                    self.mpv.command(&["sub-add", &f, "select"]);
+                }
+            }
+            "add-audio" => {
+                for f in self.pick_files("Load audio", &[("Audio", &["mka", "mp3", "aac", "ac3", "eac3", "dts", "flac", "opus", "ogg", "wav", "m4a"]), ("All files", &["*"])]) {
+                    self.mpv.command(&["audio-add", &f, "select"]);
+                }
+            }
+            "open-url" => self.ui.url_input = Some(String::new()),
+            "close-file" => self.mpv.command(&["stop"]),
+            "clear-recent" => {
+                self.ui.recent.clear();
+                self.save_recent();
+            }
+            "playlist-panel" => self.ui.toggle_tab(Tab::Playlist),
+            "chapter-panel" => self.ui.toggle_tab(Tab::Chapters),
+            "video-panel" => self.ui.toggle_tab(Tab::Video),
+            "audio-panel" => self.ui.toggle_tab(Tab::Audio),
+            "sub-panel" => self.ui.toggle_tab(Tab::Subtitles),
+            "toggle-fullscreen" => self.mpv.command(&["cycle", "fullscreen"]),
+            "toggle-pip" => self.toggle_pip(),
+            "toggle-music-mode" => self.toggle_music_mode(),
+            "fit-to-screen" => {
+                if let Some(w) = self.window() {
+                    w.set_maximized(!w.is_maximized());
+                }
+            }
+            "bigger-window" => self.scale_window(1.1),
+            "smaller-window" => self.scale_window(1.0 / 1.1),
+            "show-current-file-in-finder" => {
+                let p = self.player.path.clone();
+                reveal(&p);
+            }
+            "reveal" => reveal(arg),
+            "about" => self.ui.show_about = true,
+            "find-online-subs" | "live-text" => {
+                self.mpv.command(&["show-text", "Not available on this platform yet"]);
+            }
+            other => eprintln!("unknown app command: {other}"),
+        }
+        self.redraw();
+    }
+
+    // ------------------------------------------------- window geometry ---
+
+    /// Resizes the window to the video size (like IINA). Returns false if the
+    /// video dimensions aren't known yet.
+    fn fit_to_video(&mut self, scale: f64) -> bool {
+        let (Some(w), Some(h)) = (
+            self.mpv.get_string("dwidth").and_then(|s| s.parse::<f64>().ok()),
+            self.mpv.get_string("dheight").and_then(|s| s.parse::<f64>().ok()),
+        ) else {
+            return false;
+        };
+        let Some(window) = self.window().cloned() else { return false };
+        if self.player.fullscreen || window.is_maximized() || self.ui.pip || self.ui.music_mode {
+            return true;
+        }
+        // mpv sizes windows in physical pixels scaled by the display's DPI
+        // (hidpi-window-scale); do the same.
+        let dpi = window.scale_factor();
+        let (mut tw, mut th) = (w * scale * dpi, h * scale * dpi);
+        if let Some(mon) = window.current_monitor() {
+            let ms = mon.size();
+            let (mw, mh) = (ms.width as f64 * 0.85, ms.height as f64 * 0.85);
+            let k = (mw / tw).min(mh / th).min(1.0);
+            tw *= k;
+            th *= k;
+            let _ = window.request_inner_size(PhysicalSize::new(tw as u32, th as u32));
+            // Re-center like IINA does when a new video opens.
+            let mp = mon.position();
+            let outer = window.outer_size();
+            let dx = outer.width.saturating_sub(window.inner_size().width) as f64;
+            let dy = outer.height.saturating_sub(window.inner_size().height) as f64;
+            let x = mp.x as f64 + (ms.width as f64 - tw - dx) / 2.0;
+            let y = mp.y as f64 + (ms.height as f64 - th - dy) / 2.0;
+            window.set_outer_position(PhysicalPosition::new(x.max(mp.x as f64) as i32, y.max(mp.y as f64) as i32));
+        } else {
+            let _ = window.request_inner_size(PhysicalSize::new(tw as u32, th as u32));
+        }
+        true
+    }
+
+    fn scale_window(&mut self, k: f64) {
+        if let Some(w) = self.window() {
+            let s = w.inner_size();
+            let _ = w.request_inner_size(PhysicalSize::new((s.width as f64 * k) as u32, (s.height as f64 * k) as u32));
+        }
+    }
+
+    fn save_geometry(&mut self) {
+        if let Some(w) = self.window() {
+            self.saved_geometry = Some(Geometry { pos: w.outer_position().ok(), size: w.inner_size() });
+        }
+    }
+
+    fn restore_geometry(&mut self) {
+        let saved = self.saved_geometry.take();
+        if let (Some(w), Some(g)) = (self.window(), saved) {
+            w.set_decorations(true);
+            w.set_window_level(if self.player.ontop { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal });
+            let _ = w.request_inner_size(g.size);
+            if let Some(p) = g.pos {
+                w.set_outer_position(p);
+            }
+        }
+    }
+
+    fn toggle_pip(&mut self) {
+        if self.ui.pip {
+            self.ui.pip = false;
+            self.restore_geometry();
+            return;
+        }
+        if self.player.idle {
+            return;
+        }
+        if self.player.fullscreen {
+            self.mpv.set_flag("fullscreen", false);
+        }
+        if self.ui.music_mode {
+            self.ui.music_mode = false;
+        } else {
+            self.save_geometry();
+        }
+        self.ui.pip = true;
+        self.ui.sidebar = None;
+        let Some(w) = self.window().cloned() else { return };
+        let (vw, vh) = (
+            self.mpv.get_string("dwidth").and_then(|s| s.parse::<f64>().ok()).unwrap_or(16.0),
+            self.mpv.get_string("dheight").and_then(|s| s.parse::<f64>().ok()).unwrap_or(9.0),
+        );
+        if let Some(mon) = w.current_monitor() {
+            let ms = mon.size();
+            let width = ms.width as f64 * 0.25;
+            let height = width * vh.max(1.0) / vw.max(1.0);
+            w.set_decorations(false);
+            w.set_window_level(WindowLevel::AlwaysOnTop);
+            let _ = w.request_inner_size(PhysicalSize::new(width as u32, height as u32));
+            let margin = 32.0 * w.scale_factor();
+            let mp = mon.position();
+            w.set_outer_position(PhysicalPosition::new(
+                (mp.x as f64 + ms.width as f64 - width - margin) as i32,
+                (mp.y as f64 + ms.height as f64 - height - margin * 2.0) as i32,
+            ));
+        }
+    }
+
+    fn toggle_music_mode(&mut self) {
+        if self.ui.music_mode {
+            self.ui.music_mode = false;
+            self.restore_geometry();
+            return;
+        }
+        if self.player.fullscreen {
+            self.mpv.set_flag("fullscreen", false);
+        }
+        if self.ui.pip {
+            self.ui.pip = false;
+            if let Some(w) = self.window() {
+                w.set_decorations(true);
+            }
+        } else {
+            self.save_geometry();
+        }
+        self.ui.music_mode = true;
+        if let Some(w) = self.window() {
+            let _ = w.request_inner_size(LogicalSize::new(480.0, 270.0));
+        }
+    }
+
+    // ------------------------------------------------------- mpv events ---
+
+    fn handle_mpv_events(&mut self, el: &ActiveEventLoop) {
+        for ev in self.mpv.poll_events() {
+            if std::env::var_os("IINA_RS_DEBUG").is_some() { eprintln!("mpv event: {ev:?}"); }
+            match ev {
+                Event::Shutdown => {
+                    el.exit();
+                    return;
+                }
+                Event::StartFile => self.resize_on_video = true,
+                Event::VideoReconfig => {
+                    if self.resize_on_video && self.fit_to_video(1.0) {
+                        self.resize_on_video = false;
+                    }
+                }
+                Event::Property(name, value) => {
+                    let before = (self.player.fullscreen, self.player.ontop, self.player.window_scale);
+                    self.player.apply(&name, &value);
+                    match name.as_str() {
+                        "fullscreen" if before.0 != self.player.fullscreen => self.apply_fullscreen(),
+                        "ontop" if before.1 != self.player.ontop => {
+                            if let Some(w) = self.window() {
+                                w.set_window_level(if self.player.ontop { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal });
+                            }
+                        }
+                        "window-scale" if (before.2 - self.player.window_scale).abs() > 1e-6 => {
+                            let s = self.player.window_scale;
+                            let _ = self.fit_to_video(s);
+                        }
+                        "media-title" | "idle-active" => self.update_title(),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.redraw();
+    }
+
+    fn apply_fullscreen(&mut self) {
+        self.ui.fullscreen = self.player.fullscreen;
+        if self.player.fullscreen && (self.ui.pip || self.ui.music_mode) {
+            self.ui.pip = false;
+            self.ui.music_mode = false;
+            self.restore_geometry();
+        }
+        if let Some(w) = self.window() {
+            w.set_fullscreen(self.player.fullscreen.then_some(Fullscreen::Borderless(None)));
+        }
+    }
+
+    fn update_title(&self) {
+        if let Some(w) = self.window() {
+            if self.player.idle || self.player.title.is_empty() {
+                w.set_title("IINA-RS");
+            } else {
+                w.set_title(&format!("{} — IINA-RS", self.player.title));
+            }
+        }
+    }
+
+    // ----------------------------------------------------------- render ---
+
+    fn render(&mut self) {
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        let size = gfx.window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        self.mpv.render_update();
+        self.mpv.render(size.width as i32, size.height as i32);
+
+        let window = gfx.window.clone();
+        let (player, ui_state, mpv) = (&self.player, &mut self.ui, &self.mpv);
+        let mut cmds = Vec::new();
+        gfx.egui.run(&window, |ctx| {
+            cmds = ui::draw(ctx, ui_state, player, mpv);
+        });
+        gfx.egui.paint(&window);
+        if let Some(path) = self.snapshot.as_ref().filter(|_| self.started.elapsed() > Duration::from_secs(4)) {
+            save_snapshot(gfx.egui.painter.gl(), size, path);
+            self.snapshot = None;
+            self.mpv.command(&["quit"]);
+        }
+        let _ = gfx.surface.swap_buffers(&gfx.context);
+        self.mpv.report_swap();
+
+        // Like IINA, lift subtitles above the controller while it is shown.
+        // sub-margin-y is in units of a 720px-tall frame; the bar is ~130pt high.
+        let lift = self.ui.osc_visible && !self.player.idle && !self.ui.pip;
+        if lift != self.subs_lifted {
+            self.subs_lifted = lift;
+            let margin = if lift {
+                let h_pt = size.height as f64 / window.scale_factor();
+                (130.0 / h_pt * 720.0).clamp(22.0, 300.0)
+            } else {
+                22.0
+            };
+            self.mpv.set_string("sub-margin-y", &format!("{}", margin.round() as i64));
+        }
+
+        // Hide the cursor over the video while the controller is hidden.
+        let hide = !self.ui.osc_visible && !self.player.idle && !self.player.pause && !self.ui.pointer_over_ui;
+        if hide != self.cursor_hidden {
+            self.cursor_hidden = hide;
+            window.set_cursor_visible(!hide);
+        }
+        for c in cmds {
+            self.run_app_command(&c);
+        }
+        if self.snapshot.is_some() {
+            window.request_redraw();
+        }
+    }
+
+    fn on_activity(&mut self) {
+        self.ui.last_activity = Instant::now();
+        if self.cursor_hidden {
+            self.cursor_hidden = false;
+            if let Some(w) = self.window() {
+                w.set_cursor_visible(true);
+            }
+        }
+        self.redraw();
+    }
+}
+
+const MEDIA_EXTS: &[&str] = &[
+    "mkv", "mp4", "m4v", "avi", "mov", "webm", "wmv", "flv", "ts", "m2ts", "mts", "mpg", "mpeg", "vob", "ogv", "3gp", "rmvb", "mp3",
+    "flac", "m4a", "aac", "ogg", "opus", "wav", "wma", "alac", "ape", "m3u", "m3u8", "pls", "iso",
+];
+
+fn save_snapshot(gl: &glow::Context, size: PhysicalSize<u32>, path: &str) {
+    use glow::HasContext;
+    let (w, h) = (size.width as i32, size.height as i32);
+    let mut px = vec![0u8; (w * h * 4) as usize];
+    unsafe {
+        gl.read_pixels(0, 0, w, h, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut px)));
+    }
+    let row = (w * 4) as usize;
+    let flipped: Vec<u8> = px.chunks(row).rev().flatten().copied().collect();
+    if let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, flipped) {
+        let _ = img.save(path);
+    }
+}
+
+fn reveal(path: &str) {
+    if path.is_empty() || path.contains("://") {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer").arg(format!("/select,{path}")).spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = Path::new(path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        if self.gfx.is_none() {
+            self.create_window(el);
+        }
+    }
+
+    fn user_event(&mut self, el: &ActiveEventLoop, ev: UserEvent) {
+        match ev {
+            UserEvent::MpvEvents => self.handle_mpv_events(el),
+            UserEvent::MpvRender => self.redraw(),
+            UserEvent::Repaint(delay) => {
+                if delay.is_zero() {
+                    self.redraw();
+                } else if let Some(at) = Instant::now().checked_add(delay) {
+                    if self.repaint_at.is_none_or(|t| at < t) {
+                        self.repaint_at = Some(at);
+                    }
+                }
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        match self.repaint_at {
+            Some(t) if t <= Instant::now() => {
+                self.repaint_at = None;
+                self.redraw();
+                el.set_control_flow(ControlFlow::Wait);
+            }
+            Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
+            None => el.set_control_flow(ControlFlow::Wait),
+        }
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, _id: winit::window::WindowId, event: WindowEvent) {
+        let Some(gfx) = self.gfx.as_mut() else { return };
+        let resp = gfx.egui.on_window_event(&gfx.window, &event);
+        if resp.repaint {
+            gfx.window.request_redraw();
+        }
+        let egui_ctx = gfx.egui.egui_ctx.clone();
+
+        match event {
+            WindowEvent::CloseRequested => {
+                // `quit` saves the resume position; mpv then sends SHUTDOWN.
+                self.mpv.command(&["quit"]);
+            }
+            WindowEvent::Destroyed => el.exit(),
+            WindowEvent::Resized(size) => {
+                if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+                    gfx.surface.resize(&gfx.context, w, h);
+                }
+                // Keep mpv's fullscreen flag in sync if the OS changed it.
+                let fs = gfx.window.fullscreen().is_some();
+                if fs != self.player.fullscreen {
+                    self.mpv.set_flag("fullscreen", fs);
+                }
+                self.redraw();
+            }
+            WindowEvent::RedrawRequested => self.render(),
+            WindowEvent::DroppedFile(path) => {
+                // winit delivers one event per file; files dropped together
+                // arrive back-to-back: the first replaces playback, the rest append.
+                let p = path.to_string_lossy().into_owned();
+                let batch = self.last_drop.is_some_and(|t| t.elapsed() < Duration::from_millis(300));
+                self.open(&p, !batch);
+                self.last_drop = Some(Instant::now());
+            }
+            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state != ElementState::Pressed || egui_ctx.wants_keyboard_input() {
+                    return;
+                }
+                if let Some(spec) = keys::event_to_spec(&event, self.modifiers) {
+                    match self.bindings.lookup(&spec).cloned() {
+                        Some(Binding::Mpv(cmd)) => self.mpv.command_string(&cmd),
+                        Some(Binding::App(cmd)) => self.run_app_command(&cmd),
+                        None => {}
+                    }
+                    self.on_activity();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let moved = (position.x - self.cursor.x).abs() + (position.y - self.cursor.y).abs() > 0.5;
+                self.cursor = position;
+                if let Some((start, _)) = self.press {
+                    let d = (position.x - start.x).abs() + (position.y - start.y).abs();
+                    if d > 6.0 && !self.player.fullscreen {
+                        self.press = None;
+                        let _ = gfx.window.drag_window();
+                    }
+                }
+                if moved {
+                    self.on_activity();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let over_ui = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
+                match (button, state) {
+                    (MouseButton::Left, ElementState::Pressed) if !over_ui => {
+                        self.ui.context_menu = None;
+                        let now = Instant::now();
+                        if self.last_click.is_some_and(|t| now.duration_since(t) < Duration::from_millis(400)) {
+                            self.last_click = None;
+                            self.press = None;
+                            if !self.player.idle && !self.ui.pip {
+                                self.mpv.command(&["cycle", "fullscreen"]);
+                            } else if self.ui.pip {
+                                self.toggle_pip();
+                            }
+                        } else {
+                            self.last_click = Some(now);
+                            self.press = Some((self.cursor, now));
+                        }
+                    }
+                    (MouseButton::Left, ElementState::Released) => self.press = None,
+                    (MouseButton::Right, ElementState::Pressed) if !over_ui => {
+                        let ppp = egui_ctx.pixels_per_point() as f64;
+                        self.ui.context_menu = Some(egui::pos2((self.cursor.x / ppp) as f32, (self.cursor.y / ppp) as f32));
+                    }
+                    (MouseButton::Middle, ElementState::Pressed) if !over_ui => self.mpv.command(&["cycle", "pause"]),
+                    (MouseButton::Back, ElementState::Pressed) => self.mpv.command(&["seek", "-10"]),
+                    (MouseButton::Forward, ElementState::Pressed) => self.mpv.command(&["seek", "10"]),
+                    _ => {}
+                }
+                self.on_activity();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if egui_ctx.is_pointer_over_area() || self.player.idle {
+                    return;
+                }
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
+                    MouseScrollDelta::PixelDelta(p) => (p.x / 40.0, p.y / 40.0),
+                };
+                // Like IINA: vertical scroll = volume, horizontal = seek.
+                if dy.abs() >= dx.abs() {
+                    self.mpv.command(&["add", "volume", &format!("{:.1}", dy * 2.0)]);
+                } else {
+                    self.mpv.command(&["seek", &format!("{:.1}", dx * 2.0)]);
+                }
+                self.on_activity();
+            }
+            _ => {}
+        }
+    }
+
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        // The render context must be freed while the GL context is current.
+        self.mpv.free_render_context();
+        if let Some(mut g) = self.gfx.take() {
+            g.egui.destroy();
+        }
+    }
+}
+
+fn main() {
+    let mut args = Vec::new();
+    let mut mpv_opts = Vec::new();
+    for a in std::env::args().skip(1) {
+        if let Some(opt) = a.strip_prefix("--") {
+            match opt.split_once('=') {
+                Some((k, v)) => mpv_opts.push((k.to_string(), v.to_string())),
+                None => match opt.strip_prefix("no-") {
+                    Some(k) => mpv_opts.push((k.to_string(), "no".into())),
+                    None => mpv_opts.push((opt.to_string(), "yes".into())),
+                },
+            }
+        } else {
+            args.push(a);
+        }
+    }
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
+    let proxy = event_loop.create_proxy();
+    let mut app = match App::new(proxy, args, mpv_opts) {
+        Ok(a) => a,
+        Err(e) => {
+            let msg = format!(
+                "IINA-RS could not start mpv:\n\n{e}\n\nInstall libmpv (Linux: `sudo apt install libmpv2`), or place libmpv-2.dll next to the program (Windows)."
+            );
+            eprintln!("{msg}");
+            rfd::MessageDialog::new().set_title("IINA-RS").set_description(&msg).set_level(rfd::MessageLevel::Error).show();
+            std::process::exit(1);
+        }
+    };
+    event_loop.run_app(&mut app).expect("event loop error");
+}
