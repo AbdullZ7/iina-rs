@@ -99,6 +99,13 @@ struct App {
     /// Last known (path, position, duration) of the current file, for history.
     last_pos: Option<(String, f64, f64)>,
     debug_cmds_done: bool,
+    /// Property-change OSD is suppressed until shortly after a file starts,
+    /// so initial values don't flash messages.
+    osd_armed_at: Option<Instant>,
+    /// Show the position after the next seek (keyboard seeks, like IINA).
+    osd_seek: bool,
+    /// Show the chapter name after the next chapter change.
+    osd_chapter: bool,
 }
 
 fn config_dir() -> PathBuf {
@@ -132,8 +139,10 @@ impl App {
             ("ytdl", "yes"),
             ("watch-later-dir", &format!("{cfg}/watch_later")),
             ("screenshot-template", "IINA-RS %F %wH.%wM.%wS"),
-            ("osd-font-size", "40"),
-            ("osd-bar", "yes"),
+            // mpv's built-in OSD/OSC are replaced by IINA-RS's own UI.
+            ("osd-level", "0"),
+            ("osd-bar", "no"),
+            ("osd-on-seek", "no"),
             ("sub-auto", "fuzzy"),
             ("audio-file-auto", "fuzzy"),
             ("config-dir", &cfg),
@@ -197,6 +206,9 @@ impl App {
             history: history::History::load(&config_dir_for_history),
             last_pos: None,
             debug_cmds_done: false,
+            osd_armed_at: None,
+            osd_seek: false,
+            osd_chapter: false,
         })
     }
 
@@ -406,6 +418,19 @@ impl App {
             }
             "reveal" => reveal(arg),
             "about" => self.ui.show_about = true,
+            // Debug aid: open the context menu at the window center.
+            "ctx-menu" => {
+                if let Some(g) = self.gfx.as_ref() {
+                    let ctx = g.egui.egui_ctx.clone();
+                    self.ui.open_context_menu_center(&ctx);
+                }
+            }
+            // Debug aid: run a key binding by its spec, e.g. "key RIGHT".
+            "key" => match self.bindings.lookup(&keys::normalize(arg)).cloned() {
+                Some(Binding::Mpv(c)) => self.run_mpv_binding(&c),
+                Some(Binding::App(c)) => self.run_app_command(&c),
+                None => eprintln!("no binding for {arg}"),
+            },
             "inspector" => self.ui.show_inspector = !self.ui.show_inspector,
             "history" => self.ui.show_history = !self.ui.show_history,
             "history-remove" => self.history.remove(arg),
@@ -451,7 +476,7 @@ impl App {
                 }
             }
             "live-text" => {
-                self.mpv.command(&["show-text", &i18n::tl("Not available on this platform yet")]);
+                self.ui.show_osd(i18n::tl("Not available on this platform yet"), None);
             }
             other => eprintln!("unknown app command: {other}"),
         }
@@ -596,7 +621,10 @@ impl App {
                     el.exit();
                     return;
                 }
-                Event::StartFile => self.resize_on_video = self.ui.settings.resize_to_video,
+                Event::StartFile => {
+                    self.resize_on_video = self.ui.settings.resize_to_video;
+                    self.osd_armed_at = Some(Instant::now() + Duration::from_millis(1200));
+                }
                 Event::FileLoaded => {
                     self.add_siblings();
                     self.start_thumbnails();
@@ -607,9 +635,20 @@ impl App {
                         self.history.opened(&path, &title, dur);
                     }
                     self.player.crop_label = "None".into();
+                    if !title.is_empty() {
+                        self.ui.show_osd(title.clone(), None);
+                    }
                 }
                 Event::EndFile => self.flush_history(),
-                Event::PlaybackRestart if !self.debug_cmds_done => self.run_debug_cmds(),
+                Event::PlaybackRestart => {
+                    if self.osd_seek {
+                        self.osd_seek = false;
+                        self.show_seek_osd();
+                    }
+                    if !self.debug_cmds_done && std::env::var_os("IINA_RS_CMD_DELAY").is_none() {
+                        self.run_debug_cmds();
+                    }
+                }
                 Event::VideoReconfig => {
                     if self.resize_on_video && self.fit_to_video(1.0) {
                         self.resize_on_video = false;
@@ -625,6 +664,12 @@ impl App {
                     }
                     let before = (self.player.fullscreen, self.player.ontop, self.player.window_scale);
                     self.player.apply(&name, &value);
+                    self.osd_for_property(&name);
+                    if name == "chapter" && std::mem::take(&mut self.osd_chapter) {
+                        if let Some(c) = usize::try_from(self.player.chapter).ok().and_then(|i| self.player.chapters.get(i)) {
+                            self.ui.show_osd(i18n::tlf("Chapter: {}", &[&c.title]), None);
+                        }
+                    }
                     match name.as_str() {
                         "fullscreen" if before.0 != self.player.fullscreen => self.apply_fullscreen(),
                         "ontop" if before.1 != self.player.ontop => {
@@ -797,6 +842,109 @@ impl App {
         }
         if self.snapshot.is_some() {
             window.request_redraw();
+        }
+    }
+
+    /// Runs an input.conf command, routing mpv's OSD commands to our OSD and
+    /// arming OSD feedback for actions that don't change a watched property.
+    fn run_mpv_binding(&mut self, cmd: &str) {
+        let first = cmd.split_whitespace().next().unwrap_or("");
+        match first {
+            "show-progress" => {
+                self.osd_seek = true;
+                self.show_seek_osd();
+                return;
+            }
+            "show-text" => {
+                let text = cmd["show-text".len()..].trim().trim_matches('"').to_string();
+                self.ui.show_osd(text, None);
+                return;
+            }
+            "seek" | "frame-step" | "frame-back-step" | "sub-seek" => self.osd_seek = true,
+            "screenshot" => self.ui.show_osd(i18n::tl("Screenshot Captured"), None),
+            _ => {}
+        }
+        if cmd.contains("chapter") {
+            self.osd_chapter = true;
+        }
+        self.mpv.command_string(cmd);
+    }
+
+    fn show_seek_osd(&mut self) {
+        // Read the position directly: the time-pos change event for the new
+        // position may not have arrived yet when the seek completes.
+        let pos = self.mpv.get_string("time-pos").and_then(|s| s.parse::<f64>().ok()).unwrap_or(self.player.time_pos);
+        let dur = self.player.duration;
+        let progress = (dur > 0.0).then(|| (pos / dur) as f32);
+        self.ui.show_time_osd(format!("{} / {}", ui::fmt_time(pos), ui::fmt_time(dur)), progress);
+    }
+
+    fn track_desc(&self, kind: &str, id: &str) -> String {
+        if id == "no" || id.is_empty() {
+            return i18n::tl("None");
+        }
+        let Some(t) = self.player.tracks.iter().find(|t| t.kind == kind && t.id.to_string() == id) else { return format!("#{id}") };
+        let mut s = format!("#{}", t.id);
+        for part in [&t.title, &t.lang, &t.codec].into_iter().flatten() {
+            s.push(' ');
+            s.push_str(part);
+        }
+        s
+    }
+
+    /// IINA-style feedback for user-visible property changes.
+    fn osd_for_property(&mut self, name: &str) {
+        if self.osd_armed_at.is_none_or(|t| Instant::now() < t) {
+            return;
+        }
+        use i18n::{tl, tlf};
+        let p = &self.player;
+        let onoff = |b: bool| tl(if b { "On" } else { "Off" });
+        let msg: Option<(String, Option<f32>)> = match name {
+            "volume" => Some((tlf("Volume: {}", &[&format!("{:.0}", p.volume)]), Some((p.volume / 100.0) as f32))),
+            "mute" => Some((tl(if p.mute { "Mute" } else { "Unmute" }), None)),
+            "speed" => Some((tlf("Speed: {}x", &[&format!("{:.2}", p.speed)]), None)),
+            "pause" => Some((tl(if p.pause { "Pause" } else { "Resume" }), None)),
+            "sub-delay" => Some((tlf("Subtitle Delay: {}s", &[&format!("{:+.1}", p.sub_delay)]), None)),
+            "audio-delay" => Some((tlf("Audio Delay: {}s", &[&format!("{:+.1}", p.audio_delay)]), None)),
+            "sid" => Some((tlf("Subtitle: {}", &[&self.track_desc("sub", &p.sid)]), None)),
+            "secondary-sid" => Some((tlf("Secondary Subtitle: {}", &[&self.track_desc("sub", &p.secondary_sid)]), None)),
+            "aid" => Some((tlf("Audio: {}", &[&self.track_desc("audio", &p.aid)]), None)),
+            "vid" => Some((tlf("Video: {}", &[&self.track_desc("video", &p.vid)]), None)),
+            "sub-scale" => Some((tlf("Subtitle Scale: {}x", &[&format!("{:.2}", p.sub_scale)]), None)),
+            "sub-pos" => Some((tlf("Subtitle Position: {}", &[&format!("{:.0}", p.sub_pos)]), None)),
+            "sub-visibility" => Some((tl(if p.sub_visible { "Subtitles Visible" } else { "Subtitles Hidden" }), None)),
+            "loop-file" => Some((tl(if p.loop_file { "Loop: File" } else { "Loop: Off" }), None)),
+            "loop-playlist" => Some((tl(if p.loop_playlist { "Loop: Playlist" } else { "Loop: Off" }), None)),
+            "ab-loop-a" | "ab-loop-b" => Some((
+                match (p.ab_loop_a, p.ab_loop_b) {
+                    (Some(a), Some(b)) => tlf("A-B Loop: {} – {}", &[&ui::fmt_time(a), &ui::fmt_time(b)]),
+                    (Some(a), None) => tlf("A-B Loop: A = {}", &[&ui::fmt_time(a)]),
+                    _ => tl("A-B Loop: Off"),
+                },
+                None,
+            )),
+            "video-aspect-override" => Some((
+                tlf("Aspect Ratio: {}", &[&if p.aspect.is_empty() || p.aspect.starts_with('-') || p.aspect == "no" { tl("Default") } else { p.aspect.clone() }]),
+                None,
+            )),
+            "video-rotate" => Some((tlf("Rotation: {}°", &[&p.rotate]), None)),
+            "deinterlace" => Some((tlf("Deinterlace: {}", &[&onoff(p.deinterlace)]), None)),
+            "hwdec" => Some((tlf("Hardware Decoding: {}", &[&onoff(p.hwdec_enabled)]), None)),
+            "brightness" | "contrast" | "saturation" | "gamma" | "hue" => {
+                let (label, val) = match name {
+                    "brightness" => ("Brightness", p.brightness),
+                    "contrast" => ("Contrast", p.contrast),
+                    "saturation" => ("Saturation", p.saturation),
+                    "gamma" => ("Gamma", p.gamma),
+                    _ => ("Hue", p.hue),
+                };
+                Some((format!("{}: {val}", tl(label)), Some(((val + 100) as f32) / 200.0)))
+            }
+            _ => None,
+        };
+        if let Some((text, progress)) = msg {
+            self.ui.show_osd(text, progress);
         }
     }
 
@@ -1062,6 +1210,17 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        // Debug aid: IINA_RS_CMD_DELAY=secs runs IINA_RS_CMD after a delay.
+        if let Some(d) = std::env::var("IINA_RS_CMD_DELAY").ok().and_then(|v| v.parse::<f64>().ok()) {
+            if !self.debug_cmds_done {
+                let at = self.started + Duration::from_secs_f64(d);
+                if Instant::now() >= at {
+                    self.run_debug_cmds();
+                } else if self.repaint_at.is_none_or(|r| at < r) {
+                    self.repaint_at = Some(at);
+                }
+            }
+        }
         // Debug aid: IINA_RS_FS_TOGGLES=n cycles fullscreen every 2 s, n times.
         if let Some(n) = std::env::var("IINA_RS_FS_TOGGLES").ok().and_then(|v| v.parse::<u32>().ok()) {
             if self.fs_toggles < n && self.started.elapsed() > Duration::from_secs(2 * (self.fs_toggles as u64 + 1)) {
@@ -1138,7 +1297,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if let Some(spec) = keys::event_to_spec(&event, self.modifiers) {
                     match self.bindings.lookup(&spec).cloned() {
-                        Some(Binding::Mpv(cmd)) => self.mpv.command_string(&cmd),
+                        Some(Binding::Mpv(cmd)) => self.run_mpv_binding(&cmd),
                         Some(Binding::App(cmd)) => self.run_app_command(&cmd),
                         None => {}
                     }

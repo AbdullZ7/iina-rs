@@ -53,6 +53,9 @@ pub struct UiState {
     pub subs: subtitles::Shared,
     /// Result message of the last file-association action.
     pub assoc_status: String,
+    /// IINA-style on-screen message: (logical text, optional progress 0..1,
+    /// shown at, progress is a time position — never mirrored).
+    pub osd: Option<(String, Option<f32>, Instant, bool)>,
     thumb_path: String,
     thumb_tex: HashMap<usize, egui::TextureHandle>,
 }
@@ -84,9 +87,25 @@ impl UiState {
             show_subs: false,
             subs: Default::default(),
             assoc_status: String::new(),
+            osd: None,
             thumb_path: String::new(),
             thumb_tex: HashMap::new(),
         }
+    }
+
+    /// Shows an on-screen message (replaces mpv's own OSD, which is disabled).
+    pub fn show_osd(&mut self, text: String, progress: Option<f32>) {
+        self.osd = Some((text, progress, Instant::now(), false));
+    }
+
+    /// OSD for a playback position (its bar keeps left-to-right in Arabic).
+    pub fn show_time_osd(&mut self, text: String, progress: Option<f32>) {
+        self.osd = Some((text, progress, Instant::now(), true));
+    }
+
+    /// Debug aid: opens the context menu at the window center.
+    pub fn open_context_menu_center(&mut self, ctx: &egui::Context) {
+        self.context_menu = Some(ctx.screen_rect().center());
     }
 
     pub fn toggle_tab(&mut self, tab: Tab) {
@@ -185,6 +204,79 @@ fn row<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 
 fn row_wrapped<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     ui.horizontal_wrapped(add).inner
+}
+
+/// Checkbox whose box sits on the reading-start side (right in Arabic).
+fn check(ui: &mut Ui, value: &mut bool, text: impl Into<egui::WidgetText>) -> Response {
+    if !is_rtl() {
+        return ui.checkbox(value, text);
+    }
+    ui.horizontal(|ui| {
+        // In a right-aligned body rows run right-to-left: box first = rightmost.
+        let mut r = ui.add(egui::Checkbox::without_text(value));
+        let label = ui.add(egui::Label::new(text).sense(Sense::click()));
+        if label.clicked() {
+            *value = !*value;
+            r.mark_changed();
+        }
+        r | label
+    })
+    .inner
+}
+
+/// Slider mirrored in Arabic: minimum on the right, value box on the far left.
+fn slider<N: egui::emath::Numeric>(ui: &mut Ui, value: &mut N, range: std::ops::RangeInclusive<N>, suffix: &str, decimals: usize) -> Response {
+    if !is_rtl() {
+        return ui.add(egui::Slider::new(value, range).suffix(suffix).max_decimals(decimals));
+    }
+    ui.horizontal(|ui| {
+        let (lo, hi) = (*range.start(), *range.end());
+        let r = ui.add(egui::Slider::new(value, hi..=lo).show_value(false));
+        let d = ui.add(egui::DragValue::new(value).range(lo..=hi).suffix(suffix).max_decimals(decimals).speed(((hi.to_f64() - lo.to_f64()) / 200.0).max(0.01)));
+        r | d
+    })
+    .inner
+}
+
+/// Window header for Arabic: title on the right, close button on the left
+/// (egui's own title bar is left-to-right). Returns true when closed.
+fn rtl_header(ui: &mut Ui, title: &str) -> bool {
+    if !is_rtl() {
+        return false;
+    }
+    let mut close = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).size(15.0).color(FG));
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            if ui.add(egui::Button::new("✕").frame(false)).clicked() {
+                close = true;
+            }
+        });
+    });
+    ui.separator();
+    close
+}
+
+/// Context-menu entry: label at the reading start, shortcut at the other end.
+fn menu_item(ui: &mut Ui, label: &str, shortcut: &str) -> Response {
+    let h = 24.0;
+    let w = ui.available_width().max(200.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    let font = FontId::proportional(14.0);
+    let pad = 8.0;
+    let (main_align, main_x, sc_align, sc_x) = if is_rtl() {
+        (Align2::RIGHT_CENTER, rect.right() - pad, Align2::LEFT_CENTER, rect.left() + pad)
+    } else {
+        (Align2::LEFT_CENTER, rect.left() + pad, Align2::RIGHT_CENTER, rect.right() - pad)
+    };
+    ui.painter().text(pos2(main_x, rect.center().y), main_align, label, font.clone(), FG);
+    if !shortcut.is_empty() {
+        ui.painter().text(pos2(sc_x, rect.center().y), sc_align, shortcut, font, FG_DIM);
+    }
+    resp
 }
 
 /// A table. egui's Grid doesn't support right-aligned containers, so in
@@ -404,6 +496,7 @@ fn bar_slider(
     max: f64,
     marks: &[f64],
     ranges: &[(f64, f64, Color32)],
+    rtl: bool,
 ) -> (Response, Option<(f64, bool)>, Option<BarHover>) {
     let height = 18.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
@@ -411,31 +504,37 @@ fn bar_slider(
     let thick = if active { 5.0 } else { 3.5 };
     let bar = Rect::from_center_size(rect.center(), vec2(rect.width(), thick));
     let frac = |v: f64| if max > 0.0 { (v / max).clamp(0.0, 1.0) as f32 } else { 0.0 };
+    // Screen x of a value; mirrored when the bar fills right-to-left.
+    let xpos = |v: f64| if rtl { bar.right() - bar.width() * frac(v) } else { bar.left() + bar.width() * frac(v) };
     let p = ui.painter();
     p.rect_filled(bar, thick / 2.0, TRACK_BG);
     for &(a, b, color) in ranges {
-        let (x0, x1) = (bar.left() + bar.width() * frac(a), bar.left() + bar.width() * frac(b));
+        let (x0, x1) = (xpos(a).min(xpos(b)), xpos(a).max(xpos(b)));
         if x1 > x0 {
             p.rect_filled(Rect::from_min_max(pos2(x0, bar.top()), pos2(x1, bar.bottom())), thick / 2.0, color);
         }
     }
-    p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * frac(value), thick)), thick / 2.0, FG);
+    let fill = Rect::from_min_max(pos2(xpos(0.0).min(xpos(value)), bar.top()), pos2(xpos(0.0).max(xpos(value)), bar.bottom()));
+    p.rect_filled(fill, thick / 2.0, FG);
     if max > 0.0 {
         for &m in marks {
-            let x = bar.left() + bar.width() * frac(m);
+            let x = xpos(m);
             p.line_segment([pos2(x, bar.top() - 1.0), pos2(x, bar.bottom() + 1.0)], Stroke::new(1.5_f32, Color32::from_black_alpha(160)));
         }
     }
     if active {
-        p.circle_filled(pos2(bar.left() + bar.width() * frac(value), bar.center().y), 6.0, Color32::WHITE);
+        p.circle_filled(pos2(xpos(value), bar.center().y), 6.0, Color32::WHITE);
     }
     let pointer_value = resp
         .interact_pointer_pos()
         .or(resp.hover_pos())
-        .map(|pos| (((pos.x - bar.left()) / bar.width()).clamp(0.0, 1.0) as f64) * max);
+        .map(|pos| {
+            let f = ((pos.x - bar.left()) / bar.width()).clamp(0.0, 1.0) as f64;
+            if rtl { (1.0 - f) * max } else { f * max }
+        });
     let hover = pointer_value.filter(|_| active && max > 0.0).map(|v| BarHover {
         value: v,
-        anchor: pos2(bar.left() + bar.width() * frac(v), rect.top()),
+        anchor: pos2(xpos(v), rect.top()),
     });
     let mut out = None;
     if let Some(v) = pointer_value {
@@ -533,6 +632,7 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
     if let Some(tab) = ui_state.sidebar {
         sidebar(ctx, ui_state, tab, pl, mpv, &mut cmds);
     }
+    osd(ctx, ui_state);
     context_menu(ctx, ui_state, pl, &mut cmds);
     url_dialog(ctx, ui_state, mpv);
     jump_dialog(ctx, ui_state, pl, mpv);
@@ -551,6 +651,49 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
     }
     ui_state.pointer_over_ui = ctx.is_pointer_over_area();
     cmds
+}
+
+/// IINA-style OSD: a rounded HUD message in the top corner (top-left, or
+/// top-right in Arabic) with an optional progress bar, fading out.
+fn osd(ctx: &egui::Context, st: &mut UiState) {
+    const SHOW: f32 = 1.4;
+    const FADE: f32 = 0.25;
+    let Some((text, progress, at, time)) = st.osd.clone() else { return };
+    let age = at.elapsed().as_secs_f32();
+    if age > SHOW + FADE {
+        st.osd = None;
+        return;
+    }
+    let alpha = if age > SHOW { 1.0 - (age - SHOW) / FADE } else { 1.0 };
+    ctx.request_repaint();
+    let top = if st.fullscreen || st.music_mode { 58.0 } else { 18.0 };
+    let (align, offset) = if is_rtl() { (Align2::RIGHT_TOP, vec2(-20.0, top)) } else { (Align2::LEFT_TOP, vec2(20.0, top)) };
+    egui::Area::new(egui::Id::new("osd"))
+        .anchor(align, offset)
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.multiply_opacity(alpha);
+            egui::Frame::new()
+                .fill(HUD_BG)
+                .corner_radius(10)
+                .inner_margin(egui::Margin::symmetric(16, 10))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(v(&text)).size(22.0).color(FG));
+                    if let Some(p) = progress {
+                        let (r, _) = ui.allocate_exact_size(vec2(240.0, 6.0), Sense::hover());
+                        ui.painter().rect_filled(r, 3.0, TRACK_BG);
+                        let w = r.width() * p.clamp(0.0, 1.0);
+                        // Levels (volume…) fill from the reading start; time doesn't mirror.
+                        let fill = if is_rtl() && !time {
+                            Rect::from_min_max(pos2(r.right() - w, r.top()), r.max)
+                        } else {
+                            Rect::from_min_size(r.min, vec2(w, r.height()))
+                        };
+                        ui.painter().rect_filled(fill, 3.0, FG);
+                    }
+                });
+        });
 }
 
 fn title_bar(ctx: &egui::Context, pl: &Player, alpha: f32) {
@@ -591,21 +734,52 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
                 .inner_margin(egui::Margin::symmetric(14, 8))
                 .show(ui, |ui| {
                     ui.set_width(width - 28.0);
-                    // Row 1: volume | transport | toggles
+                    // Row 1: volume | transport | toggles. In Arabic the side groups
+                    // swap (volume on the right, fills right-to-left); transport
+                    // buttons and the seek bar keep their direction, as media
+                    // controls do in RTL interfaces (Material bidi guidelines).
+                    let rtl = is_rtl();
+                    let side_w = (width - 28.0 - 3.0 * 34.0) / 2.0 - 8.0;
+                    let volume = |ui: &mut Ui| {
+                        let icon: IconFn = if pl.mute || pl.volume <= 0.0 { icon_muted } else { icon_volume };
+                        if icon_button(ui, 26.0, &t("Mute"), icon).clicked() {
+                            mpv.command(&["cycle", "mute"]);
+                        }
+                        if !compact {
+                            let (r, v, _) = bar_slider(ui, (side_w - 40.0).clamp(30.0, 90.0), pl.volume, 100.0, &[], &[], rtl);
+                            if let Some((v, _)) = v {
+                                mpv.set_double("volume", v.round());
+                            }
+                            r.on_hover_text(tf("Volume {}", &[&format!("{:.0}", pl.volume)]));
+                        }
+                    };
+                    let pip = st.pip;
+                    let mut toggles = |ui: &mut Ui| {
+                        if !pip && icon_button(ui, 26.0, &t("Fullscreen"), icon_fullscreen).clicked() {
+                            cmds.push("toggle-fullscreen".into());
+                        }
+                        if icon_button(ui, 26.0, &t("Picture-in-Picture"), icon_pip).clicked() {
+                            cmds.push("toggle-pip".into());
+                        }
+                        if !compact {
+                            if icon_button(ui, 26.0, &t("Playlist"), icon_playlist).clicked() {
+                                cmds.push("playlist-panel".into());
+                            }
+                            if icon_button(ui, 26.0, &t("Subtitles"), icon_subtitle).clicked() {
+                                cmds.push("sub-panel".into());
+                            }
+                            if icon_button(ui, 26.0, &t("Video & Audio settings"), icon_settings).clicked() {
+                                cmds.push("video-panel".into());
+                            }
+                            if (pl.speed - 1.0).abs() > 1e-3 {
+                                ui.label(RichText::new(format!("{:.2}x", pl.speed)).size(11.5).color(FG_DIM));
+                            }
+                        }
+                    };
                     ui.horizontal(|ui| {
-                        let side_w = (width - 28.0 - 3.0 * 34.0) / 2.0 - 8.0;
+                        // Starting side: volume (LTR) or toggles (RTL), from the left edge.
                         ui.allocate_ui_with_layout(vec2(side_w, 30.0), Layout::left_to_right(Align::Center), |ui| {
-                            let icon: IconFn = if pl.mute || pl.volume <= 0.0 { icon_muted } else { icon_volume };
-                            if icon_button(ui, 26.0, &t("Mute"), icon).clicked() {
-                                mpv.command(&["cycle", "mute"]);
-                            }
-                            if !compact {
-                                let (r, v, _) = bar_slider(ui, (side_w - 40.0).clamp(30.0, 90.0), pl.volume, 100.0, &[], &[]);
-                                if let Some((v, _)) = v {
-                                    mpv.set_double("volume", v.round());
-                                }
-                                r.on_hover_text(tf("Volume {}", &[&format!("{:.0}", pl.volume)]));
-                            }
+                            if rtl { toggles(ui) } else { volume(ui) }
                         });
                         if icon_button(ui, 34.0, &t("Previous"), icon_prev).clicked() {
                             if pl.playlist_count > 1 {
@@ -625,27 +799,9 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
                                 mpv.command(&["seek", "10"]);
                             }
                         }
+                        // Ending side, from the right edge.
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if !st.pip && icon_button(ui, 26.0, &t("Fullscreen"), icon_fullscreen).clicked() {
-                                cmds.push("toggle-fullscreen".into());
-                            }
-                            if icon_button(ui, 26.0, &t("Picture-in-Picture"), icon_pip).clicked() {
-                                cmds.push("toggle-pip".into());
-                            }
-                            if !compact {
-                                if icon_button(ui, 26.0, &t("Playlist"), icon_playlist).clicked() {
-                                    cmds.push("playlist-panel".into());
-                                }
-                                if icon_button(ui, 26.0, &t("Subtitles"), icon_subtitle).clicked() {
-                                    cmds.push("sub-panel".into());
-                                }
-                                if icon_button(ui, 26.0, &t("Video & Audio settings"), icon_settings).clicked() {
-                                    cmds.push("video-panel".into());
-                                }
-                                if (pl.speed - 1.0).abs() > 1e-3 {
-                                    ui.label(RichText::new(format!("{:.2}x", pl.speed)).size(11.5).color(FG_DIM));
-                                }
-                            }
+                            if rtl { volume(ui) } else { toggles(ui) }
                         });
                     });
                     // Row 2: time | seek bar | duration (click to toggle remaining)
@@ -665,7 +821,7 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
                             ranges.push((a.min(b), a.max(b), Color32::from_rgba_unmultiplied(80, 150, 255, 140)));
                         }
                         let bar_w = ui.available_width() - label_w - 8.0;
-                        let (r, v, h) = bar_slider(ui, bar_w, shown, pl.duration, &marks, &ranges);
+                        let (r, v, h) = bar_slider(ui, bar_w, shown, pl.duration, &marks, &ranges, false);
                         st.seek_bar_rect = Some(r.rect);
                         hover = h;
                         if let Some((v, finished)) = v {
@@ -780,7 +936,7 @@ fn labeled_slider(ui: &mut Ui, mpv: &Mpv, label: &str, prop: &str, value: f64, r
     ui.label(RichText::new(t(label)).color(FG_DIM));
     row(ui, |ui| {
         let mut x = value;
-        let r = ui.add(egui::Slider::new(&mut x, range).suffix(suffix).max_decimals(2));
+        let r = slider(ui, &mut x, range, suffix, 2);
         if r.changed() {
             mpv.set_double(prop, x);
         }
@@ -868,7 +1024,7 @@ fn sidebar(ctx: &egui::Context, st: &mut UiState, tab: Tab, pl: &Player, mpv: &M
                     track_list(ui, mpv, &tracks, "secondary-sid", true, |t| t.id.to_string() == sec);
                     ui.separator();
                     let mut vis = pl.sub_visible;
-                    if ui.checkbox(&mut vis, t("Show subtitles")).changed() {
+                    if check(ui, &mut vis, t("Show subtitles")).changed() {
                         mpv.set_flag("sub-visibility", vis);
                     }
                     labeled_slider(ui, mpv, "Subtitle delay", "sub-delay", pl.sub_delay, -10.0..=10.0, 0.0, " s");
@@ -896,7 +1052,7 @@ fn playlist_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
             mpv.command(&["playlist-shuffle"]);
         }
         let mut looping = pl.loop_playlist;
-        if ui.checkbox(&mut looping, t("Loop")).changed() {
+        if check(ui, &mut looping, t("Loop")).changed() {
             mpv.set_string("loop-playlist", if looping { "inf" } else { "no" });
         }
     });
@@ -977,15 +1133,15 @@ fn video_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
     });
     row(ui, |ui| {
         let mut flip = pl.vf.contains("@iina-flip");
-        if ui.checkbox(&mut flip, t("Flip")).changed() {
+        if check(ui, &mut flip, t("Flip")).changed() {
             mpv.command(&["vf", "toggle", "@iina-flip:vflip"]);
         }
         let mut mirror = pl.vf.contains("@iina-mirror");
-        if ui.checkbox(&mut mirror, t("Mirror")).changed() {
+        if check(ui, &mut mirror, t("Mirror")).changed() {
             mpv.command(&["vf", "toggle", "@iina-mirror:hflip"]);
         }
         let mut deint = pl.deinterlace;
-        if ui.checkbox(&mut deint, t("Deinterlace")).changed() {
+        if check(ui, &mut deint, t("Deinterlace")).changed() {
             mpv.set_string("deinterlace", if deint { "yes" } else { "no" });
         }
     });
@@ -1001,7 +1157,7 @@ fn video_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
         row(ui, |ui| {
             ui.add_sized(vec2(84.0, 18.0), egui::Label::new(RichText::new(t(label)).color(FG_DIM)));
             let mut x = v as f64;
-            if ui.add(egui::Slider::new(&mut x, -100.0..=100.0).integer()).changed() {
+            if slider(ui, &mut x, -100.0..=100.0, "", 0).changed() {
                 mpv.set_string(prop, &format!("{}", x.round() as i64));
             }
         });
@@ -1013,7 +1169,7 @@ fn video_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
     }
     ui.separator();
     let mut hw = pl.hwdec_enabled;
-    if ui.checkbox(&mut hw, t("Hardware decoding")).changed() {
+    if check(ui, &mut hw, t("Hardware decoding")).changed() {
         mpv.set_string("hwdec", if hw { "auto-safe" } else { "no" });
     }
     ui.label(RichText::new(tf("Decoder: {}", &[&if pl.hwdec_current.is_empty() { tl("software") } else { pl.hwdec_current.clone() }])).color(FG_DIM).size(11.0));
@@ -1065,14 +1221,16 @@ fn context_menu(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut V
     let Some(pos) = st.context_menu else { return };
     let resp = egui::Area::new(egui::Id::new("ctx-menu"))
         .fixed_pos(pos)
+        // Menus open towards the reading direction.
+        .pivot(if is_rtl() { Align2::RIGHT_TOP } else { Align2::LEFT_TOP })
         .order(egui::Order::Foreground)
         .constrain(true)
         .show(ctx, |ui| rtl_window(ui, 240.0, |ui| {
             egui::Frame::menu(ui.style()).show(ui, |ui| {
-                ui.set_min_width(210.0);
+                // Arabic labels are wider; leave room for label + shortcut.
+                ui.set_min_width(if is_rtl() { 330.0 } else { 250.0 });
                 let mut item = |ui: &mut Ui, label: &str, shortcut: &str, cmd: &str| {
-                    let b = egui::Button::new(t(label)).frame(false).shortcut_text(shortcut);
-                    if ui.add(b).clicked() {
+                    if menu_item(ui, &t(label), shortcut).clicked() {
                         cmds.push(cmd.to_string());
                     }
                 };
@@ -1119,11 +1277,15 @@ fn url_dialog(ctx: &egui::Context, st: &mut UiState, mpv: &Mpv) {
     let Some(url) = st.url_input.as_mut() else { return };
     let mut close = false;
     egui::Window::new(t("Open URL"))
+        .title_bar(!is_rtl())
         .id(egui::Id::new("win-Open URL"))
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
         .show(ctx, |ui| rtl_window(ui, 440.0, |ui| {
+            if rtl_header(ui, &t("Open URL")) {
+                close = true;
+            }
             ui.label(t("Enter a media URL (http, https, YouTube via yt-dlp, …):"));
             let r = ui.add(egui::TextEdit::singleline(url).desired_width(380.0).hint_text(t("https://")));
             r.request_focus();
@@ -1160,11 +1322,15 @@ fn jump_dialog(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv) {
     let Some(text) = st.jump_input.as_mut() else { return };
     let mut close = false;
     egui::Window::new(t("Jump to"))
+        .title_bar(!is_rtl())
         .id(egui::Id::new("win-Jump to"))
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
         .show(ctx, |ui| rtl_window(ui, 400.0, |ui| {
+            if rtl_header(ui, &t("Jump to")) {
+                close = true;
+            }
             ui.label(tf("Time (hh:mm:ss) or percentage — duration {}", &[&fmt_time(pl.duration)]));
             let r = ui.add(egui::TextEdit::singleline(text).desired_width(240.0).hint_text(t("1:23:45  or  50%")));
             r.request_focus();
@@ -1192,7 +1358,9 @@ fn inspector(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv) {
     }
     let mut open = true;
     let g = |p: &str| mpv.get_string(p).filter(|s| !s.is_empty()).unwrap_or_else(|| "—".into());
+    let mut header_close = false;
     egui::Window::new(t("Inspector"))
+        .title_bar(!is_rtl())
         .id(egui::Id::new("win-Inspector"))
         .open(&mut open)
         .default_width(380.0)
@@ -1200,6 +1368,9 @@ fn inspector(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv) {
         .vscroll(true)
         .max_height((ctx.screen_rect().height() - 80.0).max(200.0))
         .show(ctx, |ui| rtl_window(ui, 420.0, |ui| {
+            if rtl_header(ui, &t("Inspector")) {
+                header_close = true;
+            }
             let section = |ui: &mut Ui, title: &str, rows: &[(&str, String)]| {
                 ui.label(RichText::new(t(title)).strong().color(FG));
                 if is_rtl() {
@@ -1259,6 +1430,9 @@ fn inspector(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv) {
             ]);
             ctx.request_repaint_after(Duration::from_millis(500));
         }));
+    if header_close {
+        open = false;
+    }
     st.show_inspector = open;
 }
 
@@ -1269,7 +1443,9 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
     let mut open = true;
     let before = st.settings.clone();
     let assoc_status = st.assoc_status.clone();
+    let mut header_close = false;
     egui::Window::new(t("Preferences"))
+        .title_bar(!is_rtl())
         .id(egui::Id::new("win-Preferences"))
         .open(&mut open)
         .collapsible(false)
@@ -1278,6 +1454,9 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
         .max_height((ctx.screen_rect().height() - 90.0).max(200.0))
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
         .show(ctx, |ui| rtl_window(ui, 560.0, |ui| {
+            if rtl_header(ui, &t("Preferences")) {
+                header_close = true;
+            }
             let s = &mut st.settings;
             row(ui, |ui| {
                 ui.label(t("Language"));
@@ -1289,25 +1468,25 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
             });
             ui.add_space(4.0);
             ui.label(RichText::new(t("General")).strong());
-            ui.checkbox(&mut s.resume_playback, t("Resume last playback position"));
-            ui.checkbox(&mut s.auto_add_folder, t("Add files in the same folder to the playlist"));
-            ui.checkbox(&mut s.resize_to_video, t("Resize window to video size when opening a file"));
-            ui.checkbox(&mut s.single_instance, t("Open files in the running window (single instance)"));
+            check(ui, &mut s.resume_playback, t("Resume last playback position"));
+            check(ui, &mut s.auto_add_folder, t("Add files in the same folder to the playlist"));
+            check(ui, &mut s.resize_to_video, t("Resize window to video size when opening a file"));
+            check(ui, &mut s.single_instance, t("Open files in the running window (single instance)"));
             ui.add_space(6.0);
             ui.label(RichText::new(t("UI")).strong());
-            ui.checkbox(&mut s.thumbnails, t("Show thumbnail preview on the seek bar"));
-            ui.checkbox(&mut s.show_remaining, t("Show remaining time"));
-            ui.checkbox(&mut s.click_to_pause, t("Single click on video toggles pause"));
+            check(ui, &mut s.thumbnails, t("Show thumbnail preview on the seek bar"));
+            check(ui, &mut s.show_remaining, t("Show remaining time"));
+            check(ui, &mut s.click_to_pause, t("Single click on video toggles pause"));
             row(ui, |ui| {
                 ui.label(t("Hide controller after"));
-                ui.add(egui::Slider::new(&mut s.osc_hide_secs, 1.0..=10.0).suffix(" s").max_decimals(1));
+                slider(ui, &mut s.osc_hide_secs, 1.0..=10.0, " s", 1);
             });
             ui.add_space(6.0);
             ui.label(RichText::new(t("Video / Audio")).strong());
-            ui.checkbox(&mut s.hardware_decoding, t("Enable hardware decoding"));
+            check(ui, &mut s.hardware_decoding, t("Enable hardware decoding"));
             row(ui, |ui| {
                 ui.label(t("Initial volume"));
-                ui.add(egui::Slider::new(&mut s.volume, 0.0..=100.0).integer());
+                slider(ui, &mut s.volume, 0.0..=100.0, "", 0);
             });
             ui.add_space(6.0);
             ui.label(RichText::new(t("Screenshots")).strong());
@@ -1359,6 +1538,9 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
             ui.add_space(6.0);
             ui.label(RichText::new(t("Settings folder: input.conf (key bindings), mpv.conf (mpv options), scripts/ (mpv Lua/JS scripts).")).size(11.0).color(FG_DIM));
         }));
+    if header_close {
+        open = false;
+    }
     if st.settings != before {
         st.settings_dirty = true;
     }
@@ -1367,13 +1549,18 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
 
 fn about(ctx: &egui::Context, st: &mut UiState) {
     let mut open = st.show_about;
+    let mut header_close = false;
     egui::Window::new(t("About IINA-RS"))
+        .title_bar(!is_rtl())
         .id(egui::Id::new("win-About IINA-RS"))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
         .show(ctx, |ui| rtl_window(ui, 380.0, |ui| {
+            if rtl_header(ui, &t("About IINA-RS")) {
+                header_close = true;
+            }
             ui.vertical_centered(|ui| {
                 ui.add(egui::Image::new(egui::include_image!("../assets/iina-rs.png")).fit_to_exact_size(vec2(80.0, 80.0)));
                 ui.heading("IINA-RS");
@@ -1389,6 +1576,9 @@ fn about(ctx: &egui::Context, st: &mut UiState) {
                 ui.hyperlink_to(t("mpv"), "https://mpv.io");
             });
         }));
+    if header_close {
+        open = false;
+    }
     st.show_about = open;
 }
 
@@ -1397,11 +1587,16 @@ fn history_window(ctx: &egui::Context, st: &mut UiState, hist: &History, cmds: &
         return;
     }
     let mut open = true;
+    let mut header_close = false;
     egui::Window::new(t("Playback History"))
+        .title_bar(!is_rtl())
         .id(egui::Id::new("win-Playback History"))
         .open(&mut open)
         .default_size(vec2(560.0, 420.0))
         .show(ctx, |ui| rtl_window(ui, 580.0, |ui| {
+            if rtl_header(ui, &t("Playback History")) {
+                header_close = true;
+            }
             row(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut st.history_filter).hint_text(t("Search…")).desired_width(260.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1458,6 +1653,9 @@ fn history_window(ctx: &egui::Context, st: &mut UiState, hist: &History, cmds: &
                 }
             });
         }));
+    if header_close {
+        open = false;
+    }
     st.show_history = open;
 }
 
@@ -1469,11 +1667,16 @@ fn subtitle_search(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>
     let shared = st.subs.clone();
     let mut s = shared.lock().unwrap();
     let before_provider = s.provider;
+    let mut header_close = false;
     egui::Window::new(t("Find Online Subtitles"))
+        .title_bar(!is_rtl())
         .id(egui::Id::new("win-Find Online Subtitles"))
         .open(&mut open)
         .default_size(vec2(680.0, 440.0))
         .show(ctx, |ui| rtl_window(ui, 680.0, |ui| {
+            if rtl_header(ui, &t("Find Online Subtitles")) {
+                header_close = true;
+            }
             row(ui, |ui| {
                 ui.label(t("Source"));
                 for p in subtitles::Provider::ALL {
@@ -1542,6 +1745,9 @@ fn subtitle_search(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>
                 });
             });
         }));
+    if header_close {
+        open = false;
+    }
     if s.provider != before_provider {
         // Remember the chosen source; results belong to the previous one.
         st.settings.sub_provider = s.provider.name().to_string();
