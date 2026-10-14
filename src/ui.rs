@@ -2,6 +2,7 @@
 //! (playlist / chapters / quick settings) and welcome window.
 
 use crate::history::{self, History};
+use crate::i18n::{is_rtl, t, tf, tl, v};
 use crate::mpv::Mpv;
 use crate::settings::Settings;
 use crate::subtitles;
@@ -171,6 +172,62 @@ fn install_fallback_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+// ------------------------------------------------------------ RTL layout ---
+
+/// A row of widgets. Inside a right-aligned body (`rtl_body` / `rtl_window`)
+/// egui lays horizontal rows out right-to-left by itself, so in Arabic rows
+/// read from the right.
+fn row<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.horizontal(add).inner
+}
+
+fn row_wrapped<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.horizontal_wrapped(add).inner
+}
+
+/// A table. egui's Grid doesn't support right-aligned containers, so in
+/// Arabic the same cells go into a wrapping row, where `ui.end_row()` starts a
+/// new line (laid out right-to-left inside RTL bodies).
+fn grid<R>(ui: &mut Ui, id: &str, cols: usize, striped: bool, spacing: egui::Vec2, add: impl FnOnce(&mut Ui) -> R) -> R {
+    if is_rtl() {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = spacing;
+            add(ui)
+        })
+        .inner
+    } else {
+        egui::Grid::new(id).num_columns(cols).striped(striped).spacing(spacing).show(ui, add).inner
+    }
+}
+
+/// Panel body: right-aligned in Arabic (the panel already has a fixed width).
+fn rtl_body<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    if is_rtl() {
+        ui.with_layout(Layout::top_down(Align::Max), add).inner
+    } else {
+        add(ui)
+    }
+}
+
+/// Window body of the given width: right-aligned in Arabic. Auto-sized
+/// windows measure their content with unbounded width, so right-aligned
+/// content needs an explicit width or the window grows off-screen.
+fn rtl_window<R>(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    if is_rtl() {
+        let w = width.min(ui.ctx().screen_rect().width() - 60.0).max(200.0);
+        // Build the child from an explicit rect: inside scrolling / auto-sized
+        // windows the parent's max width can be infinite, and right-aligning
+        // against it yields NaN positions.
+        let h = ui.available_height();
+        let h = if h.is_finite() { h.max(0.0) } else { 10_000.0 };
+        let rect = Rect::from_min_size(ui.cursor().min, vec2(w, h));
+        let r = ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Max)), add);
+        r.inner
+    } else {
+        add(ui)
+    }
 }
 
 // ---------------------------------------------------------------- icons ---
@@ -398,7 +455,7 @@ fn seek_preview(ctx: &egui::Context, st: &mut UiState, pl: &Player, thumbs: Opti
     let screen = ctx.screen_rect();
     let chapter = pl.chapters.iter().rev().find(|c| c.time <= hover.value).map(|c| c.title.clone()).unwrap_or_default();
     let label = if chapter.is_empty() { fmt_time(hover.value) } else { format!("{}  ·  {chapter}", fmt_time(hover.value)) };
-    let galley = painter.layout_no_wrap(label, FontId::proportional(12.5), Color32::WHITE);
+    let galley = painter.layout_no_wrap(v(&label), FontId::proportional(12.5), Color32::WHITE);
 
     // Thumbnail texture, uploaded lazily and cached per file.
     let mut tex: Option<egui::TextureHandle> = None;
@@ -485,6 +542,13 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
     subtitle_search(ctx, ui_state, &mut cmds);
     about(ctx, ui_state);
 
+    if std::env::var_os("IINA_RS_DEBUG").is_some() {
+        for name in ["win-Preferences", "win-Inspector", "win-Playback History"] {
+            if let Some(r) = ctx.memory(|m| m.area_rect(egui::Id::new(name))) {
+                eprintln!("[ui] {name}: {:?}", r);
+            }
+        }
+    }
     ui_state.pointer_over_ui = ctx.is_pointer_over_area();
     cmds
 }
@@ -503,7 +567,7 @@ fn title_bar(ctx: &egui::Context, pl: &Player, alpha: f32) {
                 .inner_margin(egui::Margin::symmetric(14, 6))
                 .show(ui, |ui| {
                     ui.set_max_width(max_w);
-                    ui.add(egui::Label::new(RichText::new(&pl.title).color(FG).size(14.0)).wrap_mode(egui::TextWrapMode::Truncate));
+                    ui.add(egui::Label::new(RichText::new(v(&pl.title)).color(FG).size(14.0)).wrap_mode(egui::TextWrapMode::Truncate));
                 });
         });
 }
@@ -517,7 +581,7 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
     let mut hover: Option<BarHover> = None;
 
     let area = egui::Area::new(egui::Id::new("osc"))
-        .anchor(Align2::CENTER_BOTTOM, vec2(-sidebar_w / 2.0, if compact { -6.0 } else { -22.0 }))
+        .anchor(Align2::CENTER_BOTTOM, vec2(if is_rtl() { sidebar_w / 2.0 } else { -sidebar_w / 2.0 }, if compact { -6.0 } else { -22.0 }))
         .show(ctx, |ui| {
             ui.multiply_opacity(alpha);
             egui::Frame::new()
@@ -532,7 +596,7 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
                         let side_w = (width - 28.0 - 3.0 * 34.0) / 2.0 - 8.0;
                         ui.allocate_ui_with_layout(vec2(side_w, 30.0), Layout::left_to_right(Align::Center), |ui| {
                             let icon: IconFn = if pl.mute || pl.volume <= 0.0 { icon_muted } else { icon_volume };
-                            if icon_button(ui, 26.0, "Mute", icon).clicked() {
+                            if icon_button(ui, 26.0, &t("Mute"), icon).clicked() {
                                 mpv.command(&["cycle", "mute"]);
                             }
                             if !compact {
@@ -540,10 +604,10 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
                                 if let Some((v, _)) = v {
                                     mpv.set_double("volume", v.round());
                                 }
-                                r.on_hover_text(format!("Volume {:.0}", pl.volume));
+                                r.on_hover_text(tf("Volume {}", &[&format!("{:.0}", pl.volume)]));
                             }
                         });
-                        if icon_button(ui, 34.0, "Previous", icon_prev).clicked() {
+                        if icon_button(ui, 34.0, &t("Previous"), icon_prev).clicked() {
                             if pl.playlist_count > 1 {
                                 mpv.command(&["playlist-prev"]);
                             } else {
@@ -551,10 +615,10 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
                             }
                         }
                         let (icon, tip): (IconFn, &str) = if pl.pause { (icon_play, "Play") } else { (icon_pause, "Pause") };
-                        if icon_button(ui, 34.0, tip, icon).clicked() {
+                        if icon_button(ui, 34.0, &t(tip), icon).clicked() {
                             mpv.command(&["cycle", "pause"]);
                         }
-                        if icon_button(ui, 34.0, "Next", icon_next).clicked() {
+                        if icon_button(ui, 34.0, &t("Next"), icon_next).clicked() {
                             if pl.playlist_count > 1 {
                                 mpv.command(&["playlist-next"]);
                             } else {
@@ -562,20 +626,20 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
                             }
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if !st.pip && icon_button(ui, 26.0, "Fullscreen", icon_fullscreen).clicked() {
+                            if !st.pip && icon_button(ui, 26.0, &t("Fullscreen"), icon_fullscreen).clicked() {
                                 cmds.push("toggle-fullscreen".into());
                             }
-                            if icon_button(ui, 26.0, "Picture-in-Picture", icon_pip).clicked() {
+                            if icon_button(ui, 26.0, &t("Picture-in-Picture"), icon_pip).clicked() {
                                 cmds.push("toggle-pip".into());
                             }
                             if !compact {
-                                if icon_button(ui, 26.0, "Playlist", icon_playlist).clicked() {
+                                if icon_button(ui, 26.0, &t("Playlist"), icon_playlist).clicked() {
                                     cmds.push("playlist-panel".into());
                                 }
-                                if icon_button(ui, 26.0, "Subtitles", icon_subtitle).clicked() {
+                                if icon_button(ui, 26.0, &t("Subtitles"), icon_subtitle).clicked() {
                                     cmds.push("sub-panel".into());
                                 }
-                                if icon_button(ui, 26.0, "Video & Audio settings", icon_settings).clicked() {
+                                if icon_button(ui, 26.0, &t("Video & Audio settings"), icon_settings).clicked() {
                                     cmds.push("video-panel".into());
                                 }
                                 if (pl.speed - 1.0).abs() > 1e-3 {
@@ -620,7 +684,7 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
                                 fmt_time(pl.duration)
                             };
                             let r = ui.add(egui::Label::new(RichText::new(text).monospace().size(11.5).color(FG)).sense(Sense::click()));
-                            if r.on_hover_text("Click to toggle remaining time").clicked() {
+                            if r.on_hover_text(t("Click to toggle remaining time")).clicked() {
                                 st.settings.show_remaining = !st.settings.show_remaining;
                                 st.settings_dirty = true;
                             }
@@ -636,7 +700,7 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
 }
 
 fn welcome(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
-    egui::Area::new(egui::Id::new("welcome")).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+    egui::Area::new(egui::Id::new("welcome")).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| rtl_body(ui, |ui| {
         egui::Frame::new()
             .fill(Color32::from_rgba_premultiplied(30, 30, 32, 240))
             .corner_radius(14)
@@ -647,44 +711,44 @@ fn welcome(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
                     ui.allocate_ui_with_layout(vec2(190.0, 0.0), Layout::top_down_justified(Align::Center), |ui| {
                         ui.add(egui::Image::new(egui::include_image!("../assets/iina-rs.png")).fit_to_exact_size(vec2(110.0, 110.0)));
                         ui.label(RichText::new("IINA-RS").size(26.0).strong().color(Color32::WHITE));
-                        ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(FG_DIM));
+                        ui.label(RichText::new(tf("Version {}", &[&env!("CARGO_PKG_VERSION")])).color(FG_DIM));
                         ui.add_space(10.0);
-                        if ui.button("Open File…").clicked() {
+                        if ui.button(t("Open File…")).clicked() {
                             cmds.push("open-file".into());
                         }
-                        if ui.button("Open URL…").clicked() {
+                        if ui.button(t("Open URL…")).clicked() {
                             cmds.push("open-url".into());
                         }
                     });
                     ui.separator();
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("Recent").strong().color(FG));
+                    rtl_body(ui, |ui| {
+                        ui.label(RichText::new(t("Recent")).strong().color(FG));
                         ui.add_space(4.0);
                         if st.recent.is_empty() {
-                            ui.label(RichText::new("Drop a video here, or open a file.").color(FG_DIM));
+                            ui.label(RichText::new(t("Drop a video here, or open a file.")).color(FG_DIM));
                         }
                         egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
                             for path in st.recent.clone() {
-                                let r = ui.add(egui::Button::new(file_name(&path)).frame(false).truncate());
+                                let r = ui.add(egui::Button::new(v(&file_name(&path))).frame(false).truncate());
                                 if r.clicked() {
                                     cmds.push(format!("open-path {path}"));
                                 }
                                 r.on_hover_text(&path);
                             }
                         });
-                        if !st.recent.is_empty() && ui.small_button("Clear recent").clicked() {
+                        if !st.recent.is_empty() && ui.small_button(t("Clear recent")).clicked() {
                             cmds.push("clear-recent".into());
                         }
                     });
                 });
             });
-    });
+    }));
 }
 
 
 fn track_list(ui: &mut Ui, mpv: &Mpv, tracks: &[&Track], prop: &str, allow_none: bool, selected: impl Fn(&Track) -> bool) {
     let none_selected = !tracks.iter().any(|t| selected(t));
-    if allow_none && ui.selectable_label(none_selected, "None").clicked() {
+    if allow_none && ui.selectable_label(none_selected, t("None")).clicked() {
         mpv.set_string(prop, "no");
     }
     for t in tracks {
@@ -702,9 +766,10 @@ fn track_list(ui: &mut Ui, mpv: &Mpv, tracks: &[&Track], prop: &str, allow_none:
             label.push_str(&format!("  {ch}ch"));
         }
         if t.external {
-            label.push_str("  (external)");
+            label.push_str("  ");
+            label.push_str(&tl("(external)"));
         }
-        if ui.selectable_label(selected(t), label).clicked() {
+        if ui.selectable_label(selected(t), v(&label)).clicked() {
             mpv.set_string(prop, &t.id.to_string());
         }
     }
@@ -712,14 +777,14 @@ fn track_list(ui: &mut Ui, mpv: &Mpv, tracks: &[&Track], prop: &str, allow_none:
 
 #[allow(clippy::too_many_arguments)]
 fn labeled_slider(ui: &mut Ui, mpv: &Mpv, label: &str, prop: &str, value: f64, range: std::ops::RangeInclusive<f64>, default: f64, suffix: &str) {
-    ui.label(RichText::new(label).color(FG_DIM));
-    ui.horizontal(|ui| {
-        let mut v = value;
-        let r = ui.add(egui::Slider::new(&mut v, range).suffix(suffix).max_decimals(2));
+    ui.label(RichText::new(t(label)).color(FG_DIM));
+    row(ui, |ui| {
+        let mut x = value;
+        let r = ui.add(egui::Slider::new(&mut x, range).suffix(suffix).max_decimals(2));
         if r.changed() {
-            mpv.set_double(prop, v);
+            mpv.set_double(prop, x);
         }
-        if ui.small_button("Reset").clicked() {
+        if ui.small_button(t("Reset")).clicked() {
             mpv.set_double(prop, default);
         }
     });
@@ -750,24 +815,25 @@ pub fn apply_audio_eq(mpv: &Mpv, gains: &[f32; 10]) {
 }
 
 fn sidebar(ctx: &egui::Context, st: &mut UiState, tab: Tab, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
-    egui::SidePanel::right("sidebar")
+    let panel = if is_rtl() { egui::SidePanel::left("sidebar") } else { egui::SidePanel::right("sidebar") };
+    panel
         .exact_width(340.0)
         .resizable(false)
         .frame(egui::Frame::new().fill(Color32::from_rgba_premultiplied(26, 26, 28, 245)).inner_margin(egui::Margin::same(12)))
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
+        .show(ctx, |ui| rtl_body(ui, |ui| {
+            row(ui, |ui| {
                 let tabs: &[(Tab, &str)] = if matches!(tab, Tab::Playlist | Tab::Chapters) {
                     &[(Tab::Playlist, "Playlist"), (Tab::Chapters, "Chapters")]
                 } else {
                     &[(Tab::Video, "Video"), (Tab::Audio, "Audio"), (Tab::Subtitles, "Subtitles")]
                 };
-                for (t, name) in tabs {
-                    if ui.selectable_label(tab == *t, RichText::new(*name).size(14.0)).clicked() {
-                        st.sidebar = Some(*t);
+                for (tab_id, name) in tabs {
+                    if ui.selectable_label(tab == *tab_id, RichText::new(t(name)).size(14.0)).clicked() {
+                        st.sidebar = Some(*tab_id);
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("✕").clicked() {
+                    if ui.button(t("✕")).clicked() {
                         st.sidebar = None;
                     }
                 });
@@ -777,11 +843,11 @@ fn sidebar(ctx: &egui::Context, st: &mut UiState, tab: Tab, pl: &Player, mpv: &M
                 Tab::Playlist => playlist_tab(ui, pl, mpv, cmds),
                 Tab::Chapters => {
                     if pl.chapters.is_empty() {
-                        ui.label(RichText::new("No chapters").color(FG_DIM));
+                        ui.label(RichText::new(t("No chapters")).color(FG_DIM));
                     }
                     for (i, c) in pl.chapters.iter().enumerate() {
-                        let text = format!("{}   {}", fmt_time(c.time), if c.title.is_empty() { format!("Chapter {}", i + 1) } else { c.title.clone() });
-                        if ui.selectable_label(pl.chapter == i as i64, text).clicked() {
+                        let text = format!("{}   {}", fmt_time(c.time), if c.title.is_empty() { tl("Chapter {}").replace("{}", &(i + 1).to_string()) } else { c.title.clone() });
+                        if ui.selectable_label(pl.chapter == i as i64, v(&text)).clicked() {
                             mpv.set_string("chapter", &i.to_string());
                         }
                     }
@@ -789,48 +855,48 @@ fn sidebar(ctx: &egui::Context, st: &mut UiState, tab: Tab, pl: &Player, mpv: &M
                 Tab::Video => video_tab(ui, pl, mpv, cmds),
                 Tab::Audio => audio_tab(ui, st, pl, mpv, cmds),
                 Tab::Subtitles => {
-                    ui.label(RichText::new("Subtitle track").strong());
+                    ui.label(RichText::new(t("Subtitle track")).strong());
                     let tracks: Vec<&Track> = pl.tracks.iter().filter(|t| t.kind == "sub").collect();
                     let sid = pl.sid.clone();
                     track_list(ui, mpv, &tracks, "sid", true, |t| t.id.to_string() == sid);
-                    if ui.button("Load external subtitle…").clicked() {
+                    if ui.button(t("Load external subtitle…")).clicked() {
                         cmds.push("add-sub".into());
                     }
                     ui.separator();
-                    ui.label(RichText::new("Secondary subtitle").strong());
+                    ui.label(RichText::new(t("Secondary subtitle")).strong());
                     let sec = pl.secondary_sid.clone();
                     track_list(ui, mpv, &tracks, "secondary-sid", true, |t| t.id.to_string() == sec);
                     ui.separator();
                     let mut vis = pl.sub_visible;
-                    if ui.checkbox(&mut vis, "Show subtitles").changed() {
+                    if ui.checkbox(&mut vis, t("Show subtitles")).changed() {
                         mpv.set_flag("sub-visibility", vis);
                     }
                     labeled_slider(ui, mpv, "Subtitle delay", "sub-delay", pl.sub_delay, -10.0..=10.0, 0.0, " s");
                     labeled_slider(ui, mpv, "Text size", "sub-scale", pl.sub_scale, 0.3..=3.0, 1.0, "x");
                     labeled_slider(ui, mpv, "Position", "sub-pos", pl.sub_pos, 0.0..=150.0, 100.0, "");
-                    ui.label(RichText::new("Text color").color(FG_DIM));
-                    ui.horizontal(|ui| {
+                    ui.label(RichText::new(t("Text color")).color(FG_DIM));
+                    row(ui, |ui| {
                         for (name, c) in [("White", "#FFFFFF"), ("Yellow", "#FFEB3B"), ("Cyan", "#4DD0E1"), ("Green", "#8BC34A")] {
-                            if ui.small_button(name).clicked() {
+                            if ui.small_button(t(name)).clicked() {
                                 mpv.set_string("sub-color", c);
                             }
                         }
                     });
                 }
             });
-        });
+        }));
 }
 
 fn playlist_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
-    ui.horizontal(|ui| {
-        if ui.button("Add files…").clicked() {
+    row(ui, |ui| {
+        if ui.button(t("Add files…")).clicked() {
             cmds.push("add-files".into());
         }
-        if ui.button("Shuffle").clicked() {
+        if ui.button(t("Shuffle")).clicked() {
             mpv.command(&["playlist-shuffle"]);
         }
         let mut looping = pl.loop_playlist;
-        if ui.checkbox(&mut looping, "Loop").changed() {
+        if ui.checkbox(&mut looping, t("Loop")).changed() {
             mpv.set_string("loop-playlist", if looping { "inf" } else { "no" });
         }
     });
@@ -839,28 +905,28 @@ fn playlist_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
     for (i, item) in pl.playlist.iter().enumerate() {
         let name = item.title.clone().unwrap_or_else(|| file_name(&item.filename));
         let text = format!("{:>2}. {}", i + 1, name);
-        let r = ui.add(egui::Button::selectable(item.current, text).truncate());
+        let r = ui.add(egui::Button::selectable(item.current, v(&text)).truncate());
         if r.clicked() {
             mpv.set_string("playlist-pos", &i.to_string());
         }
         r.context_menu(|ui| {
-            if ui.button("Play").clicked() {
+            if ui.button(t("Play")).clicked() {
                 mpv.set_string("playlist-pos", &i.to_string());
                 ui.close();
             }
-            if i > 0 && ui.button("Move Up").clicked() {
+            if i > 0 && ui.button(t("Move Up")).clicked() {
                 mpv.command(&["playlist-move", &i.to_string(), &(i - 1).to_string()]);
                 ui.close();
             }
-            if i + 1 < n && ui.button("Move Down").clicked() {
+            if i + 1 < n && ui.button(t("Move Down")).clicked() {
                 mpv.command(&["playlist-move", &i.to_string(), &(i + 2).to_string()]);
                 ui.close();
             }
-            if ui.button("Remove").clicked() {
+            if ui.button(t("Remove")).clicked() {
                 mpv.command(&["playlist-remove", &i.to_string()]);
                 ui.close();
             }
-            if ui.button("Show in Folder").clicked() {
+            if ui.button(t("Show in Folder")).clicked() {
                 cmds.push(format!("reveal {}", item.filename));
                 ui.close();
             }
@@ -869,13 +935,13 @@ fn playlist_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
 }
 
 fn video_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
-    ui.label(RichText::new("Video track").strong());
+    ui.label(RichText::new(t("Video track")).strong());
     let tracks: Vec<&Track> = pl.tracks.iter().filter(|t| t.kind == "video").collect();
     let vid = pl.vid.clone();
     track_list(ui, mpv, &tracks, "vid", true, |t| t.id.to_string() == vid);
     ui.separator();
     labeled_slider(ui, mpv, "Speed", "speed", pl.speed, 0.25..=4.0, 1.0, "x");
-    ui.horizontal(|ui| {
+    row(ui, |ui| {
         for s in [0.5, 1.0, 1.25, 1.5, 2.0] {
             if ui.small_button(format!("{s}x")).clicked() {
                 mpv.set_double("speed", s);
@@ -883,48 +949,48 @@ fn video_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
         }
     });
     ui.separator();
-    ui.label(RichText::new("Aspect ratio").color(FG_DIM));
-    ui.horizontal_wrapped(|ui| {
+    ui.label(RichText::new(t("Aspect ratio")).color(FG_DIM));
+    row_wrapped(ui, |ui| {
         for (label, val) in [("Default", "no"), ("4:3", "4:3"), ("16:9", "16:9"), ("16:10", "16:10"), ("21:9", "2.33"), ("1:1", "1:1"), ("5:4", "5:4")] {
             let sel = pl.aspect == val || (val == "no" && (pl.aspect.is_empty() || pl.aspect.starts_with('-')));
-            if ui.selectable_label(sel, label).clicked() {
+            if ui.selectable_label(sel, t(label)).clicked() {
                 mpv.set_string("video-aspect-override", val);
             }
         }
     });
-    ui.label(RichText::new("Crop").color(FG_DIM));
-    ui.horizontal_wrapped(|ui| {
+    ui.label(RichText::new(t("Crop")).color(FG_DIM));
+    row_wrapped(ui, |ui| {
         for (label, val) in [("None", "none"), ("4:3", "1.3333"), ("16:9", "1.7778"), ("21:9", "2.3333"), ("2.35:1", "2.35"), ("1:1", "1")] {
-            if ui.selectable_label(pl.crop_label == label, label).clicked() {
+            if ui.selectable_label(pl.crop_label == label, t(label)).clicked() {
                 // The app computes the crop rectangle from the video size.
                 cmds.push(format!("crop {val} {label}"));
             }
         }
     });
-    ui.label(RichText::new("Rotation").color(FG_DIM));
-    ui.horizontal(|ui| {
+    ui.label(RichText::new(t("Rotation")).color(FG_DIM));
+    row(ui, |ui| {
         for deg in [0, 90, 180, 270] {
             if ui.selectable_label(pl.rotate == deg, format!("{deg}°")).clicked() {
                 mpv.set_string("video-rotate", &deg.to_string());
             }
         }
     });
-    ui.horizontal(|ui| {
+    row(ui, |ui| {
         let mut flip = pl.vf.contains("@iina-flip");
-        if ui.checkbox(&mut flip, "Flip").changed() {
+        if ui.checkbox(&mut flip, t("Flip")).changed() {
             mpv.command(&["vf", "toggle", "@iina-flip:vflip"]);
         }
         let mut mirror = pl.vf.contains("@iina-mirror");
-        if ui.checkbox(&mut mirror, "Mirror").changed() {
+        if ui.checkbox(&mut mirror, t("Mirror")).changed() {
             mpv.command(&["vf", "toggle", "@iina-mirror:hflip"]);
         }
         let mut deint = pl.deinterlace;
-        if ui.checkbox(&mut deint, "Deinterlace").changed() {
+        if ui.checkbox(&mut deint, t("Deinterlace")).changed() {
             mpv.set_string("deinterlace", if deint { "yes" } else { "no" });
         }
     });
     ui.separator();
-    ui.label(RichText::new("Video equalizer").strong());
+    ui.label(RichText::new(t("Video equalizer")).strong());
     for (label, prop, v) in [
         ("Brightness", "brightness", pl.brightness),
         ("Contrast", "contrast", pl.contrast),
@@ -932,53 +998,53 @@ fn video_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
         ("Gamma", "gamma", pl.gamma),
         ("Hue", "hue", pl.hue),
     ] {
-        ui.horizontal(|ui| {
-            ui.add_sized(vec2(70.0, 18.0), egui::Label::new(RichText::new(label).color(FG_DIM)));
+        row(ui, |ui| {
+            ui.add_sized(vec2(84.0, 18.0), egui::Label::new(RichText::new(t(label)).color(FG_DIM)));
             let mut x = v as f64;
             if ui.add(egui::Slider::new(&mut x, -100.0..=100.0).integer()).changed() {
                 mpv.set_string(prop, &format!("{}", x.round() as i64));
             }
         });
     }
-    if ui.small_button("Reset equalizer").clicked() {
+    if ui.small_button(t("Reset equalizer")).clicked() {
         for p in ["brightness", "contrast", "saturation", "gamma", "hue"] {
             mpv.set_string(p, "0");
         }
     }
     ui.separator();
     let mut hw = pl.hwdec_enabled;
-    if ui.checkbox(&mut hw, "Hardware decoding").changed() {
+    if ui.checkbox(&mut hw, t("Hardware decoding")).changed() {
         mpv.set_string("hwdec", if hw { "auto-safe" } else { "no" });
     }
-    ui.label(RichText::new(format!("Decoder: {}", if pl.hwdec_current.is_empty() { "software" } else { &pl.hwdec_current })).color(FG_DIM).size(11.0));
-    if ui.button("Take screenshot").clicked() {
+    ui.label(RichText::new(tf("Decoder: {}", &[&if pl.hwdec_current.is_empty() { tl("software") } else { pl.hwdec_current.clone() }])).color(FG_DIM).size(11.0));
+    if ui.button(t("Take screenshot")).clicked() {
         mpv.command(&["screenshot"]);
     }
 }
 
 fn audio_tab(ui: &mut Ui, st: &mut UiState, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
-    ui.label(RichText::new("Audio track").strong());
+    ui.label(RichText::new(t("Audio track")).strong());
     let tracks: Vec<&Track> = pl.tracks.iter().filter(|t| t.kind == "audio").collect();
     let aid = pl.aid.clone();
     track_list(ui, mpv, &tracks, "aid", true, |t| t.id.to_string() == aid);
-    if ui.button("Load external audio…").clicked() {
+    if ui.button(t("Load external audio…")).clicked() {
         cmds.push("add-audio".into());
     }
     ui.separator();
     labeled_slider(ui, mpv, "Volume", "volume", pl.volume, 0.0..=130.0, 100.0, "");
     labeled_slider(ui, mpv, "Audio delay", "audio-delay", pl.audio_delay, -5.0..=5.0, 0.0, " s");
     ui.separator();
-    ui.label(RichText::new("Equalizer").strong());
+    ui.label(RichText::new(t("Equalizer")).strong());
     let mut changed = false;
-    ui.horizontal_wrapped(|ui| {
+    row_wrapped(ui, |ui| {
         for (name, gains) in EQ_PRESETS {
-            if ui.small_button(*name).clicked() {
+            if ui.small_button(t(name)).clicked() {
                 st.eq = *gains;
                 changed = true;
             }
         }
     });
-    ui.horizontal(|ui| {
+    row(ui, |ui| {
         for (i, f) in EQ_FREQS.iter().enumerate() {
             ui.vertical(|ui| {
                 ui.spacing_mut().slider_width = 110.0;
@@ -1001,11 +1067,11 @@ fn context_menu(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut V
         .fixed_pos(pos)
         .order(egui::Order::Foreground)
         .constrain(true)
-        .show(ctx, |ui| {
+        .show(ctx, |ui| rtl_window(ui, 240.0, |ui| {
             egui::Frame::menu(ui.style()).show(ui, |ui| {
                 ui.set_min_width(210.0);
                 let mut item = |ui: &mut Ui, label: &str, shortcut: &str, cmd: &str| {
-                    let b = egui::Button::new(label).frame(false).shortcut_text(shortcut);
+                    let b = egui::Button::new(t(label)).frame(false).shortcut_text(shortcut);
                     if ui.add(b).clicked() {
                         cmds.push(cmd.to_string());
                     }
@@ -1041,7 +1107,7 @@ fn context_menu(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut V
                 item(ui, "About IINA-RS", "", "about");
                 item(ui, "Quit", "Ctrl+Q", "mpv quit");
             });
-        })
+        }))
         .response;
     let clicked_elsewhere = ctx.input(|i| i.pointer.any_pressed()) && !resp.contains_pointer() && !ctx.input(|i| i.pointer.secondary_pressed());
     if !cmds.is_empty() || clicked_elsewhere || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1052,25 +1118,26 @@ fn context_menu(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut V
 fn url_dialog(ctx: &egui::Context, st: &mut UiState, mpv: &Mpv) {
     let Some(url) = st.url_input.as_mut() else { return };
     let mut close = false;
-    egui::Window::new("Open URL")
+    egui::Window::new(t("Open URL"))
+        .id(egui::Id::new("win-Open URL"))
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-        .show(ctx, |ui| {
-            ui.label("Enter a media URL (http, https, YouTube via yt-dlp, …):");
-            let r = ui.add(egui::TextEdit::singleline(url).desired_width(380.0).hint_text("https://"));
+        .show(ctx, |ui| rtl_window(ui, 440.0, |ui| {
+            ui.label(t("Enter a media URL (http, https, YouTube via yt-dlp, …):"));
+            let r = ui.add(egui::TextEdit::singleline(url).desired_width(380.0).hint_text(t("https://")));
             r.request_focus();
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.horizontal(|ui| {
-                if (ui.button("Open").clicked() || enter) && !url.trim().is_empty() {
+            row(ui, |ui| {
+                if (ui.button(t("Open")).clicked() || enter) && !url.trim().is_empty() {
                     mpv.command(&["loadfile", url.trim(), "replace"]);
                     close = true;
                 }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if ui.button(t("Cancel")).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     close = true;
                 }
             });
-        });
+        }));
     if close {
         st.url_input = None;
     }
@@ -1092,26 +1159,27 @@ pub fn parse_time(s: &str, duration: f64) -> Option<f64> {
 fn jump_dialog(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv) {
     let Some(text) = st.jump_input.as_mut() else { return };
     let mut close = false;
-    egui::Window::new("Jump to")
+    egui::Window::new(t("Jump to"))
+        .id(egui::Id::new("win-Jump to"))
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-        .show(ctx, |ui| {
-            ui.label(format!("Time (hh:mm:ss) or percentage — duration {}", fmt_time(pl.duration)));
-            let r = ui.add(egui::TextEdit::singleline(text).desired_width(240.0).hint_text("1:23:45  or  50%"));
+        .show(ctx, |ui| rtl_window(ui, 400.0, |ui| {
+            ui.label(tf("Time (hh:mm:ss) or percentage — duration {}", &[&fmt_time(pl.duration)]));
+            let r = ui.add(egui::TextEdit::singleline(text).desired_width(240.0).hint_text(t("1:23:45  or  50%")));
             r.request_focus();
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let parsed = parse_time(text, pl.duration);
-            ui.horizontal(|ui| {
-                if (ui.add_enabled(parsed.is_some(), egui::Button::new("Jump")).clicked() || enter) && parsed.is_some() {
+            row(ui, |ui| {
+                if (ui.add_enabled(parsed.is_some(), egui::Button::new(t("Jump"))).clicked() || enter) && parsed.is_some() {
                     mpv.command(&["seek", &format!("{:.3}", parsed.unwrap()), "absolute+exact"]);
                     close = true;
                 }
-                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if ui.button(t("Cancel")).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     close = true;
                 }
             });
-        });
+        }));
     if close {
         st.jump_input = None;
     }
@@ -1124,26 +1192,40 @@ fn inspector(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv) {
     }
     let mut open = true;
     let g = |p: &str| mpv.get_string(p).filter(|s| !s.is_empty()).unwrap_or_else(|| "—".into());
-    egui::Window::new("Inspector")
+    egui::Window::new(t("Inspector"))
+        .id(egui::Id::new("win-Inspector"))
         .open(&mut open)
         .default_width(380.0)
         .default_pos(pos2(40.0, 40.0))
-        .show(ctx, |ui| {
+        .vscroll(true)
+        .max_height((ctx.screen_rect().height() - 80.0).max(200.0))
+        .show(ctx, |ui| rtl_window(ui, 420.0, |ui| {
             let section = |ui: &mut Ui, title: &str, rows: &[(&str, String)]| {
-                ui.label(RichText::new(title).strong().color(FG));
-                egui::Grid::new(title).num_columns(2).striped(true).spacing(vec2(12.0, 3.0)).show(ui, |ui| {
-                    for (k, v) in rows {
-                        ui.label(RichText::new(*k).color(FG_DIM));
-                        ui.add(egui::Label::new(v).wrap());
-                        ui.end_row();
+                ui.label(RichText::new(t(title)).strong().color(FG));
+                if is_rtl() {
+                    // One row per entry (key on the right); long values are
+                    // truncated with the full text on hover.
+                    for (k, val) in rows {
+                        row(ui, |ui| {
+                            ui.label(RichText::new(t(k)).color(FG_DIM));
+                            ui.add(egui::Label::new(v(val)).truncate()).on_hover_text(v(val));
+                        });
                     }
-                });
+                } else {
+                    grid(ui, title, 2, true, vec2(12.0, 3.0), |ui| {
+                        for (k, val) in rows {
+                            ui.label(RichText::new(t(k)).color(FG_DIM));
+                            ui.add(egui::Label::new(v(val)).wrap());
+                            ui.end_row();
+                        }
+                    });
+                }
                 ui.add_space(6.0);
             };
             let mb = |s: String| s.parse::<f64>().map(|b| format!("{:.2} MB", b / 1_048_576.0)).unwrap_or(s);
             let kbps = |s: String| s.parse::<f64>().map(|b| format!("{:.0} kbps", b / 1000.0)).unwrap_or(s);
             if pl.idle {
-                ui.label(RichText::new("Nothing is playing.").color(FG_DIM));
+                ui.label(RichText::new(t("Nothing is playing.")).color(FG_DIM));
                 return;
             }
             section(ui, "General", &[
@@ -1176,7 +1258,7 @@ fn inspector(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv) {
                 ("Cache", format!("{} s", g("demuxer-cache-duration"))),
             ]);
             ctx.request_repaint_after(Duration::from_millis(500));
-        });
+        }));
     st.show_inspector = open;
 }
 
@@ -1187,86 +1269,96 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
     let mut open = true;
     let before = st.settings.clone();
     let assoc_status = st.assoc_status.clone();
-    egui::Window::new("Preferences")
+    egui::Window::new(t("Preferences"))
+        .id(egui::Id::new("win-Preferences"))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .vscroll(true)
         .max_height((ctx.screen_rect().height() - 90.0).max(200.0))
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-        .show(ctx, |ui| {
+        .show(ctx, |ui| rtl_window(ui, 560.0, |ui| {
             let s = &mut st.settings;
-            ui.label(RichText::new("General").strong());
-            ui.checkbox(&mut s.resume_playback, "Resume last playback position");
-            ui.checkbox(&mut s.auto_add_folder, "Add files in the same folder to the playlist");
-            ui.checkbox(&mut s.resize_to_video, "Resize window to video size when opening a file");
-            ui.checkbox(&mut s.single_instance, "Open files in the running window (single instance)");
+            row(ui, |ui| {
+                ui.label(t("Language"));
+                for (code, name) in [("auto", t("Automatic")), ("en", "English".to_string()), ("ar", v("العربية"))] {
+                    if ui.selectable_label(s.language == code, name).clicked() {
+                        s.language = code.to_string();
+                    }
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new(t("General")).strong());
+            ui.checkbox(&mut s.resume_playback, t("Resume last playback position"));
+            ui.checkbox(&mut s.auto_add_folder, t("Add files in the same folder to the playlist"));
+            ui.checkbox(&mut s.resize_to_video, t("Resize window to video size when opening a file"));
+            ui.checkbox(&mut s.single_instance, t("Open files in the running window (single instance)"));
             ui.add_space(6.0);
-            ui.label(RichText::new("UI").strong());
-            ui.checkbox(&mut s.thumbnails, "Show thumbnail preview on the seek bar");
-            ui.checkbox(&mut s.show_remaining, "Show remaining time");
-            ui.checkbox(&mut s.click_to_pause, "Single click on video toggles pause");
-            ui.horizontal(|ui| {
-                ui.label("Hide controller after");
+            ui.label(RichText::new(t("UI")).strong());
+            ui.checkbox(&mut s.thumbnails, t("Show thumbnail preview on the seek bar"));
+            ui.checkbox(&mut s.show_remaining, t("Show remaining time"));
+            ui.checkbox(&mut s.click_to_pause, t("Single click on video toggles pause"));
+            row(ui, |ui| {
+                ui.label(t("Hide controller after"));
                 ui.add(egui::Slider::new(&mut s.osc_hide_secs, 1.0..=10.0).suffix(" s").max_decimals(1));
             });
             ui.add_space(6.0);
-            ui.label(RichText::new("Video / Audio").strong());
-            ui.checkbox(&mut s.hardware_decoding, "Enable hardware decoding");
-            ui.horizontal(|ui| {
-                ui.label("Initial volume");
+            ui.label(RichText::new(t("Video / Audio")).strong());
+            ui.checkbox(&mut s.hardware_decoding, t("Enable hardware decoding"));
+            row(ui, |ui| {
+                ui.label(t("Initial volume"));
                 ui.add(egui::Slider::new(&mut s.volume, 0.0..=100.0).integer());
             });
             ui.add_space(6.0);
-            ui.label(RichText::new("Screenshots").strong());
-            ui.horizontal(|ui| {
+            ui.label(RichText::new(t("Screenshots")).strong());
+            row(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut s.screenshot_dir).desired_width(260.0));
-                if ui.button("Choose…").clicked() {
+                if ui.button(t("Choose…")).clicked() {
                     if let Some(d) = rfd::FileDialog::new().pick_folder() {
                         s.screenshot_dir = d.to_string_lossy().into_owned();
                     }
                 }
             });
             ui.add_space(6.0);
-            ui.label(RichText::new("Online subtitles").strong());
-            egui::Grid::new("sub-keys").num_columns(3).spacing(vec2(8.0, 4.0)).show(ui, |ui| {
-                ui.label("SubDL key");
+            ui.label(RichText::new(t("Online subtitles")).strong());
+            grid(ui, "sub-keys", 3, false, vec2(8.0, 4.0), |ui| {
+                ui.label(t("SubDL key"));
                 ui.add(egui::TextEdit::singleline(&mut s.subdl_key).password(true).desired_width(220.0));
-                ui.hyperlink_to("Get a key", "https://subdl.com/panel/api");
+                ui.hyperlink_to(t("Get a key"), "https://subdl.com/panel/api");
                 ui.end_row();
-                ui.label("OpenSubtitles key");
+                ui.label(t("OpenSubtitles key"));
                 ui.add(egui::TextEdit::singleline(&mut s.opensubtitles_key).password(true).desired_width(220.0));
-                ui.hyperlink_to("Get a key", "https://www.opensubtitles.com/consumers");
+                ui.hyperlink_to(t("Get a key"), "https://www.opensubtitles.com/consumers");
                 ui.end_row();
             });
-            ui.horizontal(|ui| {
-                ui.label("Languages");
-                ui.add(egui::TextEdit::singleline(&mut s.sub_languages).desired_width(120.0).hint_text("ar,en"));
+            row(ui, |ui| {
+                ui.label(t("Languages"));
+                ui.add(egui::TextEdit::singleline(&mut s.sub_languages).desired_width(120.0).hint_text(t("ar,en")));
             });
             ui.add_space(6.0);
-            ui.label(RichText::new("System").strong());
-            ui.horizontal(|ui| {
+            ui.label(RichText::new(t("System")).strong());
+            row(ui, |ui| {
                 if cfg!(windows) {
-                    if ui.button("Add to “Open with”").on_hover_text("Registers IINA-RS for video/audio files for your user account").clicked() {
+                    if ui.button(t("Add to “Open with”")).on_hover_text(t("Registers IINA-RS for video/audio files for your user account")).clicked() {
                         cmds.push("assoc-register".into());
                     }
-                    if ui.button("Remove").clicked() {
+                    if ui.button(t("Remove")).clicked() {
                         cmds.push("assoc-unregister".into());
                     }
-                    if ui.button("Default apps…").clicked() {
+                    if ui.button(t("Default apps…")).clicked() {
                         cmds.push("open-default-apps".into());
                     }
                 }
-                if ui.button("Open settings folder").clicked() {
+                if ui.button(t("Open settings folder")).clicked() {
                     cmds.push("open-config-dir".into());
                 }
             });
             if !assoc_status.is_empty() {
-                ui.label(RichText::new(&assoc_status).size(11.0).color(FG_DIM));
+                ui.label(RichText::new(v(&assoc_status)).size(11.0).color(FG_DIM));
             }
             ui.add_space(6.0);
-            ui.label(RichText::new("Settings folder: input.conf (key bindings), mpv.conf (mpv options), scripts/ (mpv Lua/JS scripts).").size(11.0).color(FG_DIM));
-        });
+            ui.label(RichText::new(t("Settings folder: input.conf (key bindings), mpv.conf (mpv options), scripts/ (mpv Lua/JS scripts).")).size(11.0).color(FG_DIM));
+        }));
     if st.settings != before {
         st.settings_dirty = true;
     }
@@ -1275,24 +1367,28 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
 
 fn about(ctx: &egui::Context, st: &mut UiState) {
     let mut open = st.show_about;
-    egui::Window::new("About IINA-RS")
+    egui::Window::new(t("About IINA-RS"))
+        .id(egui::Id::new("win-About IINA-RS"))
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-        .show(ctx, |ui| {
+        .show(ctx, |ui| rtl_window(ui, 380.0, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add(egui::Image::new(egui::include_image!("../assets/iina-rs.png")).fit_to_exact_size(vec2(80.0, 80.0)));
                 ui.heading("IINA-RS");
-                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                ui.label(tf("Version {}", &[&env!("CARGO_PKG_VERSION")]));
                 ui.add_space(6.0);
-                ui.label("A Windows & Linux media player in the spirit of IINA,");
-                ui.label("written in Rust and powered by mpv (mpv.io).");
+                ui.label(t("A Windows & Linux media player in the spirit of IINA,"));
+                ui.label(t("written in Rust and powered by mpv (mpv.io)."));
+                if is_rtl() {
+                    ui.label(RichText::new(t("Arabic translation follows Arabeyes conventions.")).size(11.0).color(FG_DIM));
+                }
                 ui.add_space(6.0);
-                ui.hyperlink_to("IINA (GPLv3)", "https://github.com/iina/iina");
-                ui.hyperlink_to("mpv", "https://mpv.io");
+                ui.hyperlink_to(t("IINA (GPLv3)"), "https://github.com/iina/iina");
+                ui.hyperlink_to(t("mpv"), "https://mpv.io");
             });
-        });
+        }));
     st.show_about = open;
 }
 
@@ -1301,14 +1397,15 @@ fn history_window(ctx: &egui::Context, st: &mut UiState, hist: &History, cmds: &
         return;
     }
     let mut open = true;
-    egui::Window::new("Playback History")
+    egui::Window::new(t("Playback History"))
+        .id(egui::Id::new("win-Playback History"))
         .open(&mut open)
         .default_size(vec2(560.0, 420.0))
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut st.history_filter).hint_text("Search…").desired_width(260.0));
+        .show(ctx, |ui| rtl_window(ui, 580.0, |ui| {
+            row(ui, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut st.history_filter).hint_text(t("Search…")).desired_width(260.0));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Clear History").clicked() {
+                    if ui.button(t("Clear History")).clicked() {
                         cmds.push("history-clear".into());
                     }
                 });
@@ -1321,38 +1418,38 @@ fn history_window(ctx: &egui::Context, st: &mut UiState, hist: &History, cmds: &
                 .filter(|e| filter.is_empty() || e.title.to_lowercase().contains(&filter) || e.path.to_lowercase().contains(&filter))
                 .collect();
             if rows.is_empty() {
-                ui.label(RichText::new("No history yet.").color(FG_DIM));
+                ui.label(RichText::new(t("No history yet.")).color(FG_DIM));
             }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for e in rows {
                     let missing = !e.path.contains("://") && !std::path::Path::new(&e.path).exists();
-                    ui.horizontal(|ui| {
+                    row(ui, |ui| {
                         // Progress ring-ish bar, like IINA's history list.
                         let (r, _) = ui.allocate_exact_size(vec2(36.0, 6.0), Sense::hover());
                         ui.painter().rect_filled(r, 3.0, TRACK_BG);
                         ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width() * e.progress(), r.height())), 3.0, FG);
                         let title = if e.title.is_empty() { file_name(&e.path) } else { e.title.clone() };
-                        let text = RichText::new(title).color(if missing { FG_DIM } else { FG });
+                        let text = RichText::new(v(&title)).color(if missing { FG_DIM } else { FG });
                         let resp = ui.add(egui::Button::new(text).frame(false).truncate()).on_hover_text(&e.path);
                         if resp.double_clicked() || resp.clicked() {
                             cmds.push(format!("open-path {}", e.path));
                         }
                         resp.context_menu(|ui| {
-                            if ui.button("Play").clicked() {
+                            if ui.button(t("Play")).clicked() {
                                 cmds.push(format!("open-path {}", e.path));
                                 ui.close();
                             }
-                            if ui.button("Show in Folder").clicked() {
+                            if ui.button(t("Show in Folder")).clicked() {
                                 cmds.push(format!("reveal {}", e.path));
                                 ui.close();
                             }
-                            if ui.button("Remove from History").clicked() {
+                            if ui.button(t("Remove from History")).clicked() {
                                 cmds.push(format!("history-remove {}", e.path));
                                 ui.close();
                             }
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new(history::ago(e.last_played)).size(11.0).color(FG_DIM));
+                            ui.label(RichText::new(v(&history::ago(e.last_played))).size(11.0).color(FG_DIM));
                             if e.duration > 0.0 {
                                 ui.label(RichText::new(format!("{} / {}", fmt_time(e.position), fmt_time(e.duration))).monospace().size(11.0).color(FG_DIM));
                             }
@@ -1360,7 +1457,7 @@ fn history_window(ctx: &egui::Context, st: &mut UiState, hist: &History, cmds: &
                     });
                 }
             });
-        });
+        }));
     st.show_history = open;
 }
 
@@ -1372,12 +1469,13 @@ fn subtitle_search(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>
     let shared = st.subs.clone();
     let mut s = shared.lock().unwrap();
     let before_provider = s.provider;
-    egui::Window::new("Find Online Subtitles")
+    egui::Window::new(t("Find Online Subtitles"))
+        .id(egui::Id::new("win-Find Online Subtitles"))
         .open(&mut open)
         .default_size(vec2(680.0, 440.0))
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Source");
+        .show(ctx, |ui| rtl_window(ui, 680.0, |ui| {
+            row(ui, |ui| {
+                ui.label(t("Source"));
                 for p in subtitles::Provider::ALL {
                     if ui.selectable_label(s.provider == p, p.name()).clicked() {
                         s.provider = p;
@@ -1387,45 +1485,47 @@ fn subtitle_search(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>
             let no_key = st.settings.subtitle_key(s.provider).is_empty();
             if no_key {
                 ui.label(
-                    RichText::new(format!("A free {} API key is required. Create one, then paste it in Preferences.", s.provider.name()))
+                    RichText::new(tf("A free {} API key is required. Create one, then paste it in Preferences.", &[&s.provider.name()]))
                         .color(Color32::from_rgb(255, 200, 120)),
                 );
-                ui.horizontal(|ui| {
-                    ui.hyperlink_to("Get an API key", s.provider.key_url());
-                    if ui.button("Open Preferences").clicked() {
+                row(ui, |ui| {
+                    ui.hyperlink_to(t("Get an API key"), s.provider.key_url());
+                    if ui.button(t("Open Preferences")).clicked() {
                         cmds.push("preferences".into());
                     }
                 });
             }
             ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("Title");
+            row(ui, |ui| {
+                ui.label(t("Title"));
                 let r = ui.add(egui::TextEdit::singleline(&mut s.query).desired_width(300.0));
-                ui.label("Languages");
-                ui.add(egui::TextEdit::singleline(&mut s.languages).desired_width(70.0).hint_text("ar,en"));
+                ui.label(t("Languages"));
+                ui.add(egui::TextEdit::singleline(&mut s.languages).desired_width(70.0).hint_text(t("ar,en")));
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (ui.add_enabled(!s.busy && !no_key, egui::Button::new("Search")).clicked() || enter) && !s.busy && !no_key {
+                if (ui.add_enabled(!s.busy && !no_key, egui::Button::new(t("Search"))).clicked() || enter) && !s.busy && !no_key {
                     cmds.push("subs-search".into());
                 }
             });
-            ui.label(RichText::new(&s.status).size(11.5).color(FG_DIM));
+            ui.label(RichText::new(v(&s.status)).size(11.5).color(FG_DIM));
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                egui::Grid::new("subs-results").striped(true).num_columns(4).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
+                grid(ui, "subs-results", 4, true, vec2(10.0, 4.0), |ui| {
                     for (i, r) in s.results.clone().into_iter().enumerate() {
                         ui.label(RichText::new(r.language.to_uppercase()).monospace());
-                        let mut label = RichText::new(if r.release.is_empty() { "(no release name)".to_string() } else { r.release.clone() });
+                        let mut label = RichText::new(if r.release.is_empty() { t("(no release name)") } else { v(&r.release) });
                         if r.good_match {
                             label = label.color(Color32::from_rgb(140, 220, 140));
                         }
-                        let mut tip = if r.good_match { "Likely synced to this file".to_string() } else { "Matched by title".to_string() };
+                        let mut tip = if r.good_match { tl("Likely synced to this file") } else { tl("Matched by title") };
                         if !r.author.is_empty() {
-                            tip.push_str(&format!("\nBy {}", r.author));
+                            tip.push('\n');
+                            tip.push_str(&tl("By {}").replace("{}", &r.author));
                         }
                         if r.hearing_impaired {
-                            tip.push_str("\nHearing impaired (SDH)");
+                            tip.push('\n');
+                            tip.push_str(&tl("Hearing impaired (SDH)"));
                         }
-                        ui.add(egui::Label::new(label).truncate()).on_hover_text(tip);
+                        ui.add(egui::Label::new(label).truncate()).on_hover_text(v(&tip));
                         let mut meta = String::new();
                         if r.hearing_impaired {
                             meta.push_str("HI  ");
@@ -1434,14 +1534,14 @@ fn subtitle_search(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>
                             meta.push_str(&format!("⬇ {d}"));
                         }
                         ui.label(RichText::new(meta).size(11.0).color(FG_DIM));
-                        if ui.add_enabled(!s.busy, egui::Button::new("Download")).clicked() {
+                        if ui.add_enabled(!s.busy, egui::Button::new(t("Download"))).clicked() {
                             cmds.push(format!("subs-download {i}"));
                         }
                         ui.end_row();
                     }
                 });
             });
-        });
+        }));
     if s.provider != before_provider {
         // Remember the chosen source; results belong to the previous one.
         st.settings.sub_provider = s.provider.name().to_string();

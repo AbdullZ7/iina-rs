@@ -6,6 +6,7 @@
 
 mod assoc;
 mod history;
+mod i18n;
 mod instance;
 mod keys;
 mod mpv;
@@ -117,6 +118,7 @@ impl App {
     fn new(proxy: EventLoopProxy<UserEvent>, args: Vec<String>, mpv_opts: Vec<(String, String)>) -> Result<Self, String> {
         let config_dir = config_dir();
         let settings = Settings::load(&config_dir);
+        i18n::set_language(i18n::resolve(&settings.language));
         let mut mpv = Mpv::new()?;
         let cfg = config_dir.to_string_lossy().into_owned();
         for (k, v) in [
@@ -430,14 +432,14 @@ impl App {
             "crop" => self.apply_crop(arg),
             "assoc-register" => {
                 self.ui.assoc_status = match assoc::register(VIDEO_AUDIO_EXTS) {
-                    Ok(()) => "Registered. Pick IINA-RS under “Open with”, or set it as default in Default apps.".into(),
-                    Err(e) => format!("Failed: {e}"),
+                    Ok(()) => i18n::tl("Registered. Pick IINA-RS under “Open with”, or set it as default in Default apps."),
+                    Err(e) => i18n::tlf("Failed: {}", &[&e]),
                 };
             }
             "assoc-unregister" => {
                 self.ui.assoc_status = match assoc::unregister(VIDEO_AUDIO_EXTS) {
-                    Ok(()) => "Removed IINA-RS from “Open with”.".into(),
-                    Err(e) => format!("Failed: {e}"),
+                    Ok(()) => i18n::tl("Removed IINA-RS from “Open with”."),
+                    Err(e) => i18n::tlf("Failed: {}", &[&e]),
                 };
             }
             "open-default-apps" => assoc::open_default_apps_settings(),
@@ -449,7 +451,7 @@ impl App {
                 }
             }
             "live-text" => {
-                self.mpv.command(&["show-text", "Not available on this platform yet"]);
+                self.mpv.command(&["show-text", &i18n::tl("Not available on this platform yet")]);
             }
             other => eprintln!("unknown app command: {other}"),
         }
@@ -861,6 +863,7 @@ impl App {
 
     fn apply_settings(&mut self) {
         let s = self.ui.settings.clone();
+        i18n::set_language(i18n::resolve(&s.language));
         for (k, v) in s.mpv_options() {
             self.mpv.set_string(k, &v);
         }

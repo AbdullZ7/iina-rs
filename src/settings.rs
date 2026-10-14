@@ -33,6 +33,8 @@ pub struct Settings {
     pub opensubtitles_key: String,
     /// Preferred subtitle languages for online search, e.g. "ar,en".
     pub sub_languages: String,
+    /// Interface language: "auto" (system), "en" or "ar".
+    pub language: String,
 }
 
 impl Default for Settings {
@@ -53,6 +55,7 @@ impl Default for Settings {
             subdl_key: String::new(),
             opensubtitles_key: String::new(),
             sub_languages: "ar,en".into(),
+            language: "auto".into(),
         }
     }
 }

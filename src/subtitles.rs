@@ -3,6 +3,7 @@
 //!   ZIP archives from dl.subdl.com and need no key (300/day per IP).
 //! - OpenSubtitles.com REST API: free API key; searches by file hash + name.
 
+use crate::i18n::{tl, tlf};
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -168,14 +169,14 @@ fn http_error(provider: Provider, e: ureq::Error) -> String {
         ureq::Error::Status(401 | 403, r) => {
             let body = r.into_string().unwrap_or_default();
             if body.contains("not_authorized") || body.contains("api") || body.is_empty() {
-                format!("{name} rejected the API key. Check it in Preferences.")
+                tlf("{} rejected the API key. Check it in Preferences.", &[&name])
             } else {
                 format!("{name}: access denied ({})", body.chars().take(160).collect::<String>())
             }
         }
         ureq::Error::Status(406 | 429, r) => format!("{name}: limit reached ({})", r.into_string().unwrap_or_default().chars().take(160).collect::<String>()),
         ureq::Error::Status(code, r) => format!("{name} error {code}: {}", r.into_string().unwrap_or_default().chars().take(160).collect::<String>()),
-        ureq::Error::Transport(t) => format!("Network error: {t}"),
+        ureq::Error::Transport(t) => tlf("Network error: {}", &[&t]),
     }
 }
 
@@ -256,7 +257,7 @@ fn subdl_search(key: &str, query: &str, languages: &str, media: &str) -> Result<
             if let Ok(j) = serde_json::from_str::<SubdlResponse>(&body) {
                 let msg = j.message.or_else(|| j.error.map(|e| e.to_string())).unwrap_or_default();
                 if msg.to_lowercase().contains("not authorized") || msg.contains("not_authorized") || code == 401 || code == 403 {
-                    return Err("SubDL rejected the API key. Check it in Preferences.".into());
+                    return Err(tlf("{} rejected the API key. Check it in Preferences.", &[&"SubDL"]));
                 }
                 return Err(format!("SubDL: {msg}"));
             }
@@ -315,7 +316,7 @@ pub fn pick_from_zip(data: &[u8], season: Option<u32>, episode: Option<u32>) -> 
         }
     }
     if candidates.is_empty() {
-        return Err("The archive contains no subtitle file.".into());
+        return Err(tl("The archive contains no subtitle file."));
     }
     let wanted = match (season, episode) {
         (Some(s), Some(e)) => candidates
@@ -452,7 +453,7 @@ pub fn start_search(shared: Shared, key: String, wake: impl Fn() + Send + 'stati
     let (provider, query, langs, media) = {
         let mut s = shared.lock().unwrap();
         s.busy = true;
-        s.status = format!("Searching {}…", s.provider.name());
+        s.status = tlf("Searching {}…", &[&s.provider.name()]);
         s.results.clear();
         (s.provider, s.query.clone(), s.languages.clone(), s.media_path.clone())
     };
@@ -466,7 +467,7 @@ pub fn start_search(shared: Shared, key: String, wake: impl Fn() + Send + 'stati
         match result {
             Ok(mut r) => {
                 r.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(b.downloads.cmp(&a.downloads)));
-                s.status = if r.is_empty() { "No subtitles found.".into() } else { format!("{} results from {}", r.len(), provider.name()) };
+                s.status = if r.is_empty() { tl("No subtitles found.") } else { tlf("{} results from {}", &[&r.len(), &provider.name()]) };
                 s.results = r;
             }
             Err(e) => s.status = e,
@@ -482,7 +483,7 @@ pub fn start_download(shared: Shared, index: usize, keys: (String, String), dest
         let mut s = shared.lock().unwrap();
         let Some(r) = s.results.get(index).cloned() else { return };
         s.busy = true;
-        s.status = "Downloading…".into();
+        s.status = tl("Downloading…");
         (r, s.media_path.clone())
     };
     std::thread::spawn(move || {
@@ -494,7 +495,7 @@ pub fn start_download(shared: Shared, index: usize, keys: (String, String), dest
         s.busy = false;
         match result {
             Ok(path) => {
-                s.status = format!("Loaded {}", path.file_name().unwrap_or_default().to_string_lossy());
+                s.status = tlf("Loaded {}", &[&path.file_name().unwrap_or_default().to_string_lossy()]);
                 s.ready.push(path);
             }
             Err(e) => s.status = e,

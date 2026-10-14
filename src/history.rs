@@ -76,13 +76,14 @@ impl History {
 
 /// "just now", "5 min ago", "3 h ago", "yesterday", "12 days ago", …
 pub fn ago(ts: u64) -> String {
+    use crate::i18n::{tl, tlf};
     let d = now().saturating_sub(ts);
     match d {
-        0..=59 => "just now".into(),
-        60..=3599 => format!("{} min ago", d / 60),
-        3600..=86399 => format!("{} h ago", d / 3600),
-        86400..=172799 => "yesterday".into(),
-        _ if d < 86400 * 60 => format!("{} days ago", d / 86400),
-        _ => format!("{} months ago", d / (86400 * 30)),
+        0..=59 => tl("just now"),
+        60..=3599 => tlf("{} min ago", &[&(d / 60)]),
+        3600..=86399 => tlf("{} h ago", &[&(d / 3600)]),
+        86400..=172799 => tl("yesterday"),
+        _ if d < 86400 * 60 => tlf("{} days ago", &[&(d / 86400)]),
+        _ => tlf("{} months ago", &[&(d / (86400 * 30))]),
     }
 }

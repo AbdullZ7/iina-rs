@@ -25,6 +25,9 @@ dirs = "6"
 ureq = { version = "2", features = ["json"] }
 rand = "0.9"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+ar-reshaper = "1.5.0"
+unicode-bidi = "0.3.18"
+sys-locale = "0.3.2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
