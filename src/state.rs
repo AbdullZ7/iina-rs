@@ -12,9 +12,9 @@ pub struct Track {
     pub lang: Option<String>,
     pub codec: Option<String>,
     #[serde(default)]
-    pub selected: bool,
-    #[serde(default)]
     pub external: bool,
+    #[serde(rename = "demux-channel-count")]
+    pub channels: Option<i64>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -61,6 +61,19 @@ pub struct Player {
     pub hwdec_enabled: bool,
     pub hwdec_current: String,
     pub loop_playlist: bool,
+    pub vid: String,
+    pub aid: String,
+    pub sid: String,
+    pub secondary_sid: String,
+    pub vf: String,
+    pub cache_time: f64,
+    pub ab_loop_a: Option<f64>,
+    pub ab_loop_b: Option<f64>,
+    pub brightness: i64,
+    pub contrast: i64,
+    pub saturation: i64,
+    pub gamma: i64,
+    pub hue: i64,
 }
 
 impl Default for Player {
@@ -94,6 +107,19 @@ impl Default for Player {
             hwdec_enabled: true,
             hwdec_current: String::new(),
             loop_playlist: false,
+            vid: String::new(),
+            aid: String::new(),
+            sid: String::new(),
+            secondary_sid: String::new(),
+            vf: String::new(),
+            cache_time: 0.0,
+            ab_loop_a: None,
+            ab_loop_b: None,
+            brightness: 0,
+            contrast: 0,
+            saturation: 0,
+            gamma: 0,
+            hue: 0,
         }
     }
 }
@@ -127,6 +153,19 @@ pub const OBSERVED: &[(&str, i32)] = &[
     ("hwdec", FORMAT_STRING),
     ("hwdec-current", FORMAT_STRING),
     ("loop-playlist", FORMAT_STRING),
+    ("vid", FORMAT_STRING),
+    ("aid", FORMAT_STRING),
+    ("sid", FORMAT_STRING),
+    ("secondary-sid", FORMAT_STRING),
+    ("vf", FORMAT_STRING),
+    ("demuxer-cache-time", FORMAT_DOUBLE),
+    ("ab-loop-a", FORMAT_STRING),
+    ("ab-loop-b", FORMAT_STRING),
+    ("brightness", FORMAT_INT64),
+    ("contrast", FORMAT_INT64),
+    ("saturation", FORMAT_INT64),
+    ("gamma", FORMAT_INT64),
+    ("hue", FORMAT_INT64),
 ];
 
 pub fn observe_all(mpv: &Mpv) {
@@ -171,6 +210,21 @@ impl Player {
             ("hwdec-current", Str(s)) => self.hwdec_current = if s == "no" { String::new() } else { s.clone() },
             ("hwdec-current", None) => self.hwdec_current.clear(),
             ("loop-playlist", Str(s)) => self.loop_playlist = s != "no",
+            ("vid", Str(s)) => self.vid = s.clone(),
+            ("aid", Str(s)) => self.aid = s.clone(),
+            ("sid", Str(s)) => self.sid = s.clone(),
+            ("secondary-sid", Str(s)) => self.secondary_sid = s.clone(),
+            ("vf", Str(s)) => self.vf = s.clone(),
+            ("vf", None) => self.vf.clear(),
+            ("demuxer-cache-time", Double(d)) => self.cache_time = *d,
+            ("demuxer-cache-time", None) => self.cache_time = 0.0,
+            ("ab-loop-a", Str(s)) => self.ab_loop_a = s.parse().ok(),
+            ("ab-loop-b", Str(s)) => self.ab_loop_b = s.parse().ok(),
+            ("brightness", Int(i)) => self.brightness = *i,
+            ("contrast", Int(i)) => self.contrast = *i,
+            ("saturation", Int(i)) => self.saturation = *i,
+            ("gamma", Int(i)) => self.gamma = *i,
+            ("hue", Int(i)) => self.hue = *i,
             _ => {}
         }
     }

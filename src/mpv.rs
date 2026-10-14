@@ -21,6 +21,7 @@ pub const EVENT_START_FILE: c_int = 6;
 pub const EVENT_END_FILE: c_int = 7;
 pub const EVENT_FILE_LOADED: c_int = 8;
 pub const EVENT_VIDEO_RECONFIG: c_int = 17;
+pub const EVENT_PLAYBACK_RESTART: c_int = 21;
 pub const EVENT_PROPERTY_CHANGE: c_int = 22;
 
 const RENDER_PARAM_INVALID: c_int = 0;
@@ -28,6 +29,10 @@ const RENDER_PARAM_API_TYPE: c_int = 1;
 const RENDER_PARAM_OPENGL_INIT_PARAMS: c_int = 2;
 const RENDER_PARAM_OPENGL_FBO: c_int = 3;
 const RENDER_PARAM_FLIP_Y: c_int = 4;
+const RENDER_PARAM_SW_SIZE: c_int = 17;
+const RENDER_PARAM_SW_FORMAT: c_int = 18;
+const RENDER_PARAM_SW_STRIDE: c_int = 19;
+const RENDER_PARAM_SW_POINTER: c_int = 20;
 
 #[repr(C)]
 struct RawEvent {
@@ -176,7 +181,9 @@ pub enum Event {
     EndFile,
     FileLoaded,
     VideoReconfig,
+    PlaybackRestart,
     Property(String, PropValue),
+    Other,
 }
 
 pub struct Mpv {
@@ -296,38 +303,50 @@ impl Mpv {
         self._wakeup = Some(b);
     }
 
+    fn convert(&self, ev: &RawEvent) -> Option<Event> {
+        Some(match ev.event_id {
+            EVENT_NONE => return None,
+            EVENT_SHUTDOWN => Event::Shutdown,
+            EVENT_START_FILE => Event::StartFile,
+            EVENT_END_FILE => Event::EndFile,
+            EVENT_FILE_LOADED => Event::FileLoaded,
+            EVENT_VIDEO_RECONFIG => Event::VideoReconfig,
+            EVENT_PLAYBACK_RESTART => Event::PlaybackRestart,
+            EVENT_PROPERTY_CHANGE => {
+                let p = unsafe { &*(ev.data as *const RawEventProperty) };
+                let name = unsafe { CStr::from_ptr(p.name) }.to_string_lossy().into_owned();
+                let val = unsafe {
+                    match p.format {
+                        FORMAT_STRING if !p.data.is_null() => {
+                            PropValue::Str(CStr::from_ptr(*(p.data as *const *const c_char)).to_string_lossy().into_owned())
+                        }
+                        FORMAT_FLAG if !p.data.is_null() => PropValue::Flag(*(p.data as *const c_int) != 0),
+                        FORMAT_INT64 if !p.data.is_null() => PropValue::Int(*(p.data as *const i64)),
+                        FORMAT_DOUBLE if !p.data.is_null() => PropValue::Double(*(p.data as *const f64)),
+                        _ => PropValue::None,
+                    }
+                };
+                Event::Property(name, val)
+            }
+            _ => Event::Other,
+        })
+    }
+
     /// Drains all pending events without blocking.
     pub fn poll_events(&self) -> Vec<Event> {
         let mut out = Vec::new();
-        loop {
-            let ev = unsafe { &*(self.api.wait_event)(self.handle, 0.0) };
-            match ev.event_id {
-                EVENT_NONE => break,
-                EVENT_SHUTDOWN => out.push(Event::Shutdown),
-                EVENT_START_FILE => out.push(Event::StartFile),
-                EVENT_END_FILE => out.push(Event::EndFile),
-                EVENT_FILE_LOADED => out.push(Event::FileLoaded),
-                EVENT_VIDEO_RECONFIG => out.push(Event::VideoReconfig),
-                EVENT_PROPERTY_CHANGE => {
-                    let p = unsafe { &*(ev.data as *const RawEventProperty) };
-                    let name = unsafe { CStr::from_ptr(p.name) }.to_string_lossy().into_owned();
-                    let val = unsafe {
-                        match p.format {
-                            FORMAT_STRING if !p.data.is_null() => {
-                                PropValue::Str(CStr::from_ptr(*(p.data as *const *const c_char)).to_string_lossy().into_owned())
-                            }
-                            FORMAT_FLAG if !p.data.is_null() => PropValue::Flag(*(p.data as *const c_int) != 0),
-                            FORMAT_INT64 if !p.data.is_null() => PropValue::Int(*(p.data as *const i64)),
-                            FORMAT_DOUBLE if !p.data.is_null() => PropValue::Double(*(p.data as *const f64)),
-                            _ => PropValue::None,
-                        }
-                    };
-                    out.push(Event::Property(name, val));
-                }
-                _ => {}
+        while let Some(ev) = self.wait_event(0.0) {
+            if !matches!(ev, Event::Other) {
+                out.push(ev);
             }
         }
         out
+    }
+
+    /// Waits up to `timeout` seconds for the next event; `None` on timeout.
+    pub fn wait_event(&self, timeout: f64) -> Option<Event> {
+        let ev = unsafe { &*(self.api.wait_event)(self.handle, timeout) };
+        self.convert(ev)
     }
 
     /// Creates the OpenGL render context. The GL context must be current.
@@ -360,6 +379,44 @@ impl Mpv {
         unsafe { (self.api.render_context_set_update_callback)(ctx, Some(trampoline), cb_ctx) };
         self._update = Some(b);
         Ok(())
+    }
+
+    /// Creates a software (CPU memory) render context, used for thumbnails.
+    pub fn create_sw_render_context(&mut self, on_update: impl Fn() + Send + Sync + 'static) -> Result<(), String> {
+        let api_type = cstr("sw");
+        let mut params = [
+            RenderParam { kind: RENDER_PARAM_API_TYPE, data: api_type.as_ptr() as *mut c_void },
+            RenderParam { kind: RENDER_PARAM_INVALID, data: ptr::null_mut() },
+        ];
+        let mut ctx: *mut mpv_render_context = ptr::null_mut();
+        let r = unsafe { (self.api.render_context_create)(&mut ctx, self.handle, params.as_mut_ptr()) };
+        if r < 0 {
+            return Err(self.err(r));
+        }
+        self.render = ctx;
+        let b: Box<Box<dyn Fn() + Send + Sync>> = Box::new(Box::new(on_update));
+        let cb_ctx = &*b as *const _ as *mut c_void;
+        unsafe { (self.api.render_context_set_update_callback)(ctx, Some(trampoline), cb_ctx) };
+        self._update = Some(b);
+        Ok(())
+    }
+
+    /// Renders the current frame as RGBX into `buf` (`stride * h` bytes).
+    pub fn render_sw(&self, w: i32, h: i32, stride: usize, buf: &mut [u8]) -> bool {
+        if self.render.is_null() || buf.len() < stride * h as usize {
+            return false;
+        }
+        let mut size = [w as c_int, h as c_int];
+        let format = cstr("rgb0");
+        let mut stride = stride;
+        let mut params = [
+            RenderParam { kind: RENDER_PARAM_SW_SIZE, data: size.as_mut_ptr() as *mut c_void },
+            RenderParam { kind: RENDER_PARAM_SW_FORMAT, data: format.as_ptr() as *mut c_void },
+            RenderParam { kind: RENDER_PARAM_SW_STRIDE, data: &mut stride as *mut _ as *mut c_void },
+            RenderParam { kind: RENDER_PARAM_SW_POINTER, data: buf.as_mut_ptr() as *mut c_void },
+            RenderParam { kind: RENDER_PARAM_INVALID, data: ptr::null_mut() },
+        ];
+        unsafe { (self.api.render_context_render)(self.render, params.as_mut_ptr()) >= 0 }
     }
 
     /// Must be called after the update callback fired; returns true if a new frame should be drawn.
