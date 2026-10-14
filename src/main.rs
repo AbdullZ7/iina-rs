@@ -790,6 +790,11 @@ impl App {
             self.last_stats = Instant::now();
             let g = |p: &str| self.mpv.get_string(p).unwrap_or_else(|| "-".into());
             eprintln!(
+                "[color] in: {}/{}/{} sig-peak={}  ->  out target: {}/{}  current-vo={} vo-gpu-api={}",
+                g("video-params/primaries"), g("video-params/gamma"), g("video-params/pixelformat"), g("video-params/sig-peak"),
+                g("video-target-params/primaries"), g("video-target-params/gamma"), g("current-vo"), g("gpu-api")
+            );
+            eprintln!(
                 "[stats] frames={} t={} hwdec={} vo-drop={} dec-drop={} delayed={} vf-fps={} display-fps={} size={}x{}",
                 std::mem::take(&mut self.frames), g("time-pos"), g("hwdec-current"), g("frame-drop-count"), g("decoder-frame-drop-count"),
                 g("vo-delayed-frame-count"), g("estimated-vf-fps"), g("display-fps"), size.width, size.height
