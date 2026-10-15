@@ -1,6 +1,6 @@
 [package]
 name = "iina-rs"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Cross-platform (Windows/Linux) media player inspired by IINA, built on libmpv"
 license = "GPL-3.0-or-later"
