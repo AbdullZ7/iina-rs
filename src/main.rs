@@ -340,7 +340,12 @@ impl App {
             return Err(String::new());
         }
         let window = el.create_window(attrs.clone()).map_err(|e| e.to_string())?;
-        let display_info = display_info::query(&window);
+        let mut display_info = display_info::query(&window);
+        // The OS-reported peak can vary or exceed the panel's real ability;
+        // a user value takes precedence.
+        if self.ui.settings.hdr_peak_nits > 0.0 {
+            display_info.max_nits = self.ui.settings.hdr_peak_nits;
+        }
         dbg_log(format!("display: {display_info:?}"));
         if cfg!(windows) && !display_info.hdr_active && std::env::var_os("IINA_RS_FORCE_VULKAN").is_none() {
             return Err(String::new());

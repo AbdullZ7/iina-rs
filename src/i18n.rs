@@ -278,6 +278,8 @@ const AR: &[(&str, &str)] = &[
     ("Chapter: {}", "الفصل: {}"),
     ("HDR output on HDR displays (restart required)", "إخراج HDR على الشاشات الداعمة (يتطلب إعادة التشغيل)"),
     ("Output", "المخرج"),
+    ("HDR peak brightness", "ذروة سطوع HDR"),
+    ("nits (0 = automatic)", "نت (0 = تلقائي)"),
     // Subtitle preferences
     ("Preferred languages", "اللغات المفضّلة"),
     ("Font", "الخط"),

@@ -1531,6 +1531,13 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
             check(ui, &mut s.hardware_decoding, t("Enable hardware decoding"));
             if !cfg!(target_os = "macos") {
                 check(ui, &mut s.hdr_output, t("HDR output on HDR displays (restart required)"));
+                if s.hdr_output {
+                    row(ui, |ui| {
+                        ui.label(t("HDR peak brightness"));
+                        ui.add(egui::DragValue::new(&mut s.hdr_peak_nits).range(0.0..=10000.0).speed(10.0).max_decimals(0));
+                        ui.label(RichText::new(t("nits (0 = automatic)")).size(11.0).color(FG_DIM));
+                    });
+                }
             }
             row(ui, |ui| {
                 ui.label(t("Initial volume"));

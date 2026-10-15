@@ -37,6 +37,8 @@ pub struct Settings {
     pub language: String,
     /// Present through Vulkan in HDR10 when the display is in HDR mode.
     pub hdr_output: bool,
+    /// Display peak luminance for HDR output (0 = as reported by the OS).
+    pub hdr_peak_nits: f32,
     pub subs: SubStyle,
 }
 
@@ -131,6 +133,7 @@ impl Default for Settings {
             sub_languages: "ar,en".into(),
             language: "auto".into(),
             hdr_output: true,
+            hdr_peak_nits: 0.0,
             subs: SubStyle::default(),
         }
     }
