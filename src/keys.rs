@@ -17,6 +17,12 @@ const DESKTOP_EXTRAS: &str = "
 #@iina Meta+i inspector
 #@iina Meta+j jump-to
 #@iina Meta+h history
+#@iina Z sub-delay-step 0 -
+#@iina X sub-delay-step 0 +
+#@iina Shift+Meta+Z sub-delay-step 1 -
+#@iina Shift+Meta+X sub-delay-step 1 +
+#@iina Ctrl+Meta+Shift+Z sub-delay-step 2 -
+#@iina Ctrl+Meta+Shift+X sub-delay-step 2 +
 #@iina Meta+, preferences
 Meta+q quit
 #@iina F11 toggle-fullscreen

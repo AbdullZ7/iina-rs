@@ -6,6 +6,7 @@
 
 mod assoc;
 mod display_info;
+mod fonts;
 mod history;
 mod i18n;
 mod instance;
@@ -95,7 +96,7 @@ struct App {
     last_drop: Option<Instant>,
     cursor: PhysicalPosition<f64>,
     cursor_hidden: bool,
-    subs_lifted: bool,
+    sub_margin_applied: Option<i64>,
     repaint_at: Option<Instant>,
     /// Debug aid: `IINA_RS_SNAPSHOT=out.png` saves the composited frame after
     /// a few seconds and quits (desktop capture tools often miss GL windows).
@@ -115,6 +116,7 @@ struct App {
     /// Last known (path, position, duration) of the current file, for history.
     last_pos: Option<(String, f64, f64)>,
     debug_cmds_done: bool,
+    fonts_scanning: bool,
     /// Property-change OSD is suppressed until shortly after a file starts,
     /// so initial values don't flash messages.
     osd_armed_at: Option<Instant>,
@@ -208,7 +210,7 @@ impl App {
             last_drop: None,
             cursor: PhysicalPosition::new(0.0, 0.0),
             cursor_hidden: false,
-            subs_lifted: false,
+            sub_margin_applied: None,
             repaint_at: None,
             snapshot: std::env::var("IINA_RS_SNAPSHOT").ok(),
             started: Instant::now(),
@@ -222,6 +224,7 @@ impl App {
             history: history::History::load(&config_dir_for_history),
             last_pos: None,
             debug_cmds_done: false,
+            fonts_scanning: false,
             osd_armed_at: None,
             osd_seek: false,
             osd_chapter: false,
@@ -591,7 +594,35 @@ impl App {
             }
             "open-default-apps" => assoc::open_default_apps_settings(),
             "open-config-dir" => open_folder(&self.config_dir),
-            "preferences" => self.ui.show_prefs = true,
+            "open-fonts-dir" => {
+                // mpv loads fonts from <config>/fonts for ASS subtitles.
+                let dir = self.config_dir.join("fonts");
+                let _ = std::fs::create_dir_all(&dir);
+                open_folder(&dir);
+            }
+            "scan-fonts" => {
+                // Requested every frame by the open picker until the list is
+                // ready; scan only once.
+                if !std::mem::replace(&mut self.fonts_scanning, true) {
+                    let p = self.proxy.clone();
+                    fonts::scan(self.ui.fonts.clone(), self.config_dir.join("fonts"), move || {
+                        let _ = p.send_event(UserEvent::MpvRender);
+                    });
+                }
+            }
+            "sub-delay-step" => {
+                let mut it = arg.split_whitespace();
+                let idx = it.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(2);
+                let sign = if it.next() == Some("-") { -1.0 } else { 1.0 };
+                let step = self.ui.settings.subs.sync_steps[idx];
+                self.mpv.command(&["add", "sub-delay", &format!("{:.3}", sign * step)]);
+            }
+            "preferences" => {
+                self.ui.show_prefs = true;
+                if arg == "subs" {
+                    self.ui.prefs_tab = 1;
+                }
+            }
             "jump-to" => {
                 if !self.player.idle {
                     self.ui.jump_input = Some(String::new());
@@ -990,16 +1021,19 @@ impl App {
 
         // Like IINA, lift subtitles above the controller while it is shown.
         // sub-margin-y is in units of a 720px-tall frame; the bar is ~130pt high.
+        // The user's bottom margin is the base; the controller lifts it further.
         let lift = self.ui.osc_visible && !self.player.idle && !self.ui.pip;
-        if lift != self.subs_lifted {
-            self.subs_lifted = lift;
-            let margin = if lift {
-                let h_pt = size.height as f64 / window.scale_factor();
-                (130.0 / h_pt * 720.0).clamp(22.0, 300.0)
-            } else {
-                22.0
-            };
-            self.mpv.set_string("sub-margin-y", &format!("{}", margin.round() as i64));
+        let base = self.ui.settings.subs.margin;
+        let margin = if lift {
+            let h_pt = size.height as f64 / window.scale_factor();
+            (130.0 / h_pt * 720.0).clamp(22.0, 300.0).max(base)
+        } else {
+            base
+        }
+        .round() as i64;
+        if Some(margin) != self.sub_margin_applied {
+            self.sub_margin_applied = Some(margin);
+            self.mpv.set_string("sub-margin-y", &margin.to_string());
         }
 
         // Hide the cursor over the video while the controller is hidden.

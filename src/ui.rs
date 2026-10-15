@@ -55,6 +55,11 @@ pub struct UiState {
     pub assoc_status: String,
     /// How video reaches the screen (shown in the Inspector).
     pub output_mode: String,
+    /// Installed font families (scanned on demand for the font picker).
+    pub fonts: crate::fonts::Shared,
+    pub font_filter: String,
+    /// Preferences tab: 0 = general, 1 = subtitles.
+    pub prefs_tab: u8,
     /// IINA-style on-screen message: (logical text, optional progress 0..1,
     /// shown at, progress is a time position — never mirrored).
     pub osd: Option<(String, Option<f32>, Instant, bool)>,
@@ -91,6 +96,9 @@ impl UiState {
             assoc_status: String::new(),
             osd: None,
             output_mode: String::new(),
+            fonts: Default::default(),
+            font_filter: String::new(),
+            prefs_tab: 0,
             thumb_path: String::new(),
             thumb_tex: HashMap::new(),
         }
@@ -1465,6 +1473,9 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
     let mut open = true;
     let before = st.settings.clone();
     let assoc_status = st.assoc_status.clone();
+    let st_fonts = st.fonts.clone();
+    let mut prefs_tab = st.prefs_tab;
+    let mut st_font_filter = std::mem::take(&mut st.font_filter);
     let mut header_close = false;
     egui::Window::new(t("Preferences"))
         .title_bar(!is_rtl())
@@ -1480,6 +1491,18 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
                 header_close = true;
             }
             let s = &mut st.settings;
+            row(ui, |ui| {
+                for (i, name) in [(0u8, "General"), (1u8, "Subtitles")] {
+                    if ui.selectable_label(prefs_tab == i, RichText::new(t(name)).size(15.0)).clicked() {
+                        prefs_tab = i;
+                    }
+                }
+            });
+            ui.separator();
+            if prefs_tab == 1 {
+                subtitle_prefs(ui, &mut s.subs, &st_fonts, &mut st_font_filter, cmds);
+                return;
+            }
             row(ui, |ui| {
                 ui.label(t("Language"));
                 for (code, name) in [("auto", t("Automatic")), ("en", "English".to_string()), ("ar", v("العربية"))] {
@@ -1566,6 +1589,8 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
     if header_close {
         open = false;
     }
+    st.font_filter = st_font_filter;
+    st.prefs_tab = prefs_tab;
     if st.settings != before {
         st.settings_dirty = true;
     }
@@ -1782,4 +1807,140 @@ fn subtitle_search(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>
     }
     drop(s);
     st.show_subs = open;
+}
+
+/// PotPlayer-style subtitle preferences.
+fn subtitle_prefs(ui: &mut Ui, s: &mut crate::settings::SubStyle, fonts: &crate::fonts::Shared, filter: &mut String, cmds: &mut Vec<String>) {
+    row(ui, |ui| {
+        ui.label(t("Preferred languages"));
+        ui.add(egui::TextEdit::singleline(&mut s.languages).desired_width(220.0).hint_text("ar,ara,arabic"));
+    });
+
+    // Font picker with search over installed families.
+    row(ui, |ui| {
+        ui.label(t("Font"));
+        let shown = if s.font.is_empty() { t("Default font") } else { v(&s.font) };
+        egui::ComboBox::from_id_salt("sub-font")
+            .selected_text(shown)
+            .width(240.0)
+            .height(320.0)
+            .show_ui(ui, |ui| {
+                if fonts.lock().unwrap().is_none() {
+                    cmds.push("scan-fonts".into());
+                }
+                ui.add(egui::TextEdit::singleline(filter).hint_text(t("Search fonts…")).desired_width(220.0));
+                if ui.selectable_label(s.font.is_empty(), t("Default font")).clicked() {
+                    s.font.clear();
+                }
+                match fonts.lock().unwrap().as_ref() {
+                    None => {
+                        ui.label(RichText::new(t("Loading fonts…")).color(FG_DIM));
+                    }
+                    Some(list) => {
+                        let f = filter.to_lowercase();
+                        for name in list.iter().filter(|n| f.is_empty() || n.to_lowercase().contains(&f)).take(400) {
+                            if ui.selectable_label(&s.font == name, v(name)).clicked() {
+                                s.font = name.clone();
+                            }
+                        }
+                    }
+                }
+            });
+        check(ui, &mut s.bold, t("Bold"));
+    });
+    row(ui, |ui| {
+        ui.label(t("Size"));
+        slider(ui, &mut s.size, 16.0..=120.0, "", 0);
+    });
+
+    let color = |ui: &mut Ui, label: &str, c: &mut [u8; 4]| {
+        ui.label(t(label));
+        let mut col = Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+        if egui::color_picker::color_edit_button_srgba(ui, &mut col, egui::color_picker::Alpha::OnlyBlend).changed() {
+            *c = col.to_srgba_unmultiplied();
+        }
+    };
+    row(ui, |ui| {
+        color(ui, "Text", &mut s.color);
+        color(ui, "Outline", &mut s.outline_color);
+        color(ui, "Shadow", &mut s.shadow_color);
+    });
+    row(ui, |ui| {
+        ui.label(t("Outline"));
+        slider(ui, &mut s.outline_size, 0.0..=10.0, "", 1);
+    });
+    row(ui, |ui| {
+        ui.label(t("Shadow"));
+        slider(ui, &mut s.shadow_offset, 0.0..=10.0, "", 1);
+    });
+    row(ui, |ui| {
+        ui.label(t("Letter spacing"));
+        slider(ui, &mut s.letter_spacing, -5.0..=20.0, "", 1);
+    });
+    row_wrapped(ui, |ui| {
+        ui.label(t("Style"));
+        for (val, label) in [("outline-and-shadow", "Outline & shadow"), ("opaque-box", "Opaque box"), ("background-box", "Background box")] {
+            if ui.selectable_label(s.border_style == val, t(label)).clicked() {
+                s.border_style = val.into();
+            }
+        }
+    });
+    if s.border_style != "outline-and-shadow" {
+        row(ui, |ui| color(ui, "Box color", &mut s.box_color));
+    }
+    row(ui, |ui| {
+        ui.label(t("Vertical position"));
+        slider(ui, &mut s.position, 0.0..=150.0, "", 0);
+    });
+    row(ui, |ui| {
+        ui.label(t("Bottom margin"));
+        slider(ui, &mut s.margin, 0.0..=200.0, "", 0);
+    });
+    row(ui, |ui| {
+        ui.label(t("Secondary subtitle position"));
+        slider(ui, &mut s.secondary_position, 0.0..=100.0, "", 0);
+    });
+
+    let combo = |ui: &mut Ui, id: &str, label: &str, value: &mut String, options: &[(&str, &str)]| {
+        row(ui, |ui| {
+            ui.label(t(label));
+            let current = options.iter().find(|(k, _)| k == value).map(|(_, l)| t(l)).unwrap_or_else(|| value.clone());
+            egui::ComboBox::from_id_salt(id).selected_text(current).width(220.0).show_ui(ui, |ui| {
+                for (k, l) in options {
+                    if ui.selectable_label(value == k, t(l)).clicked() {
+                        *value = k.to_string();
+                    }
+                }
+            });
+        });
+    };
+    combo(ui, "sub-enc", "Encoding", &mut s.encoding, &[
+        ("auto", "Auto-detect"),
+        ("cp1256", "Arabic (Windows-1256)"),
+        ("utf-8", "UTF-8"),
+        ("iso-8859-6", "ISO-8859-6"),
+        ("cp1252", "Windows-1252"),
+        ("cp1251", "Windows-1251"),
+        ("cp1255", "Windows-1255"),
+        ("cp1254", "Windows-1254"),
+        ("cp1253", "Windows-1253"),
+    ]);
+    combo(ui, "sub-ass", "ASS/SSA styling", &mut s.ass_override, &[("scale", "As authored"), ("force", "Use my style"), ("strip", "Remove styling")]);
+    combo(ui, "sub-auto", "Load external subtitles", &mut s.autoload, &[
+        ("exact", "Exact file name"),
+        ("fuzzy", "Containing the file name"),
+        ("all", "Any in the folder"),
+    ]);
+    check(ui, &mut s.use_margins, t("Show text subtitles in the black bars"));
+    check(ui, &mut s.remove_sdh, t("Remove hearing-impaired text"));
+    row(ui, |ui| {
+        ui.label(t("Sync steps (s)"));
+        for step in s.sync_steps.iter_mut() {
+            ui.add(egui::DragValue::new(step).range(0.01..=600.0).speed(0.1).max_decimals(2));
+        }
+    });
+    ui.label(RichText::new(t("Shortcuts: Z/X, Ctrl+Shift+Z/X, Ctrl+Alt+Shift+Z/X")).size(11.0).color(FG_DIM));
+    if ui.button(t("Open fonts folder")).clicked() {
+        cmds.push("open-fonts-dir".into());
+    }
 }
