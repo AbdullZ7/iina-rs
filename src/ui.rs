@@ -53,6 +53,8 @@ pub struct UiState {
     pub subs: subtitles::Shared,
     /// Result message of the last file-association action.
     pub assoc_status: String,
+    /// How video reaches the screen (shown in the Inspector).
+    pub output_mode: String,
     /// IINA-style on-screen message: (logical text, optional progress 0..1,
     /// shown at, progress is a time position — never mirrored).
     pub osd: Option<(String, Option<f32>, Instant, bool)>,
@@ -88,6 +90,7 @@ impl UiState {
             subs: Default::default(),
             assoc_status: String::new(),
             osd: None,
+            output_mode: String::new(),
             thumb_path: String::new(),
             thumb_tex: HashMap::new(),
         }
@@ -1433,6 +1436,7 @@ fn inspector(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv) {
                 ("Frame rate", format!("{} fps (container {})", g("estimated-vf-fps"), g("container-fps"))),
                 ("Bitrate", kbps(g("video-bitrate"))),
                 ("Hardware decoder", if pl.hwdec_current.is_empty() { "no".into() } else { pl.hwdec_current.clone() }),
+                ("Output", st.output_mode.clone()),
             ]);
             section(ui, "Audio", &[
                 ("Codec", g("audio-codec")),
@@ -1502,6 +1506,9 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
             ui.add_space(6.0);
             ui.label(RichText::new(t("Video / Audio")).strong());
             check(ui, &mut s.hardware_decoding, t("Enable hardware decoding"));
+            if !cfg!(target_os = "macos") {
+                check(ui, &mut s.hdr_output, t("HDR output on HDR displays (restart required)"));
+            }
             row(ui, |ui| {
                 ui.label(t("Initial volume"));
                 slider(ui, &mut s.volume, 0.0..=100.0, "", 0);

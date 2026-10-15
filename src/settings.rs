@@ -35,6 +35,8 @@ pub struct Settings {
     pub sub_languages: String,
     /// Interface language: "auto" (system), "en" or "ar".
     pub language: String,
+    /// Present through Vulkan in HDR10 when the display is in HDR mode.
+    pub hdr_output: bool,
 }
 
 impl Default for Settings {
@@ -56,6 +58,7 @@ impl Default for Settings {
             opensubtitles_key: String::new(),
             sub_languages: "ar,en".into(),
             language: "auto".into(),
+            hdr_output: true,
         }
     }
 }

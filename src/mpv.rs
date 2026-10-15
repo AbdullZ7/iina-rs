@@ -429,11 +429,13 @@ impl Mpv {
         unsafe { (self.api.render_context_update)(self.render) & 1 != 0 }
     }
 
-    pub fn render(&self, w: i32, h: i32) {
+    /// Renders into GL framebuffer `fbo` (0 = default) of size `w`×`h`;
+    /// `internal_format` is its GL format (0 = unknown).
+    pub fn render(&self, fbo: i32, w: i32, h: i32, internal_format: i32) {
         if self.render.is_null() {
             return;
         }
-        let mut fbo = OpenGlFbo { fbo: 0, w, h, internal_format: 0 };
+        let mut fbo = OpenGlFbo { fbo, w, h, internal_format };
         let mut flip: c_int = 1;
         let mut params = [
             RenderParam { kind: RENDER_PARAM_OPENGL_FBO, data: &mut fbo as *mut _ as *mut c_void },

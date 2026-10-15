@@ -5,6 +5,7 @@
 //! framebuffer; the egui overlay (controller, sidebar, menus) is drawn on top.
 
 mod assoc;
+mod display_info;
 mod history;
 mod i18n;
 mod instance;
@@ -15,6 +16,7 @@ mod state;
 mod subtitles;
 mod thumbs;
 mod ui;
+mod vk_present;
 
 use glutin::context::{NotCurrentGlContext, PossiblyCurrentContext};
 use glutin::display::{GetGlDisplay, GlDisplay};
@@ -50,10 +52,24 @@ enum UserEvent {
 
 struct Gfx {
     window: Arc<Window>,
+    /// GL surface: the main window (OpenGL mode) or the hidden helper window
+    /// (Vulkan HDR mode, where GL renders off-screen).
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
     egui: egui_glow::EguiGlow,
+    vk: Option<VkMode>,
 }
+
+/// HDR presentation through Vulkan (see vk_present.rs).
+struct VkMode {
+    _helper: Window,
+    presenter: vk_present::VkPresenter,
+    targets: vk_present::GlTargets,
+    display: display_info::HdrDisplay,
+    video_hdr: Option<bool>,
+}
+
+const GL_RGBA16F: i32 = 0x881A;
 
 /// Saved geometry while in PiP / music mode.
 #[derive(Clone, Copy)]
@@ -230,6 +246,17 @@ impl App {
             .with_min_inner_size(LogicalSize::new(320.0, 140.0))
             .with_window_icon(icon)
             .with_visible(false);
+        match self.try_create_vulkan(el, &attrs) {
+            Ok(gfx) => {
+                self.gfx = Some(gfx);
+                self.after_window_created();
+                return;
+            }
+            Err(reason) => {
+                dbg_log(format!("OpenGL output: {reason}"));
+                self.ui.output_mode = if reason.is_empty() { "SDR · OpenGL".into() } else { format!("SDR · OpenGL ({reason})") };
+            }
+        }
         let template = glutin::config::ConfigTemplateBuilder::new().with_depth_size(0).with_stencil_size(0);
         let (window, config) = glutin_winit::DisplayBuilder::new()
             .with_preference(glutin_winit::ApiPreference::FallbackEgl)
@@ -260,24 +287,7 @@ impl App {
         let _ = surface.set_swap_interval(&context, SwapInterval::Wait(NonZeroU32::MIN));
 
         let gl = Arc::new(unsafe { glow::Context::from_loader_function_cstr(|s| display.get_proc_address(s)) });
-        let egui = egui_glow::EguiGlow::new(el, gl, None, None, true);
-        egui_extras::install_image_loaders(&egui.egui_ctx);
-        ui::setup_style(&egui.egui_ctx);
-        let p = self.proxy.clone();
-        egui.egui_ctx.set_request_repaint_callback(move |info| {
-            let _ = p.send_event(UserEvent::Repaint(info.delay));
-        });
-
-        let gl_display = display.clone();
-        let p = self.proxy.clone();
-        if let Err(e) = self.mpv.create_render_context(
-            move |name| gl_display.get_proc_address(name),
-            move || {
-                let _ = p.send_event(UserEvent::MpvRender);
-            },
-        ) {
-            eprintln!("mpv render context: {e}");
-        }
+        let egui = self.setup_egui_and_mpv(el, gl, &display);
 
         let window = Arc::new(window);
         window.set_visible(true);
@@ -293,7 +303,112 @@ impl App {
                 eprintln!("[gl] {}: {}", f.to_string_lossy(), !display.get_proc_address(f).is_null());
             }
         }
-        self.gfx = Some(Gfx { window, surface, context, egui });
+        self.gfx = Some(Gfx { window, surface, context, egui, vk: None });
+        self.after_window_created();
+    }
+
+    /// egui + mpv's render context on the current GL context.
+    fn setup_egui_and_mpv(&mut self, el: &ActiveEventLoop, gl: Arc<glow::Context>, display: &glutin::display::Display) -> egui_glow::EguiGlow {
+        let egui = egui_glow::EguiGlow::new(el, gl, None, None, true);
+        egui_extras::install_image_loaders(&egui.egui_ctx);
+        ui::setup_style(&egui.egui_ctx);
+        let p = self.proxy.clone();
+        egui.egui_ctx.set_request_repaint_callback(move |info| {
+            let _ = p.send_event(UserEvent::Repaint(info.delay));
+        });
+        let gl_display = display.clone();
+        let p = self.proxy.clone();
+        if let Err(e) = self.mpv.create_render_context(
+            move |name| gl_display.get_proc_address(name),
+            move || {
+                let _ = p.send_event(UserEvent::MpvRender);
+            },
+        ) {
+            eprintln!("mpv render context: {e}");
+        }
+        egui
+    }
+
+    /// HDR output: a Vulkan HDR10 swapchain on the main window, with GL
+    /// rendering off-screen on a hidden helper window. Returns why it isn't
+    /// used (empty when simply not applicable).
+    fn try_create_vulkan(&mut self, el: &ActiveEventLoop, attrs: &WindowAttributes) -> Result<Gfx, String> {
+        if cfg!(target_os = "macos") || !self.ui.settings.hdr_output || std::env::var_os("IINA_RS_NO_VULKAN").is_some() {
+            return Err(String::new());
+        }
+        let window = el.create_window(attrs.clone()).map_err(|e| e.to_string())?;
+        let display_info = display_info::query(&window);
+        dbg_log(format!("display: {display_info:?}"));
+        if cfg!(windows) && !display_info.hdr_active && std::env::var_os("IINA_RS_FORCE_VULKAN").is_none() {
+            return Err(String::new());
+        }
+
+        let helper_attrs = WindowAttributes::default().with_title("IINA-RS GL").with_inner_size(PhysicalSize::new(64, 64)).with_visible(false);
+        let template = glutin::config::ConfigTemplateBuilder::new().with_depth_size(0).with_stencil_size(0);
+        let (helper, config) = glutin_winit::DisplayBuilder::new()
+            .with_window_attributes(Some(helper_attrs.clone()))
+            .build(el, template, |mut it| it.next().expect("no OpenGL config"))
+            .map_err(|e| format!("GL display: {e}"))?;
+        let helper = match helper {
+            Some(h) => h,
+            None => glutin_winit::finalize_window(el, helper_attrs, &config).map_err(|e| e.to_string())?,
+        };
+        let raw = helper.window_handle().map_err(|e| e.to_string())?.as_raw();
+        let display = config.display();
+        let ctx_attrs = glutin::context::ContextAttributesBuilder::new().build(Some(raw));
+        let not_current = unsafe { display.create_context(&config, &ctx_attrs) }.map_err(|e| format!("GL context: {e}"))?;
+        let surf_attrs =
+            glutin::surface::SurfaceAttributesBuilder::<WindowSurface>::new().build(raw, NonZeroU32::new(64).unwrap(), NonZeroU32::new(64).unwrap());
+        let surface = unsafe { display.create_window_surface(&config, &surf_attrs) }.map_err(|e| format!("GL surface: {e}"))?;
+        let context = not_current.make_current(&surface).map_err(|e| format!("make current: {e}"))?;
+        let gl = Arc::new(unsafe { glow::Context::from_loader_function_cstr(|s| display.get_proc_address(s)) });
+
+        let ext = vk_present::GlExt::load(|s| display.get_proc_address(s))?;
+        let uuid = ext.device_uuid();
+        let presenter = vk_present::VkPresenter::new(&window, uuid, display_info.max_nits)?;
+        let targets = vk_present::GlTargets::new(&gl, ext, &presenter)?;
+
+        // mpv starts in SDR; switched per file in `update_hdr_target`.
+        self.mpv.set_string("target-trc", "srgb");
+        self.mpv.set_string("target-prim", "bt.709");
+        self.ui.output_mode = format!("{} · {:.0} nits peak · UI {:.0} nits", presenter.description, display_info.max_nits, display_info.sdr_white_nits);
+        dbg_log(format!("Vulkan output: {}", self.ui.output_mode));
+        let egui = self.setup_egui_and_mpv(el, gl, &display);
+        let window = Arc::new(window);
+        window.set_visible(true);
+        Ok(Gfx {
+            window,
+            surface,
+            context,
+            egui,
+            vk: Some(VkMode { _helper: helper, presenter, targets, display: display_info, video_hdr: None }),
+        })
+    }
+
+    /// In HDR output mode, render HDR video as PQ/BT.2020 at the display's
+    /// peak (mpv tone-maps brighter masters), SDR video as sRGB.
+    fn update_hdr_target(&mut self) {
+        let Some(vk) = self.gfx.as_mut().and_then(|g| g.vk.as_mut()) else { return };
+        let gamma = self.mpv.get_string("video-params/gamma").unwrap_or_default();
+        // PQ output only on an HDR10 swapchain (not in the SDR test mode).
+        let hdr = matches!(gamma.as_str(), "pq" | "hlg") && vk.presenter.hdr;
+        if vk.video_hdr == Some(hdr) {
+            return;
+        }
+        vk.video_hdr = Some(hdr);
+        if hdr {
+            self.mpv.set_string("target-trc", "pq");
+            self.mpv.set_string("target-prim", "bt.2020");
+            self.mpv.set_string("target-peak", &format!("{:.0}", vk.display.max_nits));
+        } else {
+            self.mpv.set_string("target-trc", "srgb");
+            self.mpv.set_string("target-prim", "bt.709");
+            self.mpv.set_string("target-peak", "auto");
+        }
+        dbg_log(format!("video {} → mpv target {}", gamma, if hdr { "PQ/BT.2020" } else { "sRGB" }));
+    }
+
+    fn after_window_created(&mut self) {
         if self.player.fullscreen {
             self.apply_fullscreen();
         }
@@ -657,6 +772,7 @@ impl App {
                     }
                 }
                 Event::VideoReconfig => {
+                    self.update_hdr_target();
                     if self.resize_on_video && self.fit_to_video(1.0) {
                         self.resize_on_video = false;
                     }
@@ -774,7 +890,23 @@ impl App {
         }
         let t0 = Instant::now();
         self.mpv.render_update();
-        self.mpv.render(size.width as i32, size.height as i32);
+        if let Some(vk) = gfx.vk.as_mut() {
+            let (w, h) = vk.targets.size();
+            vk.targets.begin_frame();
+            self.mpv.render(vk.targets.video_fbo as i32, w, h, GL_RGBA16F);
+            // The UI goes into its own (transparent) texture.
+            use glow::HasContext;
+            let gl = gfx.egui.painter.gl();
+            unsafe {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, NonZeroU32::new(vk.targets.ui_fbo).map(glow::NativeFramebuffer));
+                gl.viewport(0, 0, w, h);
+                gl.disable(glow::SCISSOR_TEST);
+                gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+        } else {
+            self.mpv.render(0, size.width as i32, size.height as i32, 0);
+        }
         let t_mpv = t0.elapsed();
 
         let window = gfx.window.clone();
@@ -813,13 +945,43 @@ impl App {
             );
         }
         let snap_after = std::env::var("IINA_RS_SNAPSHOT_AFTER").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
-        if let Some(path) = self.snapshot.as_ref().filter(|_| self.started.elapsed() > Duration::from_secs(snap_after)) {
-            save_snapshot(gfx.egui.painter.gl(), size, path);
+        if let Some(vk) = gfx.vk.as_mut() {
+            let video_hdr = vk.video_hdr.unwrap_or(false);
+            let gl = gfx.egui.painter.gl().clone();
+            vk.targets.composite(&gl, video_hdr, vk.display.sdr_white_nits, vk.presenter.hdr);
+        }
+        let snapshot_due = self.snapshot.is_some() && self.started.elapsed() > Duration::from_secs(snap_after);
+        if let Some(path) = self.snapshot.as_ref().filter(|_| snapshot_due) {
+            if let Some(vk) = gfx.vk.as_ref() {
+                // PQ-encoded HDR10 frame, already top-down.
+                use glow::HasContext;
+                let gl = gfx.egui.painter.gl();
+                unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, NonZeroU32::new(vk.targets.shared_fbo).map(glow::NativeFramebuffer)) };
+                let (w, h) = vk.targets.size();
+                save_snapshot_ex(gl, PhysicalSize::new(w as u32, h as u32), path, false);
+            } else {
+                save_snapshot(gfx.egui.painter.gl(), size, path);
+            }
             self.snapshot = None;
             self.mpv.command(&["quit"]);
         }
         let t1 = Instant::now();
-        let _ = gfx.surface.swap_buffers(&gfx.context);
+        if let Some(vk) = gfx.vk.as_mut() {
+            let gl = gfx.egui.painter.gl().clone();
+            vk.targets.end_frame(&gl);
+            match vk.presenter.present() {
+                Ok(true) => {}
+                Ok(false) => {
+                    let s = gfx.window.inner_size();
+                    if let Err(e) = vk.presenter.resize(s.width, s.height).and_then(|_| vk.targets.recreate(&gl, &vk.presenter)) {
+                        eprintln!("Vulkan resize: {e}");
+                    }
+                }
+                Err(e) => eprintln!("Vulkan present: {e}"),
+            }
+        } else {
+            let _ = gfx.surface.swap_buffers(&gfx.context);
+        }
         self.mpv.report_swap();
         let t_swap = t1.elapsed();
         if t0.elapsed() > Duration::from_millis(60) {
@@ -1159,6 +1321,10 @@ fn dbg_log(msg: String) {
 }
 
 fn save_snapshot(gl: &glow::Context, size: PhysicalSize<u32>, path: &str) {
+    save_snapshot_ex(gl, size, path, true)
+}
+
+fn save_snapshot_ex(gl: &glow::Context, size: PhysicalSize<u32>, path: &str, flip: bool) {
     use glow::HasContext;
     let (w, h) = (size.width as i32, size.height as i32);
     let mut px = vec![0u8; (w * h * 4) as usize];
@@ -1166,7 +1332,7 @@ fn save_snapshot(gl: &glow::Context, size: PhysicalSize<u32>, path: &str) {
         gl.read_pixels(0, 0, w, h, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut px)));
     }
     let row = (w * 4) as usize;
-    let flipped: Vec<u8> = px.chunks(row).rev().flatten().copied().collect();
+    let flipped: Vec<u8> = if flip { px.chunks(row).rev().flatten().copied().collect() } else { px };
     if let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, flipped) {
         let _ = img.save(path);
     }
@@ -1275,8 +1441,13 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: winit::window::WindowId, event: WindowEvent) {
+    fn window_event(&mut self, el: &ActiveEventLoop, id: winit::window::WindowId, event: WindowEvent) {
         let Some(gfx) = self.gfx.as_mut() else { return };
+        // Only the main window matters (not the hidden GL helper window, nor a
+        // window discarded when HDR output wasn't possible).
+        if id != gfx.window.id() {
+            return;
+        }
         let resp = gfx.egui.on_window_event(&gfx.window, &event);
         if resp.repaint {
             gfx.window.request_redraw();
@@ -1291,7 +1462,14 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Destroyed => el.exit(),
             WindowEvent::Resized(size) => {
                 dbg_log(format!("Resized {}x{} win_fs={} mpv_fs={}", size.width, size.height, gfx.window.fullscreen().is_some(), self.player.fullscreen));
-                if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+                if let Some(vk) = gfx.vk.as_mut() {
+                    if size.width > 0 && size.height > 0 {
+                        let gl = gfx.egui.painter.gl().clone();
+                        if let Err(e) = vk.presenter.resize(size.width, size.height).and_then(|_| vk.targets.recreate(&gl, &vk.presenter)) {
+                            eprintln!("Vulkan resize: {e}");
+                        }
+                    }
+                } else if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
                     gfx.surface.resize(&gfx.context, w, h);
                 }
                 // Keep mpv's fullscreen flag in sync if the OS changed it
@@ -1405,6 +1583,10 @@ impl ApplicationHandler<UserEvent> for App {
         // The render context must be freed while the GL context is current.
         self.mpv.free_render_context();
         if let Some(mut g) = self.gfx.take() {
+            if let Some(vk) = g.vk.as_mut() {
+                let gl = g.egui.painter.gl().clone();
+                vk.targets.destroy(&gl);
+            }
             g.egui.destroy();
         }
     }

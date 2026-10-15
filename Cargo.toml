@@ -28,10 +28,13 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 ar-reshaper = "1.5.0"
 unicode-bidi = "0.3.18"
 sys-locale = "0.3.2"
+ash = "0.38"
+ash-window = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
 windows-sys = { version = "0.60", features = ["Win32_UI_Shell"] }
+windows = { version = "0.61", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Devices_Display"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

@@ -276,6 +276,8 @@ const AR: &[(&str, &str)] = &[
     ("Off", "متوقف"),
     ("Screenshot Captured", "تم التقاط الصورة"),
     ("Chapter: {}", "الفصل: {}"),
+    ("HDR output on HDR displays (restart required)", "إخراج HDR على الشاشات الداعمة (يتطلب إعادة التشغيل)"),
+    ("Output", "المخرج"),
     // App messages
     (
         "Registered. Pick IINA-RS under “Open with”, or set it as default in Default apps.",
