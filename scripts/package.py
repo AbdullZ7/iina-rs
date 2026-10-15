@@ -3,10 +3,13 @@
 
   package.py windows <iina-rs.exe> <libmpv-2.dll> <out_dir>
   package.py linux   <iina-rs>                    <out_dir>
+  package.py macos   <iina-rs>       <libmpv.2.dylib> <out_dir>   (run on macOS)
 
 Windows -> portable .zip (exe + libmpv-2.dll).
 Linux   -> .tar.gz (binary, .desktop, icon, install.sh) and a .deb that
            depends on the distro's libmpv.
+macOS   -> IINA-RS.app (libmpv and its dependencies bundled with
+           dylibbundler, ad-hoc signed) inside a .dmg.
 """
 
 import io
@@ -173,6 +176,77 @@ Description: Modern media player inspired by IINA, powered by mpv
     return path
 
 
+INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>IINA-RS</string>
+  <key>CFBundleDisplayName</key><string>IINA-RS</string>
+  <key>CFBundleIdentifier</key><string>io.github.abdullz7.iina-rs</string>
+  <key>CFBundleVersion</key><string>{version}</string>
+  <key>CFBundleShortVersionString</key><string>{version}</string>
+  <key>CFBundleExecutable</key><string>iina-rs</string>
+  <key>CFBundleIconFile</key><string>iina-rs</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Media</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array><string>public.movie</string><string>public.audio</string><string>public.audiovisual-content</string></array>
+    </dict>
+  </array>
+</dict>
+</plist>
+"""
+
+
+def package_macos(binary, libmpv, out):
+    import shutil
+    import subprocess
+
+    def run(*cmd):
+        print("+", " ".join(cmd))
+        subprocess.run(cmd, check=True)
+
+    work = os.path.join(out, "macos-build")
+    shutil.rmtree(work, ignore_errors=True)
+    app = os.path.join(work, "IINA-RS.app", "Contents")
+    for d in ("MacOS", "Resources", "Frameworks"):
+        os.makedirs(os.path.join(app, d))
+    shutil.copy(binary, os.path.join(app, "MacOS", "iina-rs"))
+    os.chmod(os.path.join(app, "MacOS", "iina-rs"), 0o755)
+    shutil.copy(os.path.join(ROOT, "assets", "iina.icns"), os.path.join(app, "Resources", "iina-rs.icns"))
+    with open(os.path.join(app, "Info.plist"), "w", encoding="utf-8") as f:
+        f.write(INFO_PLIST.format(version=VERSION))
+    frameworks = os.path.join(app, "Frameworks")
+    lib = os.path.join(frameworks, "libmpv.2.dylib")
+    shutil.copy(os.path.realpath(libmpv), lib)
+    os.chmod(lib, 0o755)
+    # The executable dlopen()s libmpv from ../Frameworks; bundle libmpv's own
+    # dependencies next to it and point their install names there.
+    run("install_name_tool", "-id", "@executable_path/../Frameworks/libmpv.2.dylib", lib)
+    run("dylibbundler", "-of", "-b", "-cd", "-x", lib, "-d", frameworks, "-p", "@executable_path/../Frameworks/")
+    # Modified binaries need a (here ad-hoc) signature to run on Apple Silicon.
+    for name in sorted(os.listdir(frameworks)):
+        run("codesign", "--force", "--sign", "-", os.path.join(frameworks, name))
+    run("codesign", "--force", "--sign", "-", os.path.join(work, "IINA-RS.app"))
+    for name, data in docs().items():
+        with open(os.path.join(work, name), "wb") as f:
+            f.write(data)
+    os.symlink("/Applications", os.path.join(work, "Applications"))
+    arch = os.uname().machine
+    dmg = os.path.join(out, f"IINA-RS-{VERSION}-macos-{arch}.dmg")
+    run("hdiutil", "create", "-volname", "IINA-RS", "-srcfolder", work, "-ov", "-format", "UDZO", dmg)
+    shutil.rmtree(work, ignore_errors=True)
+    print(dmg)
+
+
 def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
@@ -180,6 +254,9 @@ def main():
     if kind == "windows" and len(sys.argv) == 5:
         os.makedirs(sys.argv[4], exist_ok=True)
         package_windows(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif kind == "macos" and len(sys.argv) == 5:
+        os.makedirs(sys.argv[4], exist_ok=True)
+        package_macos(sys.argv[2], sys.argv[3], sys.argv[4])
     elif kind == "linux" and len(sys.argv) == 4:
         os.makedirs(sys.argv[3], exist_ok=True)
         package_linux(sys.argv[2], sys.argv[3])

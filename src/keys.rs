@@ -182,7 +182,13 @@ fn named(k: &NamedKey) -> Option<&'static str> {
 
 /// Converts a winit key press into the canonical binding string.
 pub fn event_to_spec(ev: &KeyEvent, mods: ModifiersState) -> Option<String> {
-    let (ctrl, alt, shift) = (mods.control_key() || mods.super_key(), mods.alt_key(), mods.shift_key());
+    // Cmd/Win counts as Ctrl (IINA's Meta). Ctrl+Cmd together is IINA's
+    // Ctrl+Meta, which `normalize` maps to Ctrl+Alt.
+    let (ctrl, alt, shift) = (
+        mods.control_key() || mods.super_key(),
+        mods.alt_key() || (mods.control_key() && mods.super_key()),
+        mods.shift_key(),
+    );
     let key = match &ev.logical_key {
         Key::Named(n) => named(n)?.to_string(),
         Key::Character(s) => {

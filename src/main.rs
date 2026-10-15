@@ -1175,7 +1175,9 @@ fn save_snapshot(gl: &glow::Context, size: PhysicalSize<u32>, path: &str) {
 fn open_folder(dir: &Path) {
     #[cfg(windows)]
     let _ = std::process::Command::new("explorer").arg(dir).spawn();
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(dir).spawn();
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
 }
 
@@ -1187,7 +1189,11 @@ fn reveal(path: &str) {
     {
         let _ = std::process::Command::new("explorer").arg(format!("/select,{path}")).spawn();
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         let dir = Path::new(path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();

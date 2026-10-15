@@ -168,6 +168,14 @@ fn install_fallback_fonts(ctx: &egui::Context) {
             "C:\\Windows\\Fonts\\malgun.ttf",
             "C:\\Windows\\Fonts\\seguisym.ttf",
         ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/GeezaPro.ttc",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/System/Library/Fonts/Apple Symbols.ttf",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        ]
     } else {
         &[
             "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
@@ -257,6 +265,16 @@ fn rtl_header(ui: &mut Ui, title: &str) -> bool {
     close
 }
 
+/// Shortcut as shown to the user: Mac symbols on macOS (⌘ ⇧ ⌥ ⌃).
+fn shortcut_label(s: &str) -> String {
+    if !cfg!(target_os = "macos") {
+        return s.to_string();
+    }
+    let mut out = s.replace("Ctrl+Alt+", "⌃⌘").replace("Ctrl+Shift+", "⇧⌘").replace("Ctrl+", "⌘");
+    out = out.replace("Shift+", "⇧").replace("Alt+", "⌥");
+    out
+}
+
 /// Context-menu entry: label at the reading start, shortcut at the other end.
 fn menu_item(ui: &mut Ui, label: &str, shortcut: &str) -> Response {
     let h = 24.0;
@@ -274,7 +292,7 @@ fn menu_item(ui: &mut Ui, label: &str, shortcut: &str) -> Response {
     };
     ui.painter().text(pos2(main_x, rect.center().y), main_align, label, font.clone(), FG);
     if !shortcut.is_empty() {
-        ui.painter().text(pos2(sc_x, rect.center().y), sc_align, shortcut, font, FG_DIM);
+        ui.painter().text(pos2(sc_x, rect.center().y), sc_align, shortcut_label(shortcut), font, FG_DIM);
     }
     resp
 }

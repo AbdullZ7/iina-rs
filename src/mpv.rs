@@ -111,6 +111,8 @@ fn library_candidates() -> Vec<std::path::PathBuf> {
         for n in names {
             out.push(dir.join(n));
             out.push(dir.join("lib").join(n));
+            // macOS .app bundle: Contents/MacOS/iina-rs -> Contents/Frameworks.
+            out.push(dir.join("../Frameworks").join(n));
         }
     }
     for n in names {
