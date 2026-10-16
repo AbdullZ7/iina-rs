@@ -822,10 +822,10 @@ fn osd(ctx: &egui::Context, st: &mut UiState, pl: &Player) {
                 .inner_margin(egui::Margin::symmetric(16, 10))
                 .show(ui, |ui| {
                     let main = if matches!(m.bar, OsdBar::Time) { time_text.clone() } else { m.text.clone() };
-                    ui.label(RichText::new(v(&main)).size(size).color(FG));
+                    ui.add(egui::Label::new(RichText::new(v(&main)).size(size).color(FG)).extend());
                     if let OsdDetail::Time(prefix) = &m.detail {
                         let line = if prefix.is_empty() { time_text.clone() } else { format!("{prefix}  {time_text}") };
-                        ui.label(RichText::new(v(&line)).size(size * 0.6).color(FG_DIM));
+                        ui.add(egui::Label::new(RichText::new(v(&line)).size(size * 0.6).color(FG_DIM)).extend());
                     }
                     let bar = |ui: &mut Ui| {
                         let (r, _) = ui.allocate_exact_size(vec2(240.0, 6.0), Sense::hover());

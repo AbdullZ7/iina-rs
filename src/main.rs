@@ -760,6 +760,27 @@ impl App {
         }
     }
 
+    /// Leaves fullscreen right away (not when mpv's property change comes back,
+    /// which would restore the old window over a PiP / music-mode layout).
+    /// Returns the windowed geometry fullscreen had saved, if any.
+    fn leave_fullscreen_now(&mut self) -> Option<Geometry> {
+        if !self.player.fullscreen {
+            return None;
+        }
+        self.player.fullscreen = false;
+        self.ui.fullscreen = false;
+        self.mpv.set_flag("fullscreen", false);
+        let w = self.window().cloned()?;
+        if cfg!(windows) {
+            let saved = self.fs_saved.as_ref().map(|(g, _)| Geometry { pos: g.pos, size: g.size });
+            self.set_fullscreen_windows(&w, false);
+            saved
+        } else {
+            w.set_fullscreen(None);
+            None
+        }
+    }
+
     fn toggle_pip(&mut self) {
         if self.ui.pip {
             self.ui.pip = false;
@@ -769,11 +790,11 @@ impl App {
         if self.player.idle {
             return;
         }
-        if self.player.fullscreen {
-            self.mpv.set_flag("fullscreen", false);
-        }
+        let windowed = self.leave_fullscreen_now();
         if self.ui.music_mode {
             self.ui.music_mode = false;
+        } else if windowed.is_some() {
+            self.saved_geometry = windowed;
         } else {
             self.save_geometry();
         }
@@ -784,6 +805,9 @@ impl App {
             self.mpv.get_string("dwidth").and_then(|s| s.parse::<f64>().ok()).unwrap_or(16.0),
             self.mpv.get_string("dheight").and_then(|s| s.parse::<f64>().ok()).unwrap_or(9.0),
         );
+        if w.is_maximized() {
+            w.set_maximized(false);
+        }
         if let Some(mon) = w.current_monitor() {
             let ms = mon.size();
             let width = ms.width as f64 * 0.25;
@@ -806,14 +830,14 @@ impl App {
             self.restore_geometry();
             return;
         }
-        if self.player.fullscreen {
-            self.mpv.set_flag("fullscreen", false);
-        }
+        let windowed = self.leave_fullscreen_now();
         if self.ui.pip {
             self.ui.pip = false;
             if let Some(w) = self.window() {
                 w.set_decorations(true);
             }
+        } else if windowed.is_some() {
+            self.saved_geometry = windowed;
         } else {
             self.save_geometry();
         }
@@ -1399,7 +1423,7 @@ impl App {
                 None,
             )),
             "video-aspect-override" => Some((
-                tlf("Aspect Ratio: {}", &[&if p.aspect.is_empty() || p.aspect.starts_with('-') || p.aspect == "no" { tl("Default") } else { p.aspect.clone() }]),
+                tlf("Aspect Ratio: {}", &[&if p.aspect.is_empty() || p.aspect.starts_with('-') || p.aspect == "no" { tl("Default") } else { aspect_name(&p.aspect) }]),
                 None,
             )),
             "video-rotate" => Some((tlf("Rotation: {}°", &[&p.rotate]), None)),
@@ -1998,4 +2022,21 @@ fn main() {
         }
     };
     event_loop.run_app(&mut app).expect("event loop error");
+}
+
+/// "1.777778" → "16:9"; other ratios with at most two decimals.
+fn aspect_name(raw: &str) -> String {
+    let Ok(x) = raw.trim().parse::<f64>() else { return raw.to_string() };
+    const NAMES: [(f64, &str); 9] = [
+        (4.0 / 3.0, "4:3"),
+        (16.0 / 9.0, "16:9"),
+        (16.0 / 10.0, "16:10"),
+        (2.33, "21:9"),
+        (21.0 / 9.0, "21:9"),
+        (1.0, "1:1"),
+        (5.0 / 4.0, "5:4"),
+        (2.35, "2.35:1"),
+        (1.85, "1.85:1"),
+    ];
+    NAMES.iter().find(|(r, _)| (r - x).abs() < 0.005).map(|(_, n)| n.to_string()).unwrap_or_else(|| format!("{}:1", trim_num(x)))
 }
