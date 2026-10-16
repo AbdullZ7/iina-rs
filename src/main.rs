@@ -38,7 +38,7 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::raw_window_handle::HasWindowHandle;
-use winit::window::{Fullscreen, Icon, Window, WindowAttributes, WindowLevel};
+use winit::window::{CursorIcon, Fullscreen, Icon, ResizeDirection, Window, WindowAttributes, WindowLevel};
 
 const SUB_EXTS: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "idx", "sup", "smi", "lrc"];
 
@@ -116,6 +116,10 @@ struct App {
     click_pause_at: Option<(Instant, String)>,
     /// Save settings (the last volume) after this time.
     save_settings_at: Option<Instant>,
+    /// A resize cursor is shown on a PiP window edge.
+    pip_cursor_set: bool,
+    /// The PiP window moved/resized: remember its rect (in about_to_wait).
+    pip_moved: bool,
     /// The window has been centred once (later resizes keep its centre).
     window_centred: bool,
     /// Last state requested from the OS for keeping the display awake.
@@ -238,6 +242,8 @@ impl App {
             siblings_for: None,
             click_pause_at: None,
             save_settings_at: None,
+            pip_cursor_set: false,
+            pip_moved: false,
             window_centred: false,
             keep_awake: false,
             fullscreen_applied: false,
@@ -595,7 +601,14 @@ impl App {
             "ctx-menu" => {
                 if let Some(g) = self.gfx.as_ref() {
                     let ctx = g.egui.egui_ctx.clone();
-                    self.ui.open_context_menu_center(&ctx);
+                    // "ctx-menu fx fy": at a fraction of the window (debug).
+                    let f: Vec<f32> = arg.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+                    if let [fx, fy] = f[..] {
+                        let r = ctx.screen_rect();
+                        self.ui.context_menu = Some(egui::pos2(r.left() + r.width() * fx, r.top() + r.height() * fy));
+                    } else {
+                        self.ui.open_context_menu_center(&ctx);
+                    }
                 }
             }
             // Debug aid: run a key binding by its spec, e.g. "key RIGHT".
@@ -781,6 +794,26 @@ impl App {
         }
     }
 
+    /// The PiP window edge under the cursor (borderless windows have no
+    /// system resize frame, so the edges are handled here).
+    fn pip_edge(&self) -> Option<ResizeDirection> {
+        let g = self.gfx.as_ref()?;
+        pip_edge_at(self.ui.pip, &g.window, self.cursor)
+    }
+
+    fn remember_pip(&mut self) {
+        let Some(w) = self.window() else { return };
+        let (Ok(p), s) = (w.outer_position(), w.inner_size()) else { return };
+        if s.width < 100 || s.height < 60 {
+            return;
+        }
+        let rect = Some([p.x, p.y, s.width as i32, s.height as i32]);
+        if self.ui.settings.pip_rect != rect {
+            self.ui.settings.pip_rect = rect;
+            self.save_settings_at = Some(Instant::now() + Duration::from_secs(2));
+        }
+    }
+
     fn toggle_pip(&mut self) {
         if self.ui.pip {
             self.ui.pip = false;
@@ -808,12 +841,25 @@ impl App {
         if w.is_maximized() {
             w.set_maximized(false);
         }
+        w.set_decorations(false);
+        w.set_window_level(WindowLevel::AlwaysOnTop);
+        if let Some([x, y, pw, _]) = self.ui.settings.pip_rect {
+            let on_screen = w.available_monitors().any(|m| {
+                let (p, s) = (m.position(), m.size());
+                x >= p.x - 50 && y >= p.y - 50 && x < p.x + s.width as i32 - 50 && y < p.y + s.height as i32 - 50
+            });
+            if on_screen && pw >= 160 {
+                // Same place and width as last time; height follows this video.
+                let height = pw as f64 * vh.max(1.0) / vw.max(1.0);
+                let _ = w.request_inner_size(PhysicalSize::new(pw as u32, height as u32));
+                w.set_outer_position(PhysicalPosition::new(x, y));
+                return;
+            }
+        }
         if let Some(mon) = w.current_monitor() {
             let ms = mon.size();
             let width = ms.width as f64 * 0.25;
             let height = width * vh.max(1.0) / vw.max(1.0);
-            w.set_decorations(false);
-            w.set_window_level(WindowLevel::AlwaysOnTop);
             let _ = w.request_inner_size(PhysicalSize::new(width as u32, height as u32));
             let margin = 32.0 * w.scale_factor();
             let mp = mon.position();
@@ -1769,6 +1815,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.repaint_at = Some(t);
             }
         }
+        if std::mem::take(&mut self.pip_moved) && self.ui.pip {
+            self.remember_pip();
+        }
         if let Some(t) = self.save_settings_at {
             if t <= Instant::now() {
                 self.save_settings_at = None;
@@ -1807,7 +1856,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.mpv.command(&["quit"]);
             }
             WindowEvent::Destroyed => el.exit(),
+            WindowEvent::Moved(_) if self.ui.pip => self.pip_moved = true,
             WindowEvent::Resized(size) => {
+                if self.ui.pip {
+                    self.pip_moved = true;
+                }
                 dbg_log(format!("Resized {}x{} win_fs={} mpv_fs={}", size.width, size.height, gfx.window.fullscreen().is_some(), self.player.fullscreen));
                 if let Some(vk) = gfx.vk.as_mut() {
                     if size.width > 0 && size.height > 0 {
@@ -1864,6 +1917,22 @@ impl ApplicationHandler<UserEvent> for App {
                         let _ = gfx.window.drag_window();
                     }
                 }
+                if self.ui.pip {
+                    // Resize cursor on the borderless PiP window's edges.
+                    let icon = match pip_edge_at(true, &gfx.window, self.cursor) {
+                        Some(ResizeDirection::East | ResizeDirection::West) => Some(CursorIcon::EwResize),
+                        Some(ResizeDirection::North | ResizeDirection::South) => Some(CursorIcon::NsResize),
+                        Some(ResizeDirection::NorthWest | ResizeDirection::SouthEast) => Some(CursorIcon::NwseResize),
+                        Some(_) => Some(CursorIcon::NeswResize),
+                        None => None,
+                    };
+                    if let Some(icon) = icon {
+                        gfx.window.set_cursor(icon);
+                    } else if self.pip_cursor_set {
+                        gfx.window.set_cursor(CursorIcon::Default);
+                    }
+                    self.pip_cursor_set = icon.is_some();
+                }
                 if moved && self.cursor_hidden {
                     self.cursor_hidden = false;
                     gfx.window.set_cursor_visible(true);
@@ -1875,6 +1944,11 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let over_ui = egui_ctx.is_pointer_over_area() || egui_ctx.wants_pointer_input();
                 match (button, state) {
+                    (MouseButton::Left, ElementState::Pressed) if self.pip_edge().is_some() => {
+                        if let (Some(dir), Some(g)) = (self.pip_edge(), self.gfx.as_ref()) {
+                            let _ = g.window.drag_resize_window(dir);
+                        }
+                    }
                     (MouseButton::Left, ElementState::Pressed) if !over_ui => {
                         self.ui.context_menu = None;
                         let now = Instant::now();
@@ -2039,4 +2113,28 @@ fn aspect_name(raw: &str) -> String {
         (1.85, "1.85:1"),
     ];
     NAMES.iter().find(|(r, _)| (r - x).abs() < 0.005).map(|(_, n)| n.to_string()).unwrap_or_else(|| format!("{}:1", trim_num(x)))
+}
+
+/// The PiP window edge under `cursor` (borderless windows have no system
+/// resize frame, so the edges are handled by hand).
+fn pip_edge_at(pip: bool, window: &Window, cursor: PhysicalPosition<f64>) -> Option<ResizeDirection> {
+    if !pip {
+        return None;
+    }
+    let size = window.inner_size();
+    let m = 8.0 * window.scale_factor();
+    let (x, y) = (cursor.x, cursor.y);
+    let (w, h) = (size.width as f64, size.height as f64);
+    let (l, r, t, b) = (x < m, x > w - m, y < m, y > h - m);
+    Some(match (l, r, t, b) {
+        (true, _, true, _) => ResizeDirection::NorthWest,
+        (_, true, true, _) => ResizeDirection::NorthEast,
+        (true, _, _, true) => ResizeDirection::SouthWest,
+        (_, true, _, true) => ResizeDirection::SouthEast,
+        (true, ..) => ResizeDirection::West,
+        (_, true, ..) => ResizeDirection::East,
+        (_, _, true, _) => ResizeDirection::North,
+        (.., true) => ResizeDirection::South,
+        _ => return None,
+    })
 }

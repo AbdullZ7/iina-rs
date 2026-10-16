@@ -332,7 +332,11 @@ fn scroll_v<R>(ui: &mut Ui, salt: &str, max_height: Option<f32>, fill: bool, add
         area = area.vertical_scroll_offset(off);
     }
     area = area.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
-    let avail = ui.available_rect_before_wrap();
+    let mut avail = ui.available_rect_before_wrap();
+    if let Some(h) = max_height {
+        // Popups/auto-sized windows report last frame's height as available.
+        avail.max.y = avail.min.y + h;
+    }
     let content = avail.with_min_x(avail.min.x + BAR + 4.0);
     let out = ui.scope_builder(egui::UiBuilder::new().max_rect(content).layout(*ui.layout()), |ui| area.show(ui, add)).inner;
     let view = out.inner_rect;
@@ -392,13 +396,13 @@ fn shortcut_label(s: &str) -> String {
 
 /// Context-menu entry: label at the reading start, shortcut at the other end.
 fn menu_item(ui: &mut Ui, label: &str, shortcut: &str) -> Response {
-    let h = 24.0;
+    let h = ui.spacing().interact_size.y;
     let w = ui.available_width().max(200.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     if resp.hovered() {
         ui.painter().rect_filled(rect, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
     }
-    let font = FontId::proportional(14.0);
+    let font = egui::TextStyle::Body.resolve(ui.style());
     let pad = 8.0;
     let (main_align, main_x, sc_align, sc_x) = if is_rtl() {
         (Align2::RIGHT_CENTER, rect.right() - pad, Align2::LEFT_CENTER, rect.left() + pad)
@@ -1411,16 +1415,35 @@ fn audio_tab(ui: &mut Ui, st: &mut UiState, pl: &Player, mpv: &Mpv, cmds: &mut V
 
 fn context_menu(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Vec<String>) {
     let Some(pos) = st.context_menu else { return };
-    let resp = egui::Area::new(egui::Id::new("ctx-menu"))
-        .fixed_pos(pos)
-        // Menus open towards the reading direction.
-        .pivot(if is_rtl() { Align2::RIGHT_TOP } else { Align2::LEFT_TOP })
+    let screen = ctx.screen_rect();
+    // Arabic labels are wider; leave room for label + shortcut.
+    let width = (if is_rtl() { 330.0 } else { 260.0_f32 }).min(screen.width() - 16.0);
+    // ~22 rows + separators: shrink rows on short windows so it all fits.
+    let row_h = ((screen.height() - 40.0) / 24.0).clamp(17.0, 24.0);
+    let font = if row_h < 21.0 { 13.0 } else { 14.0 };
+    // Open at the cursor towards the reading direction; flip when there's no
+    // room, and keep inside the window.
+    let rtl = is_rtl();
+    let right_room = screen.right() - pos.x;
+    let left_room = pos.x - screen.left();
+    let open_left = if rtl { left_room >= width || left_room > right_room } else { right_room < width && left_room > right_room };
+    let x = if open_left { (pos.x - width).max(screen.left() + 4.0) } else { pos.x.min(screen.right() - width - 4.0) };
+    // Height: last frame's measured menu, else an estimate (rows + separators).
+    let menu_id = egui::Id::new("ctx-menu");
+    let est_h = ctx.memory(|m| m.area_rect(menu_id)).map(|r| r.height()).unwrap_or(row_h * 25.0 + 60.0).min(screen.height() - 8.0);
+    let y = if pos.y + est_h > screen.bottom() { (screen.bottom() - est_h - 4.0).max(screen.top() + 4.0) } else { pos.y };
+    let resp = egui::Area::new(menu_id)
+        .fixed_pos(pos2(x, y))
         .order(egui::Order::Foreground)
         .constrain(true)
-        .show(ctx, |ui| rtl_window(ui, 240.0, |ui| {
+        .show(ctx, |ui| {
             egui::Frame::menu(ui.style()).show(ui, |ui| {
-                // Arabic labels are wider; leave room for label + shortcut.
-                ui.set_min_width(if is_rtl() { 330.0 } else { 250.0 });
+                ui.set_width(width - 12.0);
+                ui.spacing_mut().interact_size.y = row_h;
+                ui.spacing_mut().item_spacing.y = if row_h < 21.0 { 1.0 } else { 2.0 };
+                ui.style_mut().text_styles.insert(egui::TextStyle::Body, FontId::proportional(font));
+                let max_h = screen.height() - 16.0;
+                scroll_v(ui, "ctx-menu", Some(max_h), false, |ui| {
                 let mut item = |ui: &mut Ui, label: &str, shortcut: &str, cmd: &str| {
                     if menu_item(ui, &t(label), shortcut).clicked() {
                         cmds.push(cmd.to_string());
@@ -1460,8 +1483,9 @@ fn context_menu(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut V
                 item(ui, "Preferences…", "Ctrl+,", "preferences");
                 item(ui, "About IINA-RS", "", "about");
                 item(ui, "Quit", "Ctrl+Q", "mpv quit");
+                });
             });
-        }))
+        })
         .response;
     let clicked_elsewhere = ctx.input(|i| i.pointer.any_pressed()) && !resp.contains_pointer() && !ctx.input(|i| i.pointer.secondary_pressed());
     if !cmds.is_empty() || clicked_elsewhere || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {

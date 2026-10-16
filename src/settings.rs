@@ -117,6 +117,9 @@ pub struct Settings {
     // --------------------------------------------------------------- advanced
     /// Extra mpv options, one `name=value` per line (applied last).
     pub mpv_options: String,
+
+    /// Last Picture-in-Picture window (x, y, width, height in physical pixels).
+    pub pip_rect: Option<[i32; 4]>,
 }
 
 /// Subtitle preferences (PotPlayer-style), applied as mpv options.
@@ -276,6 +279,7 @@ impl Default for Settings {
             subs: SubStyle::default(),
 
             mpv_options: String::new(),
+            pip_rect: None,
         }
     }
 }
