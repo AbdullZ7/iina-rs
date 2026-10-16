@@ -21,7 +21,9 @@ pub const EVENT_START_FILE: c_int = 6;
 pub const EVENT_END_FILE: c_int = 7;
 pub const EVENT_FILE_LOADED: c_int = 8;
 pub const EVENT_VIDEO_RECONFIG: c_int = 17;
+pub const EVENT_SEEK: c_int = 20;
 pub const EVENT_PLAYBACK_RESTART: c_int = 21;
+pub const EVENT_HOOK: c_int = 25;
 pub const EVENT_PROPERTY_CHANGE: c_int = 22;
 
 const RENDER_PARAM_INVALID: c_int = 0;
@@ -47,6 +49,12 @@ struct RawEventProperty {
     name: *const c_char,
     format: c_int,
     data: *mut c_void,
+}
+
+#[repr(C)]
+struct RawEventHook {
+    name: *const c_char,
+    id: u64,
 }
 
 #[repr(C)]
@@ -85,6 +93,8 @@ struct Api {
     set_wakeup_callback:
         unsafe extern "C" fn(*mut mpv_handle, Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void),
     free: unsafe extern "C" fn(*mut c_void),
+    hook_add: unsafe extern "C" fn(*mut mpv_handle, u64, *const c_char, c_int) -> c_int,
+    hook_continue: unsafe extern "C" fn(*mut mpv_handle, u64) -> c_int,
     error_string: unsafe extern "C" fn(c_int) -> *const c_char,
     render_context_create:
         unsafe extern "C" fn(*mut *mut mpv_render_context, *mut mpv_handle, *mut RenderParam) -> c_int,
@@ -155,6 +165,8 @@ impl Api {
             wait_event: sym!("mpv_wait_event"),
             set_wakeup_callback: sym!("mpv_set_wakeup_callback"),
             free: sym!("mpv_free"),
+            hook_add: sym!("mpv_hook_add"),
+            hook_continue: sym!("mpv_hook_continue"),
             error_string: sym!("mpv_error_string"),
             render_context_create: sym!("mpv_render_context_create"),
             render_context_set_update_callback: sym!("mpv_render_context_set_update_callback"),
@@ -184,6 +196,9 @@ pub enum Event {
     FileLoaded,
     VideoReconfig,
     PlaybackRestart,
+    Seek,
+    /// A hook registered with `hook_add`; call `hook_continue(id)` when done.
+    Hook(String, u64),
     Property(String, PropValue),
     Other,
 }
@@ -298,6 +313,16 @@ impl Mpv {
         unsafe { (self.api.observe_property)(self.handle, 0, n.as_ptr(), format) };
     }
 
+    /// Registers a hook (e.g. "on_load"); mpv waits until `hook_continue`.
+    pub fn hook_add(&self, name: &str, priority: i32) {
+        let n = cstr(name);
+        unsafe { (self.api.hook_add)(self.handle, 0, n.as_ptr(), priority) };
+    }
+
+    pub fn hook_continue(&self, id: u64) {
+        unsafe { (self.api.hook_continue)(self.handle, id) };
+    }
+
     pub fn set_wakeup_callback(&mut self, f: impl Fn() + Send + Sync + 'static) {
         let b: Box<Box<dyn Fn() + Send + Sync>> = Box::new(Box::new(f));
         let ctx = &*b as *const _ as *mut c_void;
@@ -314,6 +339,11 @@ impl Mpv {
             EVENT_FILE_LOADED => Event::FileLoaded,
             EVENT_VIDEO_RECONFIG => Event::VideoReconfig,
             EVENT_PLAYBACK_RESTART => Event::PlaybackRestart,
+            EVENT_SEEK => Event::Seek,
+            EVENT_HOOK => {
+                let h = unsafe { &*(ev.data as *const RawEventHook) };
+                Event::Hook(unsafe { CStr::from_ptr(h.name) }.to_string_lossy().into_owned(), h.id)
+            }
             EVENT_PROPERTY_CHANGE => {
                 let p = unsafe { &*(ev.data as *const RawEventProperty) };
                 let name = unsafe { CStr::from_ptr(p.name) }.to_string_lossy().into_owned();

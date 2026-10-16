@@ -14,6 +14,7 @@ mod keys;
 mod mpv;
 mod settings;
 mod state;
+mod sub_finder;
 mod subtitles;
 mod thumbs;
 mod ui;
@@ -111,7 +112,16 @@ struct App {
     /// File whose folder siblings should be added once it has loaded.
     siblings_for: Option<String>,
     /// Pending single-click pause (delayed so a double click can cancel it).
-    click_pause_at: Option<Instant>,
+    /// Pending single-click action (delayed so a double click can cancel it).
+    click_pause_at: Option<(Instant, String)>,
+    /// Save settings (the last volume) after this time.
+    save_settings_at: Option<Instant>,
+    /// The window has been centred once (later resizes keep its centre).
+    window_centred: bool,
+    /// Last state requested from the OS for keeping the display awake.
+    keep_awake: bool,
+    /// Fullscreen-on-open applied for the current file.
+    fullscreen_applied: bool,
     history: history::History,
     /// Last known (path, position, duration) of the current file, for history.
     last_pos: Option<(String, f64, f64)>,
@@ -154,13 +164,13 @@ impl App {
             ("input-default-bindings", "no"),
             ("input-vo-keyboard", "no"),
             ("osc", "no"),
-            ("ytdl", "yes"),
             ("watch-later-dir", &format!("{cfg}/watch_later")),
-            ("screenshot-template", "IINA-RS %F %wH.%wM.%wS"),
             // mpv's built-in OSD/OSC are replaced by IINA-RS's own UI.
             ("osd-level", "0"),
             ("osd-bar", "no"),
             ("osd-on-seek", "no"),
+            // A-B loops are per file (IINA).
+            ("reset-on-next-file", "ab-loop-a,ab-loop-b"),
             ("sub-auto", "fuzzy"),
             ("audio-file-auto", "fuzzy"),
             ("config-dir", &cfg),
@@ -173,13 +183,19 @@ impl App {
         for (k, v) in settings.mpv_options() {
             mpv.set_option(k, &v);
         }
-        mpv.set_option("volume", &format!("{}", settings.volume.round() as i64));
+        mpv.set_option("volume", &format!("{}", settings.volume.min(settings.volume_max.max(100.0)).round() as i64));
+        // Advanced: the user's own mpv options, after ours.
+        for (k, v) in settings.extra_mpv_options() {
+            mpv.set_option(&k, &v);
+        }
         // `--name=value` / `--flag` / `--no-flag` arguments are passed to mpv, like iina-cli.
         for (k, v) in &mpv_opts {
             mpv.set_option(k, v);
         }
         mpv.init()?;
         state::observe_all(&mpv);
+        // Subfolder subtitles are added while the file loads (see on_load).
+        mpv.hook_add("on_load", 50);
         let p = proxy.clone();
         mpv.set_wakeup_callback(move || {
             let _ = p.send_event(UserEvent::MpvEvents);
@@ -221,6 +237,10 @@ impl App {
             thumbs: None,
             siblings_for: None,
             click_pause_at: None,
+            save_settings_at: None,
+            window_centred: false,
+            keep_awake: false,
+            fullscreen_applied: false,
             history: history::History::load(&config_dir_for_history),
             last_pos: None,
             debug_cmds_done: false,
@@ -245,8 +265,8 @@ impl App {
         let icon = Icon::from_rgba(include_bytes!("../assets/icon_64.rgba").to_vec(), 64, 64).ok();
         let attrs = WindowAttributes::default()
             .with_title("IINA-RS")
-            .with_inner_size(LogicalSize::new(960.0, 540.0))
-            .with_min_inner_size(LogicalSize::new(320.0, 140.0))
+            .with_inner_size(LogicalSize::new(640.0, 360.0))
+            .with_min_inner_size(LogicalSize::new(285.0, 120.0))
             .with_window_icon(icon)
             .with_visible(false);
         match self.try_create_vulkan(el, &attrs) {
@@ -458,6 +478,9 @@ impl App {
             if !self.player.idle {
                 self.mpv.command(&["write-watch-later-config"]);
             }
+            if self.ui.settings.pause_on_open {
+                self.mpv.set_flag("pause", true);
+            }
             self.mpv.command(&["loadfile", &abs, "replace"]);
             self.resize_on_video = true;
             self.siblings_for = (siblings && !abs.contains("://") && self.ui.settings.auto_add_folder).then(|| abs.clone());
@@ -500,15 +523,28 @@ impl App {
         let (name, arg) = cmd.split_once(' ').unwrap_or((cmd, ""));
         match name {
             "mpv" => self.mpv.command_string(arg),
+            "toggle-pause" => self.toggle_pause(),
+            "arrow-left" => self.arrow_button(false),
+            "arrow-right" => self.arrow_button(true),
+            "screenshot" => self.take_screenshot(),
+            "toggle-flip" => self.mpv.command(&["vf", "toggle", "@iina-flip:vflip"]),
+            "toggle-mirror" => self.mpv.command(&["vf", "toggle", "@iina-mirror:hflip"]),
+            "save-playlist" => self.save_playlist(),
+            "delete-current-file" => self.delete_current_file(),
             "open-path" => self.open(arg, true),
             "open-file" => {
                 let files = self.pick_files("Open", &[("Media", MEDIA_EXTS), ("All files", &["*"])]);
                 self.open_many(files);
             }
             "add-files" => {
-                for f in self.pick_files("Add to playlist", &[("Media", MEDIA_EXTS), ("All files", &["*"])]) {
+                let files = self.pick_files("Add to playlist", &[("Media", MEDIA_EXTS), ("All files", &["*"])]);
+                let n = files.len();
+                for f in files {
                     let idle = self.player.idle;
                     self.open_ex(&f, idle, false);
+                }
+                if n > 0 {
+                    self.ui.show_osd(i18n::tlf("Added {} files to playlist", &[&n]), None);
                 }
             }
             "add-sub" => {
@@ -522,7 +558,14 @@ impl App {
                 }
             }
             "open-url" => self.ui.url_input = Some(String::new()),
-            "close-file" => self.mpv.command(&["stop"]),
+            "close-file" => {
+                // Keep the resume position, like IINA does on stop.
+                if !self.player.idle {
+                    self.mpv.command(&["write-watch-later-config"]);
+                }
+                self.mpv.command(&["stop"]);
+                self.ui.show_osd(i18n::tl("Stop"), None);
+            }
             "clear-recent" => {
                 self.ui.recent.clear();
                 self.save_recent();
@@ -625,7 +668,9 @@ impl App {
             "preferences" => {
                 self.ui.show_prefs = true;
                 if arg == "subs" {
-                    self.ui.prefs_tab = 1;
+                    self.ui.prefs_tab = 2;
+                } else if let Ok(tab) = arg.parse::<u8>() {
+                    self.ui.prefs_tab = tab.min(5);
                 }
             }
             "jump-to" => {
@@ -659,6 +704,7 @@ impl App {
         // mpv sizes windows in physical pixels scaled by the display's DPI
         // (hidpi-window-scale); do the same.
         let dpi = window.scale_factor();
+        let scale = scale * self.ui.settings.resize_scale.clamp(0.25, 4.0);
         let (mut tw, mut th) = (w * scale * dpi, h * scale * dpi);
         if let Some(mon) = window.current_monitor() {
             let ms = mon.size();
@@ -666,15 +712,23 @@ impl App {
             let k = (mw / tw).min(mh / th).min(1.0);
             tw *= k;
             th *= k;
+            let old_inner = window.inner_size();
+            let old_pos = window.outer_position().ok();
             let _ = window.request_inner_size(PhysicalSize::new(tw as u32, th as u32));
-            // Re-center like IINA does when a new video opens.
             let mp = mon.position();
             let outer = window.outer_size();
-            let dx = outer.width.saturating_sub(window.inner_size().width) as f64;
-            let dy = outer.height.saturating_sub(window.inner_size().height) as f64;
-            let x = mp.x as f64 + (ms.width as f64 - tw - dx) / 2.0;
-            let y = mp.y as f64 + (ms.height as f64 - th - dy) / 2.0;
-            window.set_outer_position(PhysicalPosition::new(x.max(mp.x as f64) as i32, y.max(mp.y as f64) as i32));
+            let dx = outer.width.saturating_sub(old_inner.width) as f64;
+            let dy = outer.height.saturating_sub(old_inner.height) as f64;
+            // Like IINA: centre on the screen the first time, afterwards keep
+            // the window's centre where it is.
+            let (cx, cy) = match old_pos.filter(|_| self.window_centred) {
+                Some(p) => (p.x as f64 + (old_inner.width as f64 + dx) / 2.0, p.y as f64 + (old_inner.height as f64 + dy) / 2.0),
+                None => (mp.x as f64 + ms.width as f64 / 2.0, mp.y as f64 + ms.height as f64 / 2.0),
+            };
+            self.window_centred = true;
+            let x = (cx - (tw + dx) / 2.0).clamp(mp.x as f64, (mp.x as f64 + ms.width as f64 - tw - dx).max(mp.x as f64));
+            let y = (cy - (th + dy) / 2.0).clamp(mp.y as f64, (mp.y as f64 + ms.height as f64 - th - dy).max(mp.y as f64));
+            window.set_outer_position(PhysicalPosition::new(x as i32, y as i32));
         } else {
             let _ = window.request_inner_size(PhysicalSize::new(tw as u32, th as u32));
         }
@@ -779,7 +833,21 @@ impl App {
                     el.exit();
                     return;
                 }
+                Event::Hook(name, id) => {
+                    if name == "on_load" {
+                        self.on_load_hook(id);
+                    } else {
+                        self.mpv.hook_continue(id);
+                    }
+                }
+                Event::Seek => {
+                    // IINA shows the position on every seek (keys, bar, mpv).
+                    if self.osd_armed_at.is_some_and(|t| Instant::now() >= t) {
+                        self.show_seek_osd();
+                    }
+                }
                 Event::StartFile => {
+                    self.fullscreen_applied = false;
                     self.resize_on_video = self.ui.settings.resize_to_video;
                     self.osd_armed_at = Some(Instant::now() + Duration::from_millis(1200));
                 }
@@ -793,16 +861,15 @@ impl App {
                         self.history.opened(&path, &title, dur);
                     }
                     self.player.crop_label = "None".into();
+                    if self.ui.settings.fullscreen_on_open && !std::mem::replace(&mut self.fullscreen_applied, true) && !self.player.fullscreen {
+                        self.mpv.set_flag("fullscreen", true);
+                    }
                     if !title.is_empty() {
                         self.ui.show_osd(title.clone(), None);
                     }
                 }
                 Event::EndFile => self.flush_history(),
                 Event::PlaybackRestart => {
-                    if self.osd_seek {
-                        self.osd_seek = false;
-                        self.show_seek_osd();
-                    }
                     if !self.debug_cmds_done && std::env::var_os("IINA_RS_CMD_DELAY").is_none() {
                         self.run_debug_cmds();
                     }
@@ -825,9 +892,23 @@ impl App {
                     self.player.apply(&name, &value);
                     self.osd_for_property(&name);
                     if name == "chapter" && std::mem::take(&mut self.osd_chapter) {
-                        if let Some(c) = usize::try_from(self.player.chapter).ok().and_then(|i| self.player.chapters.get(i)) {
-                            self.ui.show_osd(i18n::tlf("Chapter: {}", &[&c.title]), None);
+                        let n = self.player.chapters.len();
+                        if let Some(i) = usize::try_from(self.player.chapter).ok().filter(|i| *i < n) {
+                            let title = self.player.chapters[i].title.clone();
+                            self.ui.show_osd_ex(
+                                i18n::tlf("Chapter: {}", &[&title]),
+                                ui::OsdDetail::Time(format!("({}/{})", i + 1, n)),
+                                ui::OsdBar::None,
+                            );
                         }
+                    }
+                    if name == "volume" && self.ui.settings.remember_volume && self.osd_armed_at.is_some_and(|t| Instant::now() >= t) {
+                        // Remember the last volume (IINA's softVolume).
+                        self.ui.settings.volume = self.player.volume;
+                        self.save_settings_at = Some(Instant::now() + Duration::from_secs(2));
+                    }
+                    if matches!(name.as_str(), "pause" | "idle-active" | "vid") {
+                        self.update_keep_awake();
                     }
                     match name.as_str() {
                         "fullscreen" if before.0 != self.player.fullscreen => self.apply_fullscreen(),
@@ -1067,6 +1148,14 @@ impl App {
     /// arming OSD feedback for actions that don't change a watched property.
     fn run_mpv_binding(&mut self, cmd: &str) {
         let first = cmd.split_whitespace().next().unwrap_or("");
+        if cmd.split_whitespace().collect::<Vec<_>>() == ["cycle", "pause"] {
+            self.toggle_pause();
+            return;
+        }
+        if cmd.trim() == "screenshot" {
+            self.take_screenshot();
+            return;
+        }
         match first {
             "show-progress" => {
                 self.osd_seek = true;
@@ -1078,7 +1167,6 @@ impl App {
                 self.ui.show_osd(text, None);
                 return;
             }
-            "seek" | "frame-step" | "frame-back-step" | "sub-seek" => self.osd_seek = true,
             "screenshot" => self.ui.show_osd(i18n::tl("Screenshot Captured"), None),
             _ => {}
         }
@@ -1089,12 +1177,161 @@ impl App {
     }
 
     fn show_seek_osd(&mut self) {
-        // Read the position directly: the time-pos change event for the new
-        // position may not have arrived yet when the seek completes.
-        let pos = self.mpv.get_string("time-pos").and_then(|s| s.parse::<f64>().ok()).unwrap_or(self.player.time_pos);
-        let dur = self.player.duration;
-        let progress = (dur > 0.0).then(|| (pos / dur) as f32);
-        self.ui.show_time_osd(format!("{} / {}", ui::fmt_time(pos), ui::fmt_time(dur)), progress);
+        // The OSD shows the live position (updated while it is visible).
+        self.ui.show_time_osd();
+    }
+
+    /// Play/pause; at the end of a file (keep-open), play restarts it (IINA).
+    fn toggle_pause(&mut self) {
+        if self.player.idle {
+            return;
+        }
+        if self.player.pause && self.player.eof_reached {
+            self.mpv.command(&["seek", "0", "absolute"]);
+            self.mpv.set_flag("pause", false);
+        } else {
+            self.mpv.command(&["cycle", "pause"]);
+        }
+    }
+
+    /// The controller's ⏪ ⏩ buttons (IINA: speed by default).
+    fn arrow_button(&mut self, forward: bool) {
+        match self.ui.settings.arrow_action.as_str() {
+            "playlist" if self.player.playlist_count > 1 => self.mpv.command(&[if forward { "playlist-next" } else { "playlist-prev" }]),
+            "playlist" | "seek" => {
+                let step = self.ui.settings.arrow_seek_step.max(1.0);
+                self.mpv.command(&["seek", &format!("{}", if forward { step } else { -step })]);
+            }
+            _ => {
+                let speed = self.player.speed;
+                let new = if forward {
+                    if speed < 1.0 { 1.0 } else { (speed * 2.0).min(32.0) }
+                } else if speed > 1.0 {
+                    1.0
+                } else {
+                    (speed / 2.0).max(0.25)
+                };
+                self.mpv.set_double("speed", new);
+            }
+        }
+    }
+
+    fn take_screenshot(&mut self) {
+        let mode = if self.ui.settings.screenshot_with_subs { "subtitles" } else { "video" };
+        self.mpv.command(&["screenshot", mode]);
+        self.ui.show_osd(i18n::tl("Screenshot Captured"), None);
+    }
+
+    /// Mouse actions from Preferences.
+    fn mouse_action(&mut self, action: &str) {
+        match action {
+            "pause" => self.toggle_pause(),
+            "fullscreen" if !self.player.idle && !self.ui.pip => self.mpv.command(&["cycle", "fullscreen"]),
+            "fullscreen" if self.ui.pip => self.toggle_pip(),
+            "hide-osc" => {
+                // Hide controller and cursor until the mouse moves again.
+                self.ui.last_activity = Instant::now() - Duration::from_secs(3600);
+                self.redraw();
+            }
+            "pip" => self.toggle_pip(),
+            "menu" => {
+                if let Some(g) = self.gfx.as_ref() {
+                    let ppp = g.egui.egui_ctx.pixels_per_point() as f64;
+                    self.ui.context_menu = Some(egui::pos2((self.cursor.x / ppp) as f32, (self.cursor.y / ppp) as f32));
+                    self.redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Scroll action ("volume", "seek", "speed") by `steps` notches.
+    fn scroll_action(&mut self, action: &str, steps: f64) {
+        if steps == 0.0 {
+            return;
+        }
+        match action {
+            "volume" => self.mpv.command(&["add", "volume", &format!("{:.2}", steps * 2.0)]),
+            "seek" => self.mpv.command(&["seek", &format!("{:.2}", steps * 2.0)]),
+            "speed" => self.mpv.command(&["multiply", "speed", &format!("{:.4}", 1.05f64.powf(steps))]),
+            _ => {}
+        }
+    }
+
+    fn save_playlist(&mut self) {
+        if self.player.playlist.is_empty() {
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new().add_filter("M3U8", &["m3u8"]).set_file_name("playlist.m3u8").save_file() else { return };
+        let mut text = String::from("#EXTM3U\n");
+        for item in &self.player.playlist {
+            if let Some(t) = &item.title {
+                text.push_str(&format!("#EXTINF:-1,{t}\n"));
+            }
+            text.push_str(&item.filename);
+            text.push('\n');
+        }
+        let _ = std::fs::write(path, text);
+    }
+
+    /// Moves the playing file to the recycle bin / trash (after confirming).
+    fn delete_current_file(&mut self) {
+        let path = self.player.path.clone();
+        if path.is_empty() || path.contains("://") {
+            return;
+        }
+        let name = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let ok = rfd::MessageDialog::new()
+            .set_title("IINA-RS")
+            .set_description(i18n::tlf("Move “{}” to the Recycle Bin?", &[&name]))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .set_level(rfd::MessageLevel::Warning)
+            .show();
+        if ok != rfd::MessageDialogResult::Yes {
+            return;
+        }
+        let pos = self.mpv.get_string("playlist-pos").unwrap_or_default();
+        if self.player.playlist_count > 1 {
+            self.mpv.command(&["playlist-next", "force"]);
+            self.mpv.command(&["playlist-remove", &pos]);
+        } else {
+            self.mpv.command(&["stop"]);
+        }
+        if let Err(e) = trash::delete(&path) {
+            self.ui.show_osd(format!("{e}"), None);
+        }
+    }
+
+    /// Keeps the display awake while video plays (IINA: prevent screensaver).
+    fn update_keep_awake(&mut self) {
+        let want = self.ui.settings.prevent_sleep && !self.player.idle && !self.player.pause && !self.player.vid.is_empty() && self.player.vid != "no";
+        if want == self.keep_awake {
+            return;
+        }
+        self.keep_awake = want;
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
+            let flags = if want { ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED } else { ES_CONTINUOUS };
+            SetThreadExecutionState(flags);
+        }
+    }
+
+    /// on_load hook: add subtitles found in subfolders before mpv selects tracks.
+    fn on_load_hook(&mut self, id: u64) {
+        if self.ui.settings.subs.search_subfolders {
+            let path = self.mpv.get_string("path").unwrap_or_default();
+            if !path.is_empty() && !path.contains("://") {
+                let found = sub_finder::find(Path::new(&path));
+                if !found.is_empty() {
+                    let sep = if cfg!(windows) { ";" } else { ":" };
+                    let list: Vec<String> = found.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                    dbg_log(format!("subfolder subtitles: {list:?}"));
+                    self.mpv.set_string("file-local-options/sub-files", &list.join(sep));
+                }
+            }
+        }
+        self.mpv.hook_continue(id);
     }
 
     fn track_desc(&self, kind: &str, id: &str) -> String {
@@ -1118,22 +1355,41 @@ impl App {
         use i18n::{tl, tlf};
         let p = &self.player;
         let onoff = |b: bool| tl(if b { "On" } else { "Off" });
+        let delay = |d: f64| {
+            if d.abs() < 0.0005 {
+                tl("No Delay")
+            } else if d > 0.0 {
+                tlf("{}s Later", &[&trim_num(d)])
+            } else {
+                tlf("{}s Earlier", &[&trim_num(-d)])
+            }
+        };
+        let vmax = self.ui.settings.volume_max.max(100.0);
+        match name {
+            "pause" => {
+                self.ui.show_osd_ex(tl(if p.pause { "Pause" } else { "Resume" }), ui::OsdDetail::Time(String::new()), ui::OsdBar::None);
+                return;
+            }
+            "sub-delay" | "audio-delay" => {
+                let (label, d) = if name == "sub-delay" { ("Subtitle Delay: {}", p.sub_delay) } else { ("Audio Delay: {}", p.audio_delay) };
+                self.ui.show_osd_ex(tlf(label, &[&delay(d)]), ui::OsdDetail::None, ui::OsdBar::Centered((d / 10.0).clamp(-1.0, 1.0) as f32));
+                return;
+            }
+            _ => {}
+        }
         let msg: Option<(String, Option<f32>)> = match name {
-            "volume" => Some((tlf("Volume: {}", &[&format!("{:.0}", p.volume)]), Some((p.volume / 100.0) as f32))),
+            "volume" => Some((tlf("Volume: {}", &[&format!("{:.0}", p.volume)]), Some((p.volume / vmax) as f32))),
             "mute" => Some((tl(if p.mute { "Mute" } else { "Unmute" }), None)),
-            "speed" => Some((tlf("Speed: {}x", &[&format!("{:.2}", p.speed)]), None)),
-            "pause" => Some((tl(if p.pause { "Pause" } else { "Resume" }), None)),
-            "sub-delay" => Some((tlf("Subtitle Delay: {}s", &[&format!("{:+.1}", p.sub_delay)]), None)),
-            "audio-delay" => Some((tlf("Audio Delay: {}s", &[&format!("{:+.1}", p.audio_delay)]), None)),
+            "speed" => Some((tlf("Speed: {}x", &[&trim_num(p.speed)]), None)),
             "sid" => Some((tlf("Subtitle: {}", &[&self.track_desc("sub", &p.sid)]), None)),
             "secondary-sid" => Some((tlf("Secondary Subtitle: {}", &[&self.track_desc("sub", &p.secondary_sid)]), None)),
             "aid" => Some((tlf("Audio: {}", &[&self.track_desc("audio", &p.aid)]), None)),
             "vid" => Some((tlf("Video: {}", &[&self.track_desc("video", &p.vid)]), None)),
             "sub-scale" => Some((tlf("Subtitle Scale: {}x", &[&format!("{:.2}", p.sub_scale)]), None)),
-            "sub-pos" => Some((tlf("Subtitle Position: {}", &[&format!("{:.0}", p.sub_pos)]), None)),
+            "sub-pos" => Some((tlf("Subtitle Position: {}", &[&format!("{:.0}", p.sub_pos)]), Some((p.sub_pos / 150.0) as f32))),
             "sub-visibility" => Some((tl(if p.sub_visible { "Subtitles Visible" } else { "Subtitles Hidden" }), None)),
-            "loop-file" => Some((tl(if p.loop_file { "Loop: File" } else { "Loop: Off" }), None)),
-            "loop-playlist" => Some((tl(if p.loop_playlist { "Loop: Playlist" } else { "Loop: Off" }), None)),
+            "loop-file" => Some((tl(if p.loop_file { "Enable file looping" } else { "Disable loop" }), None)),
+            "loop-playlist" => Some((tl(if p.loop_playlist { "Enable playlist looping" } else { "Disable loop" }), None)),
             "ab-loop-a" | "ab-loop-b" => Some((
                 match (p.ab_loop_a, p.ab_loop_b) {
                     (Some(a), Some(b)) => tlf("A-B Loop: {} – {}", &[&ui::fmt_time(a), &ui::fmt_time(b)]),
@@ -1212,6 +1468,7 @@ impl App {
         if ratio == "none" {
             self.mpv.set_string("video-crop", "");
             self.player.crop_label = "None".into();
+            self.ui.show_osd(i18n::tlf("Crop: {}", &[&i18n::tl("None")]), None);
             return;
         }
         let (Some(w), Some(h), Some(r)) = (
@@ -1225,6 +1482,7 @@ impl App {
         let (x, y) = (((w - cw) / 2.0).round(), ((h - ch) / 2.0).round());
         self.mpv.set_string("video-crop", &format!("{}x{}+{}+{}", cw as i64, ch as i64, x as i64, y as i64));
         self.player.crop_label = label.to_string();
+        self.ui.show_osd(i18n::tlf("Crop: {}", &[&label]), None);
     }
 
     fn apply_settings(&mut self) {
@@ -1252,7 +1510,7 @@ impl App {
             return;
         }
         let p = self.proxy.clone();
-        self.thumbs = Some(thumbs::start(path, move || {
+        self.thumbs = Some(thumbs::start(path, self.config_dir.join("thumbnails"), move || {
             let _ = p.send_event(UserEvent::ThumbsReady);
         }));
     }
@@ -1359,6 +1617,12 @@ fn dbg_log(msg: String) {
     }
 }
 
+/// 1.5 → "1.5", 2.0 → "2", 1.25 → "1.25" (IINA's number format).
+fn trim_num(v: f64) -> String {
+    let s = format!("{v:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 fn save_snapshot(gl: &glow::Context, size: PhysicalSize<u32>, path: &str) {
     save_snapshot_ex(gl, size, path, true)
 }
@@ -1375,6 +1639,18 @@ fn save_snapshot_ex(gl: &glow::Context, size: PhysicalSize<u32>, path: &str, fli
     if let Some(img) = image::RgbaImage::from_raw(w as u32, h as u32, flipped) {
         let _ = img.save(path);
     }
+}
+
+/// The OS double-click time (Windows), else 400 ms.
+fn double_click_interval() -> Duration {
+    #[cfg(windows)]
+    unsafe {
+        let ms = windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime();
+        if ms > 0 {
+            return Duration::from_millis(ms as u64);
+        }
+    }
+    Duration::from_millis(400)
 }
 
 fn open_folder(dir: &Path) {
@@ -1461,10 +1737,18 @@ impl ApplicationHandler<UserEvent> for App {
                 self.repaint_at = Some(next);
             }
         }
-        if let Some(t) = self.click_pause_at {
+        if let Some((t, action)) = self.click_pause_at.clone() {
             if t <= Instant::now() {
                 self.click_pause_at = None;
-                self.mpv.command(&["cycle", "pause"]);
+                self.mouse_action(&action);
+            } else if self.repaint_at.is_none_or(|r| t < r) {
+                self.repaint_at = Some(t);
+            }
+        }
+        if let Some(t) = self.save_settings_at {
+            if t <= Instant::now() {
+                self.save_settings_at = None;
+                self.ui.settings.save(&self.config_dir);
             } else if self.repaint_at.is_none_or(|r| t < r) {
                 self.repaint_at = Some(t);
             }
@@ -1541,7 +1825,8 @@ impl ApplicationHandler<UserEvent> for App {
                         Some(Binding::App(cmd)) => self.run_app_command(&cmd),
                         None => {}
                     }
-                    self.on_activity();
+                    // Keys show the OSD, not the controller (IINA).
+                    self.redraw();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1555,6 +1840,10 @@ impl ApplicationHandler<UserEvent> for App {
                         let _ = gfx.window.drag_window();
                     }
                 }
+                if moved && self.cursor_hidden {
+                    self.cursor_hidden = false;
+                    gfx.window.set_cursor_visible(true);
+                }
                 if moved {
                     self.on_activity();
                 }
@@ -1565,50 +1854,74 @@ impl ApplicationHandler<UserEvent> for App {
                     (MouseButton::Left, ElementState::Pressed) if !over_ui => {
                         self.ui.context_menu = None;
                         let now = Instant::now();
-                        if self.last_click.is_some_and(|t| now.duration_since(t) < Duration::from_millis(400)) {
+                        let interval = double_click_interval();
+                        let double = self.ui.settings.double_click.clone();
+                        if self.last_click.is_some_and(|t| now.duration_since(t) < interval) && double != "none" {
                             self.last_click = None;
                             self.press = None;
                             self.click_pause_at = None;
-                            if !self.player.idle && !self.ui.pip {
-                                self.mpv.command(&["cycle", "fullscreen"]);
-                            } else if self.ui.pip {
-                                self.toggle_pip();
-                            }
+                            self.mouse_action(&double);
                         } else {
                             self.last_click = Some(now);
                             self.press = Some((self.cursor, now));
-                            if self.ui.settings.click_to_pause && !self.player.idle {
-                                self.click_pause_at = Some(now + Duration::from_millis(350));
+                            let single = self.ui.settings.single_click.clone();
+                            if single != "none" && !self.player.idle {
+                                // Wait for a possible double click, unless there's none.
+                                let delay = if double == "none" { Duration::ZERO } else { interval };
+                                self.click_pause_at = Some((now + delay, single));
                             }
                         }
                     }
                     (MouseButton::Left, ElementState::Released) => self.press = None,
                     (MouseButton::Right, ElementState::Pressed) if !over_ui => {
-                        let ppp = egui_ctx.pixels_per_point() as f64;
-                        self.ui.context_menu = Some(egui::pos2((self.cursor.x / ppp) as f32, (self.cursor.y / ppp) as f32));
+                        let a = self.ui.settings.right_click.clone();
+                        self.mouse_action(&a);
                     }
-                    (MouseButton::Middle, ElementState::Pressed) if !over_ui => self.mpv.command(&["cycle", "pause"]),
+                    (MouseButton::Middle, ElementState::Pressed) if !over_ui => {
+                        let a = self.ui.settings.middle_click.clone();
+                        self.mouse_action(&a);
+                    }
                     (MouseButton::Back, ElementState::Pressed) => self.mpv.command(&["seek", "-10"]),
                     (MouseButton::Forward, ElementState::Pressed) => self.mpv.command(&["seek", "10"]),
                     _ => {}
                 }
                 self.on_activity();
             }
+            WindowEvent::CursorLeft { .. } => {
+                // Leaving the window hides the controller at once (IINA).
+                if self.ui.settings.osc_autohide && !self.player.pause {
+                    self.ui.last_activity = Instant::now() - Duration::from_secs(3600);
+                }
+                self.ui.pointer_over_ui = false;
+                self.redraw();
+            }
             WindowEvent::MouseWheel { delta, .. } => {
-                if egui_ctx.is_pointer_over_area() || self.player.idle {
+                if self.player.idle {
                     return;
                 }
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
                     MouseScrollDelta::PixelDelta(p) => (p.x / 40.0, p.y / 40.0),
                 };
-                // Like IINA: vertical scroll = volume, horizontal = seek.
-                if dy.abs() >= dx.abs() {
-                    self.mpv.command(&["add", "volume", &format!("{:.1}", dy * 2.0)]);
+                // Over the seek bar the wheel seeks, over the volume slider it
+                // changes the volume (IINA); elsewhere on the UI it does nothing.
+                let ppp = egui_ctx.pixels_per_point() as f64;
+                let pos = egui::pos2((self.cursor.x / ppp) as f32, (self.cursor.y / ppp) as f32);
+                let main = if dy.abs() >= dx.abs() { dy } else { dx };
+                if self.ui.seek_bar_rect.is_some_and(|r| r.expand2(egui::vec2(0.0, 8.0)).contains(pos)) && self.ui.osc_visible {
+                    self.scroll_action("seek", main);
+                } else if self.ui.volume_bar_rect.is_some_and(|r| r.expand2(egui::vec2(4.0, 8.0)).contains(pos)) && self.ui.osc_visible {
+                    self.scroll_action("volume", main);
+                } else if egui_ctx.is_pointer_over_area() {
+                    return;
+                } else if dy.abs() >= dx.abs() {
+                    let a = self.ui.settings.scroll_vertical.clone();
+                    self.scroll_action(&a, dy);
                 } else {
-                    self.mpv.command(&["seek", &format!("{:.1}", dx * 2.0)]);
+                    let a = self.ui.settings.scroll_horizontal.clone();
+                    self.scroll_action(&a, dx);
                 }
-                self.on_activity();
+                self.redraw();
             }
             _ => {}
         }
@@ -1616,6 +1929,11 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
         self.flush_history();
+        if self.save_settings_at.take().is_some() {
+            self.ui.settings.save(&self.config_dir);
+        }
+        self.ui.settings.prevent_sleep = false;
+        self.update_keep_awake();
         if self.ui.settings.single_instance {
             instance::release(&self.config_dir);
         }

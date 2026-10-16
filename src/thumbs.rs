@@ -50,21 +50,157 @@ impl Drop for Generator {
 
 /// Starts generating thumbnails for `path`; `wake` is called whenever new
 /// images are available. Dropping the returned generator cancels the work.
-pub fn start(path: String, wake: impl Fn() + Send + 'static) -> Generator {
+pub fn start(path: String, cache_dir: std::path::PathBuf, wake: impl Fn() + Send + 'static) -> Generator {
     let shared = Arc::new(Mutex::new(Thumbnails { path: path.clone(), ..Default::default() }));
     let cancel = Arc::new(AtomicBool::new(false));
     let (s, c) = (shared.clone(), cancel.clone());
     std::thread::Builder::new()
         .name("thumbnails".into())
         .spawn(move || {
-            if let Err(e) = run(&path, &s, &c, &wake) {
-                eprintln!("thumbnails: {e}");
+            let cache = cache::path_for(&cache_dir, &path);
+            if let Some(images) = cache.as_ref().and_then(|c| cache::load(&c.0, c.1)) {
+                let mut g = s.lock().unwrap();
+                g.images = images;
+                g.done = true;
+                drop(g);
+                wake();
+                return;
+            }
+            match run(&path, &s, &c, &wake) {
+                Ok(()) if !c.load(Ordering::Relaxed) => {
+                    if let Some((file, key)) = &cache {
+                        cache::save(file, *key, &s.lock().unwrap().images);
+                        cache::trim(&cache_dir, CACHE_LIMIT);
+                    }
+                }
+                Ok(()) => {}
+                Err(e) => eprintln!("thumbnails: {e}"),
             }
             s.lock().unwrap().done = true;
             wake();
         })
         .expect("spawn thumbnail thread");
     Generator { shared, cancel }
+}
+
+/// Disk cache size limit (IINA: 500 MiB).
+const CACHE_LIMIT: u64 = 500 << 20;
+
+/// On-disk thumbnail cache (like IINA's): one file per video, JPEG images,
+/// keyed by the path and validated against the file's size and mtime.
+mod cache {
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+
+    const MAGIC: &[u8; 8] = b"IRSTHMB1";
+
+    /// FNV-1a: stable across runs (unlike std's hasher).
+    fn fnv(s: &str) -> u64 {
+        s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
+    }
+
+    /// (cache file, validity key from size + mtime).
+    pub fn path_for(dir: &Path, video: &str) -> Option<(PathBuf, u64)> {
+        let meta = std::fs::metadata(video).ok()?;
+        let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        let key = meta.len() ^ mtime.rotate_left(32);
+        std::fs::create_dir_all(dir).ok()?;
+        Some((dir.join(format!("{:016x}.thumbs", fnv(video))), key))
+    }
+
+    pub fn load(file: &Path, key: u64) -> Option<Vec<(f64, egui::ColorImage)>> {
+        let mut data = Vec::new();
+        std::fs::File::open(file).ok()?.read_to_end(&mut data).ok()?;
+        if data.len() < 20 || &data[..8] != MAGIC || u64::from_le_bytes(data[8..16].try_into().ok()?) != key {
+            return None;
+        }
+        let count = u32::from_le_bytes(data[16..20].try_into().ok()?) as usize;
+        let mut pos = 20;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let t = f64::from_le_bytes(data.get(pos..pos + 8)?.try_into().ok()?);
+            let len = u32::from_le_bytes(data.get(pos + 8..pos + 12)?.try_into().ok()?) as usize;
+            let jpeg = data.get(pos + 12..pos + 12 + len)?;
+            pos += 12 + len;
+            let img = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).ok()?.to_rgba8();
+            let size = [img.width() as usize, img.height() as usize];
+            out.push((t, egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw())));
+        }
+        // Mark as recently used for the size limit.
+        let _ = std::fs::File::options().append(true).open(file).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        (!out.is_empty()).then_some(out)
+    }
+
+    pub fn save(file: &Path, key: u64, images: &[(f64, egui::ColorImage)]) {
+        if images.len() < 10 {
+            return;
+        }
+        let mut data = Vec::new();
+        data.extend_from_slice(MAGIC);
+        data.extend_from_slice(&key.to_le_bytes());
+        data.extend_from_slice(&(images.len() as u32).to_le_bytes());
+        for (t, img) in images {
+            let rgb: Vec<u8> = img.pixels.iter().flat_map(|c| [c.r(), c.g(), c.b()]).collect();
+            let mut jpeg = Vec::new();
+            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 75);
+            if image::ImageEncoder::write_image(enc, &rgb, img.size[0] as u32, img.size[1] as u32, image::ExtendedColorType::Rgb8).is_err() {
+                return;
+            }
+            data.extend_from_slice(&t.to_le_bytes());
+            data.extend_from_slice(&(jpeg.len() as u32).to_le_bytes());
+            data.extend_from_slice(&jpeg);
+        }
+        let tmp = file.with_extension("tmp");
+        if std::fs::File::create(&tmp).and_then(|mut f| f.write_all(&data)).is_ok() {
+            let _ = std::fs::rename(&tmp, file);
+        }
+    }
+
+    /// Over the limit: delete the least recently used half (IINA's policy).
+    pub fn trim(dir: &Path, limit: u64) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let m = e.metadata().ok()?;
+                Some((m.modified().ok()?, m.len(), e.path()))
+            })
+            .collect();
+        let total: u64 = files.iter().map(|f| f.1).sum();
+        if total <= limit {
+            return;
+        }
+        files.sort_by_key(|f| f.0);
+        let mut freed = 0;
+        for (_, len, path) in files {
+            if freed >= total / 2 {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                freed += len;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn roundtrip() {
+            let dir = std::env::temp_dir().join(format!("iina-rs-thumbcache-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let file = dir.join("x.thumbs");
+            let imgs: Vec<(f64, egui::ColorImage)> =
+                (0..12).map(|i| (i as f64, egui::ColorImage::new([32, 18], vec![egui::Color32::from_rgb(200, 30, 30); 32 * 18]))).collect();
+            super::save(&file, 42, &imgs);
+            let back = super::load(&file, 42).expect("cache loads");
+            assert_eq!(back.len(), 12);
+            assert_eq!(back[3].1.size, [32, 18]);
+            let px = back[0].1.pixels[0];
+            assert!((px.r() as i32 - 200).abs() < 12 && px.g() < 50, "{px:?}");
+            assert!(super::load(&file, 43).is_none(), "stale key rejected");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 fn wait_for(mpv: &Mpv, cancel: &AtomicBool, timeout: Duration, want: impl Fn(&Event) -> bool) -> Result<(), String> {

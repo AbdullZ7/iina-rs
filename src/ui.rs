@@ -15,6 +15,33 @@ use egui::{
 };
 use std::time::{Duration, Instant};
 
+/// Second line of an OSD message.
+#[derive(Clone)]
+pub enum OsdDetail {
+    None,
+    /// Prefix followed by the live "position / duration".
+    Time(String),
+}
+
+#[derive(Clone)]
+pub enum OsdBar {
+    None,
+    /// A level 0..1 (fills from the reading start).
+    Level(f32),
+    /// −1..1 around the centre (delays).
+    Centered(f32),
+    /// The live playback position (never mirrored); the main text is the time.
+    Time,
+}
+
+#[derive(Clone)]
+pub struct Osd {
+    pub text: String,
+    pub detail: OsdDetail,
+    pub bar: OsdBar,
+    pub at: Instant,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Playlist,
@@ -60,9 +87,10 @@ pub struct UiState {
     pub font_filter: String,
     /// Preferences tab: 0 = general, 1 = subtitles.
     pub prefs_tab: u8,
-    /// IINA-style on-screen message: (logical text, optional progress 0..1,
-    /// shown at, progress is a time position — never mirrored).
-    pub osd: Option<(String, Option<f32>, Instant, bool)>,
+    /// IINA-style on-screen message.
+    pub osd: Option<Osd>,
+    /// Where the controller's volume slider was drawn (wheel over it = volume).
+    pub volume_bar_rect: Option<Rect>,
     thumb_path: String,
     thumb_tex: HashMap<usize, egui::TextureHandle>,
 }
@@ -95,6 +123,7 @@ impl UiState {
             subs: Default::default(),
             assoc_status: String::new(),
             osd: None,
+            volume_bar_rect: None,
             output_mode: String::new(),
             fonts: Default::default(),
             font_filter: String::new(),
@@ -106,12 +135,19 @@ impl UiState {
 
     /// Shows an on-screen message (replaces mpv's own OSD, which is disabled).
     pub fn show_osd(&mut self, text: String, progress: Option<f32>) {
-        self.osd = Some((text, progress, Instant::now(), false));
+        let bar = progress.map_or(OsdBar::None, OsdBar::Level);
+        self.show_osd_ex(text, OsdDetail::None, bar);
     }
 
-    /// OSD for a playback position (its bar keeps left-to-right in Arabic).
-    pub fn show_time_osd(&mut self, text: String, progress: Option<f32>) {
-        self.osd = Some((text, progress, Instant::now(), true));
+    pub fn show_osd_ex(&mut self, text: String, detail: OsdDetail, bar: OsdBar) {
+        if self.settings.osd_enabled {
+            self.osd = Some(Osd { text, detail, bar, at: Instant::now() });
+        }
+    }
+
+    /// Live "position / duration" with a time bar (seeks, show-progress).
+    pub fn show_time_osd(&mut self) {
+        self.show_osd_ex(String::new(), OsdDetail::None, OsdBar::Time);
     }
 
     /// Debug aid: opens the context menu at the window center.
@@ -337,7 +373,13 @@ fn rtl_body<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 /// content needs an explicit width or the window grows off-screen.
 fn rtl_window<R>(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     if is_rtl() {
-        let w = width.min(ui.ctx().screen_rect().width() - 60.0).max(200.0);
+        let mut w = width.min(ui.ctx().screen_rect().width() - 60.0).max(200.0);
+        // Inside a scrolling window the scroll bar takes part of the width:
+        // keep right-aligned content within the visible (clipped) area.
+        let visible = ui.clip_rect().max.x - ui.cursor().min.x;
+        if visible.is_finite() && visible > 200.0 {
+            w = w.min(visible - 8.0);
+        }
         // Build the child from an explicit rect: inside scrolling / auto-sized
         // windows the parent's max width can be infinite, and right-aligning
         // against it yields NaN positions.
@@ -606,7 +648,7 @@ fn seek_preview(ctx: &egui::Context, st: &mut UiState, pl: &Player, thumbs: Opti
     let (img_size, w) = match &tex {
         Some(t) => {
             let [tw, th] = t.size();
-            let width = (screen.width() / 5.0).clamp(140.0, 260.0);
+            let width = if st.settings.thumbnail_width > 0.0 { st.settings.thumbnail_width } else { (screen.width() / 5.0).clamp(140.0, 260.0) };
             let s = vec2(width, width * th as f32 / tw.max(1) as f32);
             (Some(s), s.x.max(galley.size().x) + pad * 2.0)
         }
@@ -639,7 +681,7 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
         welcome(ctx, ui_state, &mut cmds);
     } else {
         let recently_active = now.duration_since(ui_state.last_activity) < hide_after;
-        let want_osc = pl.pause
+        let want_osc = !ui_state.settings.osc_autohide
             || recently_active
             || ui_state.pointer_over_ui
             || ui_state.music_mode
@@ -661,12 +703,12 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
     if let Some(tab) = ui_state.sidebar {
         sidebar(ctx, ui_state, tab, pl, mpv, &mut cmds);
     }
-    osd(ctx, ui_state);
+    osd(ctx, ui_state, pl);
     context_menu(ctx, ui_state, pl, &mut cmds);
     url_dialog(ctx, ui_state, mpv);
     jump_dialog(ctx, ui_state, pl, mpv);
     inspector(ctx, ui_state, pl, mpv);
-    preferences(ctx, ui_state, &mut cmds);
+    preferences(ctx, ui_state, pl, &mut cmds);
     history_window(ctx, ui_state, hist, &mut cmds);
     subtitle_search(ctx, ui_state, &mut cmds);
     about(ctx, ui_state);
@@ -683,18 +725,20 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
 }
 
 /// IINA-style OSD: a rounded HUD message in the top corner (top-left, or
-/// top-right in Arabic) with an optional progress bar, fading out.
-fn osd(ctx: &egui::Context, st: &mut UiState) {
-    const SHOW: f32 = 1.4;
-    const FADE: f32 = 0.25;
-    let Some((text, progress, at, time)) = st.osd.clone() else { return };
-    let age = at.elapsed().as_secs_f32();
-    if age > SHOW + FADE {
+/// top-right in Arabic) with an optional second line and bar, fading out.
+fn osd(ctx: &egui::Context, st: &mut UiState, pl: &Player) {
+    const FADE: f32 = 0.5;
+    let show = st.settings.osd_timeout.max(0.3);
+    let Some(m) = st.osd.clone() else { return };
+    let age = m.at.elapsed().as_secs_f32();
+    if age > show + FADE {
         st.osd = None;
         return;
     }
-    let alpha = if age > SHOW { 1.0 - (age - SHOW) / FADE } else { 1.0 };
+    let alpha = if age > show { 1.0 - (age - show) / FADE } else { 1.0 };
     ctx.request_repaint();
+    let size = st.settings.osd_text_size.clamp(10.0, 60.0);
+    let time_text = format!("{} / {}", fmt_time(pl.time_pos), fmt_time(pl.duration));
     let top = if st.fullscreen || st.music_mode { 58.0 } else { 18.0 };
     let (align, offset) = if is_rtl() { (Align2::RIGHT_TOP, vec2(-20.0, top)) } else { (Align2::LEFT_TOP, vec2(20.0, top)) };
     egui::Area::new(egui::Id::new("osd"))
@@ -708,18 +752,43 @@ fn osd(ctx: &egui::Context, st: &mut UiState) {
                 .corner_radius(10)
                 .inner_margin(egui::Margin::symmetric(16, 10))
                 .show(ui, |ui| {
-                    ui.label(RichText::new(v(&text)).size(22.0).color(FG));
-                    if let Some(p) = progress {
+                    let main = if matches!(m.bar, OsdBar::Time) { time_text.clone() } else { m.text.clone() };
+                    ui.label(RichText::new(v(&main)).size(size).color(FG));
+                    if let OsdDetail::Time(prefix) = &m.detail {
+                        let line = if prefix.is_empty() { time_text.clone() } else { format!("{prefix}  {time_text}") };
+                        ui.label(RichText::new(v(&line)).size(size * 0.6).color(FG_DIM));
+                    }
+                    let bar = |ui: &mut Ui| {
                         let (r, _) = ui.allocate_exact_size(vec2(240.0, 6.0), Sense::hover());
                         ui.painter().rect_filled(r, 3.0, TRACK_BG);
-                        let w = r.width() * p.clamp(0.0, 1.0);
-                        // Levels (volume…) fill from the reading start; time doesn't mirror.
-                        let fill = if is_rtl() && !time {
-                            Rect::from_min_max(pos2(r.right() - w, r.top()), r.max)
-                        } else {
-                            Rect::from_min_size(r.min, vec2(w, r.height()))
-                        };
-                        ui.painter().rect_filled(fill, 3.0, FG);
+                        r
+                    };
+                    match m.bar {
+                        OsdBar::None => {}
+                        OsdBar::Level(p) => {
+                            let r = bar(ui);
+                            let w = r.width() * p.clamp(0.0, 1.0);
+                            // Levels fill from the reading start (right in Arabic).
+                            let fill = if is_rtl() {
+                                Rect::from_min_max(pos2(r.right() - w, r.top()), r.max)
+                            } else {
+                                Rect::from_min_size(r.min, vec2(w, r.height()))
+                            };
+                            ui.painter().rect_filled(fill, 3.0, FG);
+                        }
+                        OsdBar::Centered(p) => {
+                            let r = bar(ui);
+                            let p = if is_rtl() { -p } else { p };
+                            let c = r.center().x;
+                            let x = c + r.width() / 2.0 * p.clamp(-1.0, 1.0);
+                            ui.painter().rect_filled(Rect::from_min_max(pos2(c.min(x), r.top()), pos2(c.max(x), r.bottom())), 3.0, FG);
+                            ui.painter().line_segment([pos2(c, r.top() - 2.0), pos2(c, r.bottom() + 2.0)], Stroke::new(1.5_f32, FG_DIM));
+                        }
+                        OsdBar::Time => {
+                            let r = bar(ui);
+                            let p = if pl.duration > 0.0 { (pl.time_pos / pl.duration).clamp(0.0, 1.0) as f32 } else { 0.0 };
+                            ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width() * p, r.height())), 3.0, FG);
+                        }
                     }
                 });
         });
@@ -751,6 +820,9 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
     let width = avail.min(560.0);
     let compact = st.pip || screen.height() < 160.0;
     let mut hover: Option<BarHover> = None;
+    // Filled inside the controller's closures, applied afterwards.
+    let mut ctl_cmds: Vec<String> = Vec::new();
+    let vol_rect: std::cell::Cell<Option<Rect>> = std::cell::Cell::new(None);
 
     let area = egui::Area::new(egui::Id::new("osc"))
         .anchor(Align2::CENTER_BOTTOM, vec2(if is_rtl() { sidebar_w / 2.0 } else { -sidebar_w / 2.0 }, if compact { -6.0 } else { -22.0 }))
@@ -769,13 +841,22 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
                     // controls do in RTL interfaces (Material bidi guidelines).
                     let rtl = is_rtl();
                     let side_w = (width - 28.0 - 3.0 * 34.0) / 2.0 - 8.0;
+                    let st_vmax = st.settings.volume_max.max(100.0);
+                    let arrow = st.settings.arrow_action.clone();
+                    let (tip_back, tip_fwd) = match arrow.as_str() {
+                        "speed" => ("Slower", "Faster"),
+                        "seek" => ("Rewind", "Forward"),
+                        _ => ("Previous", "Next"),
+                    };
                     let volume = |ui: &mut Ui| {
                         let icon: IconFn = if pl.mute || pl.volume <= 0.0 { icon_muted } else { icon_volume };
                         if icon_button(ui, 26.0, &t("Mute"), icon).clicked() {
                             mpv.command(&["cycle", "mute"]);
                         }
                         if !compact {
-                            let (r, v, _) = bar_slider(ui, (side_w - 40.0).clamp(30.0, 90.0), pl.volume, 100.0, &[], &[], rtl);
+                            let vmax = st_vmax;
+                            let (r, v, _) = bar_slider(ui, (side_w - 40.0).clamp(30.0, 90.0), pl.volume, vmax, &[], &[], rtl);
+                            vol_rect.set(Some(r.rect));
                             if let Some((v, _)) = v {
                                 mpv.set_double("volume", v.round());
                             }
@@ -810,23 +891,15 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
                         ui.allocate_ui_with_layout(vec2(side_w, 30.0), Layout::left_to_right(Align::Center), |ui| {
                             if rtl { toggles(ui) } else { volume(ui) }
                         });
-                        if icon_button(ui, 34.0, &t("Previous"), icon_prev).clicked() {
-                            if pl.playlist_count > 1 {
-                                mpv.command(&["playlist-prev"]);
-                            } else {
-                                mpv.command(&["seek", "-10"]);
-                            }
+                        if icon_button(ui, 34.0, &t(tip_back), icon_prev).clicked() {
+                            ctl_cmds.push("arrow-left".into());
                         }
                         let (icon, tip): (IconFn, &str) = if pl.pause { (icon_play, "Play") } else { (icon_pause, "Pause") };
                         if icon_button(ui, 34.0, &t(tip), icon).clicked() {
-                            mpv.command(&["cycle", "pause"]);
+                            ctl_cmds.push("toggle-pause".into());
                         }
-                        if icon_button(ui, 34.0, &t("Next"), icon_next).clicked() {
-                            if pl.playlist_count > 1 {
-                                mpv.command(&["playlist-next"]);
-                            } else {
-                                mpv.command(&["seek", "10"]);
-                            }
+                        if icon_button(ui, 34.0, &t(tip_fwd), icon_next).clicked() {
+                            ctl_cmds.push("arrow-right".into());
                         }
                         // Ending side, from the right edge.
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -877,6 +950,8 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
                     });
                 });
         });
+    cmds.extend(ctl_cmds);
+    st.volume_bar_rect = vol_rect.get();
     if let Some(mut h) = hover {
         // Float the preview above the whole controller, like IINA.
         h.anchor.y = area.response.rect.top();
@@ -1203,7 +1278,7 @@ fn video_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
     }
     ui.label(RichText::new(tf("Decoder: {}", &[&if pl.hwdec_current.is_empty() { tl("software") } else { pl.hwdec_current.clone() }])).color(FG_DIM).size(11.0));
     if ui.button(t("Take screenshot")).clicked() {
-        mpv.command(&["screenshot"]);
+        cmds.push("screenshot".into());
     }
 }
 
@@ -1267,10 +1342,10 @@ fn context_menu(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut V
                 item(ui, "Open URL…", "Ctrl+U", "open-url");
                 ui.separator();
                 if !pl.idle {
-                    item(ui, if pl.pause { "Play" } else { "Pause" }, "Space", "mpv cycle pause");
+                    item(ui, if pl.pause { "Play" } else { "Pause" }, "Space", "toggle-pause");
                     item(ui, "Jump to…", "Ctrl+J", "jump-to");
                     item(ui, "Find Online Subtitles…", "Ctrl+Shift+D", "find-online-subs");
-                    item(ui, "Take Screenshot", "Ctrl+S", "mpv screenshot");
+                    item(ui, "Take Screenshot", "Ctrl+S", "screenshot");
                     item(ui, "Stop", "Ctrl+W", "close-file");
                     ui.separator();
                 }
@@ -1286,6 +1361,10 @@ fn context_menu(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut V
                 item(ui, if st.music_mode { "✓ Music Mode" } else { "Music Mode" }, "Ctrl+Alt+M", "toggle-music-mode");
                 if !pl.path.is_empty() && !pl.path.contains("://") {
                     item(ui, "Show in Folder", "Ctrl+Shift+R", "show-current-file-in-finder");
+                    item(ui, "Move to Recycle Bin…", "", "delete-current-file");
+                }
+                if pl.playlist_count > 1 {
+                    item(ui, "Save Playlist…", "", "save-playlist");
                 }
                 ui.separator();
                 item(ui, "Inspector", "Ctrl+I", "inspector");
@@ -1466,7 +1545,36 @@ fn inspector(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv) {
     st.show_inspector = open;
 }
 
-fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
+/// A labelled drop-down choosing one of `options` (value, label key).
+fn choice(ui: &mut Ui, id: &str, label: &str, value: &mut String, options: &[(&str, &str)]) {
+    row(ui, |ui| {
+        ui.label(t(label));
+        let current = options.iter().find(|(k, _)| k == value).map(|(_, l)| t(l)).unwrap_or_else(|| value.clone());
+        egui::ComboBox::from_id_salt(id).selected_text(current).width(220.0).show_ui(ui, |ui| {
+            for (k, l) in options {
+                if ui.selectable_label(value == k, t(l)).clicked() {
+                    *value = k.to_string();
+                }
+            }
+        });
+    });
+}
+
+fn section(ui: &mut Ui, title: &str) {
+    ui.add_space(6.0);
+    ui.label(RichText::new(t(title)).strong());
+}
+
+fn text_field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
+    row(ui, |ui| {
+        ui.label(t(label));
+        ui.add(egui::TextEdit::singleline(value).desired_width(260.0).hint_text(hint));
+    });
+}
+
+const PREF_TABS: [&str; 6] = ["General", "Video & Audio", "Subtitles", "Network", "Controls", "Advanced"];
+
+fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Vec<String>) {
     if !st.show_prefs {
         return;
     }
@@ -1484,114 +1592,260 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
         .collapsible(false)
         .resizable(false)
         .vscroll(true)
+        .min_width(600.0)
+        .max_width(600.0)
         .max_height((ctx.screen_rect().height() - 90.0).max(200.0))
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-        .show(ctx, |ui| rtl_window(ui, 560.0, |ui| {
+        .show(ctx, |ui| rtl_window(ui, 600.0, |ui| {
             if rtl_header(ui, &t("Preferences")) {
                 header_close = true;
             }
             let s = &mut st.settings;
-            row(ui, |ui| {
-                for (i, name) in [(0u8, "General"), (1u8, "Subtitles")] {
-                    if ui.selectable_label(prefs_tab == i, RichText::new(t(name)).size(15.0)).clicked() {
-                        prefs_tab = i;
+            row_wrapped(ui, |ui| {
+                for (i, name) in PREF_TABS.iter().enumerate() {
+                    if ui.selectable_label(prefs_tab as usize == i, RichText::new(t(name)).size(14.0)).clicked() {
+                        prefs_tab = i as u8;
                     }
                 }
             });
             ui.separator();
-            if prefs_tab == 1 {
-                subtitle_prefs(ui, &mut s.subs, &st_fonts, &mut st_font_filter, cmds);
-                return;
-            }
-            row(ui, |ui| {
-                ui.label(t("Language"));
-                for (code, name) in [("auto", t("Automatic")), ("en", "English".to_string()), ("ar", v("العربية"))] {
-                    if ui.selectable_label(s.language == code, name).clicked() {
-                        s.language = code.to_string();
+            match prefs_tab {
+                // ------------------------------------------------------ General
+                0 => {
+                    row(ui, |ui| {
+                        ui.label(t("Language"));
+                        for (code, name) in [("auto", t("Automatic")), ("en", "English".to_string()), ("ar", v("العربية"))] {
+                            if ui.selectable_label(s.language == code, name).clicked() {
+                                s.language = code.to_string();
+                            }
+                        }
+                    });
+                    section(ui, "Playback");
+                    check(ui, &mut s.resume_playback, t("Resume last playback position"));
+                    check(ui, &mut s.auto_add_folder, t("Add files in the same folder to the playlist"));
+                    check(ui, &mut s.pause_on_open, t("Pause when a file opens"));
+                    check(ui, &mut s.fullscreen_on_open, t("Enter fullscreen when a file opens"));
+                    check(ui, &mut s.prevent_sleep, t("Keep the display awake during playback"));
+                    section(ui, "Window");
+                    check(ui, &mut s.resize_to_video, t("Resize window to video size when opening a file"));
+                    if s.resize_to_video {
+                        row(ui, |ui| {
+                            ui.label(t("Window scale"));
+                            for k in [0.5, 1.0, 1.5, 2.0] {
+                                if ui.selectable_label((s.resize_scale - k).abs() < 1e-6, format!("{k}×")).clicked() {
+                                    s.resize_scale = k;
+                                }
+                            }
+                        });
+                    }
+                    check(ui, &mut s.single_instance, t("Open files in the running window (single instance)"));
+                    section(ui, "On-screen controller");
+                    check(ui, &mut s.osc_autohide, t("Hide the controller automatically"));
+                    if s.osc_autohide {
+                        row(ui, |ui| {
+                            ui.label(t("Hide controller after"));
+                            slider(ui, &mut s.osc_hide_secs, 1.0..=10.0, " s", 1);
+                        });
+                    }
+                    check(ui, &mut s.show_remaining, t("Show remaining time"));
+                    check(ui, &mut s.thumbnails, t("Show thumbnail preview on the seek bar"));
+                    if s.thumbnails {
+                        row(ui, |ui| {
+                            ui.label(t("Thumbnail width"));
+                            ui.add(egui::DragValue::new(&mut s.thumbnail_width).range(0.0..=480.0).speed(2.0).max_decimals(0));
+                            ui.label(RichText::new(t("pt (0 = automatic)")).size(11.0).color(FG_DIM));
+                        });
+                    }
+                    section(ui, "On-screen messages");
+                    check(ui, &mut s.osd_enabled, t("Show on-screen messages"));
+                    if s.osd_enabled {
+                        row(ui, |ui| {
+                            ui.label(t("Duration"));
+                            slider(ui, &mut s.osd_timeout, 0.5..=5.0, " s", 1);
+                        });
+                        row(ui, |ui| {
+                            ui.label(t("Text size"));
+                            slider(ui, &mut s.osd_text_size, 12.0..=40.0, "", 0);
+                        });
+                    }
+                    section(ui, "Screenshots");
+                    row(ui, |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut s.screenshot_dir).desired_width(300.0));
+                        if ui.button(t("Choose…")).clicked() {
+                            if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                                s.screenshot_dir = d.to_string_lossy().into_owned();
+                            }
+                        }
+                    });
+                    choice(ui, "shot-fmt", "Format", &mut s.screenshot_format, &[("png", "PNG"), ("jpg", "JPEG"), ("webp", "WebP"), ("jxl", "JPEG XL"), ("avif", "AVIF")]);
+                    text_field(ui, "File name template", &mut s.screenshot_template, "%F-%n");
+                    check(ui, &mut s.screenshot_with_subs, t("Include subtitles"));
+                    section(ui, "System");
+                    row_wrapped(ui, |ui| {
+                        if cfg!(windows) {
+                            if ui.button(t("Add to “Open with”")).on_hover_text(t("Registers IINA-RS for video/audio files for your user account")).clicked() {
+                                cmds.push("assoc-register".into());
+                            }
+                            if ui.button(t("Remove")).clicked() {
+                                cmds.push("assoc-unregister".into());
+                            }
+                            if ui.button(t("Default apps…")).clicked() {
+                                cmds.push("open-default-apps".into());
+                            }
+                        }
+                        if ui.button(t("Open settings folder")).clicked() {
+                            cmds.push("open-config-dir".into());
+                        }
+                    });
+                    if !assoc_status.is_empty() {
+                        ui.label(RichText::new(v(&assoc_status)).size(11.0).color(FG_DIM));
                     }
                 }
-            });
-            ui.add_space(4.0);
-            ui.label(RichText::new(t("General")).strong());
-            check(ui, &mut s.resume_playback, t("Resume last playback position"));
-            check(ui, &mut s.auto_add_folder, t("Add files in the same folder to the playlist"));
-            check(ui, &mut s.resize_to_video, t("Resize window to video size when opening a file"));
-            check(ui, &mut s.single_instance, t("Open files in the running window (single instance)"));
-            ui.add_space(6.0);
-            ui.label(RichText::new(t("UI")).strong());
-            check(ui, &mut s.thumbnails, t("Show thumbnail preview on the seek bar"));
-            check(ui, &mut s.show_remaining, t("Show remaining time"));
-            check(ui, &mut s.click_to_pause, t("Single click on video toggles pause"));
-            row(ui, |ui| {
-                ui.label(t("Hide controller after"));
-                slider(ui, &mut s.osc_hide_secs, 1.0..=10.0, " s", 1);
-            });
-            ui.add_space(6.0);
-            ui.label(RichText::new(t("Video / Audio")).strong());
-            check(ui, &mut s.hardware_decoding, t("Enable hardware decoding"));
-            if !cfg!(target_os = "macos") {
-                check(ui, &mut s.hdr_output, t("HDR output on HDR displays (restart required)"));
-                if s.hdr_output {
+                // ------------------------------------------------ Video & Audio
+                1 => {
+                    section(ui, "Video");
+                    check(ui, &mut s.hardware_decoding, t("Enable hardware decoding"));
+                    if s.hardware_decoding {
+                        choice(ui, "hwdec", "Hardware decoder", &mut s.hwdec_mode, &[
+                            ("auto-safe", "Automatic (safe)"),
+                            ("auto", "Automatic (all)"),
+                            ("auto-copy", "Automatic, copy back"),
+                        ]);
+                    }
+                    if !cfg!(target_os = "macos") {
+                        check(ui, &mut s.hdr_output, t("HDR output on HDR displays (restart required)"));
+                        if s.hdr_output {
+                            row(ui, |ui| {
+                                ui.label(t("HDR peak brightness"));
+                                ui.add(egui::DragValue::new(&mut s.hdr_peak_nits).range(0.0..=10000.0).speed(10.0).max_decimals(0));
+                                ui.label(RichText::new(t("nits (0 = automatic)")).size(11.0).color(FG_DIM));
+                            });
+                        }
+                    }
+                    section(ui, "Audio");
+                    text_field(ui, "Preferred audio languages", &mut s.audio_languages, "ar,ara,en");
                     row(ui, |ui| {
-                        ui.label(t("HDR peak brightness"));
-                        ui.add(egui::DragValue::new(&mut s.hdr_peak_nits).range(0.0..=10000.0).speed(10.0).max_decimals(0));
-                        ui.label(RichText::new(t("nits (0 = automatic)")).size(11.0).color(FG_DIM));
+                        ui.label(t("Output device"));
+                        let current = if s.audio_device == "auto" || s.audio_device.is_empty() {
+                            t("Automatic")
+                        } else {
+                            pl.audio_devices.iter().find(|d| d.0 == s.audio_device).map(|d| v(&d.1)).unwrap_or_else(|| s.audio_device.clone())
+                        };
+                        egui::ComboBox::from_id_salt("audio-dev").selected_text(current).width(300.0).show_ui(ui, |ui| {
+                            if ui.selectable_label(s.audio_device == "auto", t("Automatic")).clicked() {
+                                s.audio_device = "auto".into();
+                            }
+                            for (name, desc) in pl.audio_devices.iter().filter(|d| d.0 != "auto") {
+                                if ui.selectable_label(&s.audio_device == name, v(if desc.is_empty() { name } else { desc })).clicked() {
+                                    s.audio_device = name.clone();
+                                }
+                            }
+                        });
+                    });
+                    check(ui, &mut s.remember_volume, t("Remember the last volume"));
+                    row(ui, |ui| {
+                        ui.label(t("Maximum volume"));
+                        slider(ui, &mut s.volume_max, 100.0..=200.0, "%", 0);
+                    });
+                    ui.label(RichText::new(t("Pass through to an external decoder (S/PDIF / HDMI receiver):")).color(FG_DIM));
+                    row_wrapped(ui, |ui| {
+                        for (codec, label) in [("ac3", "AC3"), ("eac3", "E-AC3"), ("dts", "DTS"), ("dts-hd", "DTS-HD"), ("truehd", "TrueHD")] {
+                            let mut on = s.spdif.iter().any(|c| c == codec);
+                            if check(ui, &mut on, label).changed() {
+                                s.spdif.retain(|c| c != codec);
+                                if on {
+                                    s.spdif.push(codec.to_string());
+                                }
+                            }
+                        }
+                    });
+                    choice(ui, "rg", "ReplayGain", &mut s.replaygain, &[("no", "Off"), ("track", "Track"), ("album", "Album")]);
+                    choice(ui, "gapless", "Gapless audio", &mut s.gapless, &[("weak", "Automatic"), ("yes", "On"), ("no", "Off")]);
+                }
+                // ---------------------------------------------------- Subtitles
+                2 => {
+                    subtitle_prefs(ui, &mut s.subs, &st_fonts, &mut st_font_filter, cmds);
+                    section(ui, "Online subtitles");
+                    grid(ui, "sub-keys", 3, false, vec2(8.0, 4.0), |ui| {
+                        ui.label(t("SubDL key"));
+                        ui.add(egui::TextEdit::singleline(&mut s.subdl_key).password(true).desired_width(220.0));
+                        ui.hyperlink_to(t("Get a key"), "https://subdl.com/panel/api");
+                        ui.end_row();
+                        ui.label(t("OpenSubtitles key"));
+                        ui.add(egui::TextEdit::singleline(&mut s.opensubtitles_key).password(true).desired_width(220.0));
+                        ui.hyperlink_to(t("Get a key"), "https://www.opensubtitles.com/consumers");
+                        ui.end_row();
+                    });
+                    row(ui, |ui| {
+                        ui.label(t("Languages"));
+                        ui.add(egui::TextEdit::singleline(&mut s.sub_languages).desired_width(120.0).hint_text(t("ar,en")));
                     });
                 }
+                // ------------------------------------------------------ Network
+                3 => {
+                    section(ui, "Cache");
+                    check(ui, &mut s.cache, t("Enable cache"));
+                    if s.cache {
+                        row(ui, |ui| {
+                            ui.label(t("Cache size"));
+                            ui.add(egui::DragValue::new(&mut s.cache_mib).range(16.0..=4096.0).speed(4.0).suffix(" MiB"));
+                        });
+                        row(ui, |ui| {
+                            ui.label(t("Read ahead"));
+                            ui.add(egui::DragValue::new(&mut s.cache_secs).range(10.0..=36000.0).speed(10.0).suffix(" s"));
+                        });
+                    }
+                    section(ui, "Connection");
+                    text_field(ui, "HTTP proxy", &mut s.http_proxy, "http://host:port");
+                    text_field(ui, "User agent", &mut s.user_agent, "");
+                    section(ui, "yt-dlp");
+                    check(ui, &mut s.ytdl, t("Play YouTube and other sites with yt-dlp"));
+                    if s.ytdl {
+                        text_field(ui, "yt-dlp path", &mut s.ytdl_path, "yt-dlp");
+                        text_field(ui, "yt-dlp options", &mut s.ytdl_raw_options, "format=bestvideo[height<=1080]+bestaudio");
+                    }
+                }
+                // ----------------------------------------------------- Controls
+                4 => {
+                    section(ui, "Mouse");
+                    let clicks: &[(&str, &str)] = &[
+                        ("none", "None"),
+                        ("pause", "Play / pause"),
+                        ("fullscreen", "Fullscreen"),
+                        ("hide-osc", "Hide controller"),
+                        ("pip", "Picture-in-Picture"),
+                        ("menu", "Context menu"),
+                    ];
+                    choice(ui, "click1", "Single click", &mut s.single_click, clicks);
+                    choice(ui, "click2", "Double click", &mut s.double_click, clicks);
+                    choice(ui, "clickr", "Right click", &mut s.right_click, clicks);
+                    choice(ui, "clickm", "Middle click", &mut s.middle_click, clicks);
+                    let scroll: &[(&str, &str)] = &[("volume", "Volume"), ("seek", "Seek"), ("speed", "Speed"), ("none", "None")];
+                    choice(ui, "scrollv", "Vertical scroll", &mut s.scroll_vertical, scroll);
+                    choice(ui, "scrollh", "Horizontal scroll", &mut s.scroll_horizontal, scroll);
+                    section(ui, "Controller buttons");
+                    choice(ui, "arrows", "⏪ ⏩ buttons", &mut s.arrow_action, &[("speed", "Change speed"), ("playlist", "Previous / next file"), ("seek", "Seek")]);
+                    if s.arrow_action == "seek" {
+                        row(ui, |ui| {
+                            ui.label(t("Seek step"));
+                            ui.add(egui::DragValue::new(&mut s.arrow_seek_step).range(1.0..=600.0).speed(1.0).suffix(" s"));
+                        });
+                    }
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(t("Key bindings: input.conf in the settings folder (IINA / mpv format).")).size(11.0).color(FG_DIM));
+                }
+                // ----------------------------------------------------- Advanced
+                _ => {
+                    section(ui, "mpv options");
+                    ui.label(RichText::new(t("One option per line, e.g. deband=yes. Applied when IINA-RS starts.")).size(11.0).color(FG_DIM));
+                    ui.add(egui::TextEdit::multiline(&mut s.mpv_options).desired_rows(8).desired_width(540.0).code_editor().hint_text("deband=yes\nscale=ewa_lanczossharp"));
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(t("Settings folder: input.conf (key bindings), mpv.conf (mpv options), scripts/ (mpv Lua/JS scripts).")).size(11.0).color(FG_DIM));
+                    if ui.button(t("Open settings folder")).clicked() {
+                        cmds.push("open-config-dir".into());
+                    }
+                }
             }
-            row(ui, |ui| {
-                ui.label(t("Initial volume"));
-                slider(ui, &mut s.volume, 0.0..=100.0, "", 0);
-            });
-            ui.add_space(6.0);
-            ui.label(RichText::new(t("Screenshots")).strong());
-            row(ui, |ui| {
-                ui.add(egui::TextEdit::singleline(&mut s.screenshot_dir).desired_width(260.0));
-                if ui.button(t("Choose…")).clicked() {
-                    if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                        s.screenshot_dir = d.to_string_lossy().into_owned();
-                    }
-                }
-            });
-            ui.add_space(6.0);
-            ui.label(RichText::new(t("Online subtitles")).strong());
-            grid(ui, "sub-keys", 3, false, vec2(8.0, 4.0), |ui| {
-                ui.label(t("SubDL key"));
-                ui.add(egui::TextEdit::singleline(&mut s.subdl_key).password(true).desired_width(220.0));
-                ui.hyperlink_to(t("Get a key"), "https://subdl.com/panel/api");
-                ui.end_row();
-                ui.label(t("OpenSubtitles key"));
-                ui.add(egui::TextEdit::singleline(&mut s.opensubtitles_key).password(true).desired_width(220.0));
-                ui.hyperlink_to(t("Get a key"), "https://www.opensubtitles.com/consumers");
-                ui.end_row();
-            });
-            row(ui, |ui| {
-                ui.label(t("Languages"));
-                ui.add(egui::TextEdit::singleline(&mut s.sub_languages).desired_width(120.0).hint_text(t("ar,en")));
-            });
-            ui.add_space(6.0);
-            ui.label(RichText::new(t("System")).strong());
-            row(ui, |ui| {
-                if cfg!(windows) {
-                    if ui.button(t("Add to “Open with”")).on_hover_text(t("Registers IINA-RS for video/audio files for your user account")).clicked() {
-                        cmds.push("assoc-register".into());
-                    }
-                    if ui.button(t("Remove")).clicked() {
-                        cmds.push("assoc-unregister".into());
-                    }
-                    if ui.button(t("Default apps…")).clicked() {
-                        cmds.push("open-default-apps".into());
-                    }
-                }
-                if ui.button(t("Open settings folder")).clicked() {
-                    cmds.push("open-config-dir".into());
-                }
-            });
-            if !assoc_status.is_empty() {
-                ui.label(RichText::new(v(&assoc_status)).size(11.0).color(FG_DIM));
-            }
-            ui.add_space(6.0);
-            ui.label(RichText::new(t("Settings folder: input.conf (key bindings), mpv.conf (mpv options), scripts/ (mpv Lua/JS scripts).")).size(11.0).color(FG_DIM));
         }));
     if header_close {
         open = false;
@@ -1854,6 +2108,7 @@ fn subtitle_prefs(ui: &mut Ui, s: &mut crate::settings::SubStyle, fonts: &crate:
                 }
             });
         check(ui, &mut s.bold, t("Bold"));
+        check(ui, &mut s.italic, t("Italic"));
     });
     row(ui, |ui| {
         ui.label(t("Size"));
@@ -1881,6 +2136,10 @@ fn subtitle_prefs(ui: &mut Ui, s: &mut crate::settings::SubStyle, fonts: &crate:
         slider(ui, &mut s.shadow_offset, 0.0..=10.0, "", 1);
     });
     row(ui, |ui| {
+        ui.label(t("Blur"));
+        slider(ui, &mut s.blur, 0.0..=20.0, "", 1);
+    });
+    row(ui, |ui| {
         ui.label(t("Letter spacing"));
         slider(ui, &mut s.letter_spacing, -5.0..=20.0, "", 1);
     });
@@ -1903,6 +2162,11 @@ fn subtitle_prefs(ui: &mut Ui, s: &mut crate::settings::SubStyle, fonts: &crate:
         ui.label(t("Bottom margin"));
         slider(ui, &mut s.margin, 0.0..=200.0, "", 0);
     });
+    row(ui, |ui| {
+        ui.label(t("Side margin"));
+        slider(ui, &mut s.margin_x, 0.0..=300.0, "", 0);
+    });
+    check(ui, &mut s.scale_by_window, t("Scale subtitles with the window"));
     row(ui, |ui| {
         ui.label(t("Secondary subtitle position"));
         slider(ui, &mut s.secondary_position, 0.0..=100.0, "", 0);
@@ -1939,6 +2203,7 @@ fn subtitle_prefs(ui: &mut Ui, s: &mut crate::settings::SubStyle, fonts: &crate:
         ("all", "Any in the folder"),
     ]);
     check(ui, &mut s.use_margins, t("Show text subtitles in the black bars"));
+    check(ui, &mut s.search_subfolders, t("Also look for subtitles in subfolders (Subs/, Subtitles/…)"));
     check(ui, &mut s.remove_sdh, t("Remove hearing-impaired text"));
     row(ui, |ui| {
         ui.label(t("Sync steps (s)"));

@@ -62,6 +62,10 @@ pub struct Player {
     pub hwdec_current: String,
     pub loop_playlist: bool,
     pub loop_file: bool,
+    /// At the end of the file (keep-open).
+    pub eof_reached: bool,
+    /// (name, description) from mpv's `audio-device-list`.
+    pub audio_devices: Vec<(String, String)>,
     pub vid: String,
     pub aid: String,
     pub sid: String,
@@ -111,6 +115,8 @@ impl Default for Player {
             hwdec_current: String::new(),
             loop_playlist: false,
             loop_file: false,
+            eof_reached: false,
+            audio_devices: vec![],
             vid: String::new(),
             aid: String::new(),
             sid: String::new(),
@@ -159,6 +165,8 @@ pub const OBSERVED: &[(&str, i32)] = &[
     ("hwdec-current", FORMAT_STRING),
     ("loop-playlist", FORMAT_STRING),
     ("loop-file", FORMAT_STRING),
+    ("eof-reached", FORMAT_FLAG),
+    ("audio-device-list", FORMAT_STRING),
     ("vid", FORMAT_STRING),
     ("aid", FORMAT_STRING),
     ("sid", FORMAT_STRING),
@@ -217,6 +225,18 @@ impl Player {
             ("hwdec-current", None) => self.hwdec_current.clear(),
             ("loop-playlist", Str(s)) => self.loop_playlist = s != "no",
             ("loop-file", Str(s)) => self.loop_file = s != "no",
+            ("eof-reached", Flag(b)) => self.eof_reached = *b,
+            ("eof-reached", None) => self.eof_reached = false,
+            ("audio-device-list", Str(s)) => {
+                #[derive(serde::Deserialize)]
+                struct Dev {
+                    name: String,
+                    #[serde(default)]
+                    description: String,
+                }
+                let devs: Vec<Dev> = serde_json::from_str(s).unwrap_or_default();
+                self.audio_devices = devs.into_iter().map(|d| (d.name, d.description)).collect();
+            }
             ("vid", Str(s)) => self.vid = s.clone(),
             ("aid", Str(s)) => self.aid = s.clone(),
             ("sid", Str(s)) => self.sid = s.clone(),
