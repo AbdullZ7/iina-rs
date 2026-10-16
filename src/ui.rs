@@ -293,6 +293,74 @@ fn slider<N: egui::emath::Numeric>(ui: &mut Ui, value: &mut N, range: std::ops::
     .inner
 }
 
+/// Width of the label column in settings forms, so controls line up.
+const LABEL_W: f32 = 175.0;
+
+/// A fixed-width cell in a horizontal row (a "virtual grid" column): the
+/// row keeps its alignment whatever the content width. Text aligns to the
+/// reading start (right in Arabic).
+fn cell<R>(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let h = ui.spacing().interact_size.y;
+    let (rect, _) = ui.allocate_exact_size(vec2(width, h), Sense::hover());
+    let layout = if is_rtl() { Layout::right_to_left(Align::Center) } else { Layout::left_to_right(Align::Center) };
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+    child.set_clip_rect(rect.intersect(ui.clip_rect()));
+    add(&mut child)
+}
+
+/// A form row: label in the fixed label column, then the controls.
+fn field<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    row(ui, |ui| {
+        cell(ui, LABEL_W, |ui| ui.add(egui::Label::new(t(label)).truncate()));
+        add(ui)
+    })
+}
+
+/// Vertical scroll area whose bar sits on the reading-end side: egui always
+/// draws it on the right, so Arabic gets a hand-drawn bar on the left.
+fn scroll_v<R>(ui: &mut Ui, salt: &str, max_height: Option<f32>, fill: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let mut area = egui::ScrollArea::vertical().id_salt(salt).auto_shrink([!fill, !fill]);
+    if let Some(h) = max_height {
+        area = area.max_height(h);
+    }
+    if !is_rtl() {
+        return area.show(ui, add).inner;
+    }
+    const BAR: f32 = 8.0;
+    let id = ui.make_persistent_id(("rtl-scroll", salt));
+    if let Some(off) = ui.data(|d| d.get_temp::<f32>(id)) {
+        area = area.vertical_scroll_offset(off);
+    }
+    area = area.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+    let avail = ui.available_rect_before_wrap();
+    let content = avail.with_min_x(avail.min.x + BAR + 4.0);
+    let out = ui.scope_builder(egui::UiBuilder::new().max_rect(content).layout(*ui.layout()), |ui| area.show(ui, add)).inner;
+    let view = out.inner_rect;
+    let total = out.content_size.y;
+    if total > view.height() + 1.0 {
+        let bar = Rect::from_min_max(pos2(avail.min.x, view.top()), pos2(avail.min.x + BAR, view.bottom()));
+        let resp = ui.interact(bar, id.with("bar"), Sense::click_and_drag());
+        let max_off = total - view.height();
+        let handle_h = (bar.height() * view.height() / total).max(24.0).min(bar.height());
+        let travel = (bar.height() - handle_h).max(1.0);
+        if resp.dragged() || resp.is_pointer_button_down_on() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let f = ((p.y - bar.top() - handle_h / 2.0) / travel).clamp(0.0, 1.0);
+                ui.data_mut(|d| d.insert_temp(id, f * max_off));
+                ui.ctx().request_repaint();
+            }
+        } else {
+            ui.data_mut(|d| d.remove::<f32>(id));
+        }
+        let top = bar.top() + travel * (out.state.offset.y / max_off).clamp(0.0, 1.0);
+        let handle = Rect::from_min_size(pos2(bar.left() + 1.0, top), vec2(BAR - 2.0, handle_h));
+        let active = resp.hovered() || resp.dragged();
+        ui.painter().rect_filled(bar, 4.0, Color32::from_white_alpha(if active { 18 } else { 8 }));
+        ui.painter().rect_filled(handle, 3.0, Color32::from_white_alpha(if active { 150 } else { 90 }));
+    }
+    out.inner
+}
+
 /// Window header for Arabic: title on the right, close button on the left
 /// (egui's own title bar is left-to-right). Returns true when closed.
 fn rtl_header(ui: &mut Ui, title: &str) -> bool {
@@ -383,8 +451,9 @@ fn rtl_window<R>(ui: &mut Ui, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
         // Build the child from an explicit rect: inside scrolling / auto-sized
         // windows the parent's max width can be infinite, and right-aligning
         // against it yields NaN positions.
-        let h = ui.available_height();
-        let h = if h.is_finite() { h.max(0.0) } else { 10_000.0 };
+        // Height up to the screen bottom: an auto-sized window's available
+        // height is last frame's size, which would never let it grow.
+        let h = (ui.ctx().screen_rect().bottom() - ui.cursor().min.y).max(0.0);
         let rect = Rect::from_min_size(ui.cursor().min, vec2(w, h));
         let r = ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Max)), add);
         r.inner
@@ -987,7 +1056,7 @@ fn welcome(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
                         if st.recent.is_empty() {
                             ui.label(RichText::new(t("Drop a video here, or open a file.")).color(FG_DIM));
                         }
-                        egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        scroll_v(ui, "recent", Some(220.0), false, |ui| {
                             for path in st.recent.clone() {
                                 let r = ui.add(egui::Button::new(v(&file_name(&path))).frame(false).truncate());
                                 if r.clicked() {
@@ -1007,6 +1076,11 @@ fn welcome(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
 
 
 fn track_list(ui: &mut Ui, mpv: &Mpv, tracks: &[&Track], prop: &str, allow_none: bool, selected: impl Fn(&Track) -> bool) {
+    let align = if is_rtl() { Align::Max } else { Align::Min };
+    ui.with_layout(Layout::top_down_justified(align), |ui| track_rows(ui, mpv, tracks, prop, allow_none, selected));
+}
+
+fn track_rows(ui: &mut Ui, mpv: &Mpv, tracks: &[&Track], prop: &str, allow_none: bool, selected: impl Fn(&Track) -> bool) {
     let none_selected = !tracks.iter().any(|t| selected(t));
     if allow_none && ui.selectable_label(none_selected, t("None")).clicked() {
         mpv.set_string(prop, "no");
@@ -1039,12 +1113,21 @@ fn track_list(ui: &mut Ui, mpv: &Mpv, tracks: &[&Track], prop: &str, allow_none:
 fn labeled_slider(ui: &mut Ui, mpv: &Mpv, label: &str, prop: &str, value: f64, range: std::ops::RangeInclusive<f64>, default: f64, suffix: &str) {
     ui.label(RichText::new(t(label)).color(FG_DIM));
     row(ui, |ui| {
+        // Fixed columns: slider | value | reset, identical on every row.
+        const VALUE_W: f32 = 64.0;
+        const RESET_W: f32 = 78.0;
+        let gap = ui.spacing().item_spacing.x;
+        let h = ui.spacing().interact_size.y;
+        ui.spacing_mut().slider_width = (ui.available_width() - VALUE_W - RESET_W - 2.0 * gap - 2.0).max(60.0);
+        let (lo, hi) = (*range.start(), *range.end());
         let mut x = value;
-        let r = slider(ui, &mut x, range, suffix, 2);
-        if r.changed() {
+        let slider = if is_rtl() { egui::Slider::new(&mut x, hi..=lo) } else { egui::Slider::new(&mut x, lo..=hi) };
+        let mut changed = ui.add(slider.show_value(false)).changed();
+        changed |= ui.add_sized([VALUE_W, h], egui::DragValue::new(&mut x).range(lo..=hi).suffix(suffix).max_decimals(2).speed((hi - lo) / 200.0)).changed();
+        if changed {
             mpv.set_double(prop, x);
         }
-        if ui.small_button(t("Reset")).clicked() {
+        if ui.add_sized([RESET_W, h], egui::Button::new(t("Reset"))).clicked() {
             mpv.set_double(prop, default);
         }
     });
@@ -1092,14 +1175,15 @@ fn sidebar(ctx: &egui::Context, st: &mut UiState, tab: Tab, pl: &Player, mpv: &M
                         st.sidebar = Some(*tab_id);
                     }
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let end = if is_rtl() { Layout::left_to_right(Align::Center) } else { Layout::right_to_left(Align::Center) };
+                ui.with_layout(end, |ui| {
                     if ui.button(t("✕")).clicked() {
                         st.sidebar = None;
                     }
                 });
             });
             ui.separator();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match tab {
+            scroll_v(ui, "sidebar", None, true, |ui| match tab {
                 Tab::Playlist => playlist_tab(ui, pl, mpv, cmds),
                 Tab::Chapters => {
                     if pl.chapters.is_empty() {
@@ -1259,7 +1343,8 @@ fn video_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
         ("Hue", "hue", pl.hue),
     ] {
         row(ui, |ui| {
-            ui.add_sized(vec2(84.0, 18.0), egui::Label::new(RichText::new(t(label)).color(FG_DIM)));
+            cell(ui, 84.0, |ui| ui.label(RichText::new(t(label)).color(FG_DIM)));
+            ui.spacing_mut().slider_width = (ui.available_width() - 64.0 - 2.0 * ui.spacing().item_spacing.x - 4.0).max(60.0);
             let mut x = v as f64;
             if slider(ui, &mut x, -100.0..=100.0, "", 0).changed() {
                 mpv.set_string(prop, &format!("{}", x.round() as i64));
@@ -1304,18 +1389,21 @@ fn audio_tab(ui: &mut Ui, st: &mut UiState, pl: &Player, mpv: &Mpv, cmds: &mut V
             }
         }
     });
-    row(ui, |ui| {
-        for (i, f) in EQ_FREQS.iter().enumerate() {
-            ui.vertical(|ui| {
-                ui.spacing_mut().slider_width = 110.0;
-                if ui.add(egui::Slider::new(&mut st.eq[i], -12.0..=12.0).vertical().show_value(false)).changed() {
-                    changed = true;
-                }
-                let label = if *f >= 1000 { format!("{}k", f / 1000) } else { f.to_string() };
-                ui.label(RichText::new(label).size(9.5).color(FG_DIM));
-            });
+    // Frequency axis stays low→high left-to-right (like the time bar), in
+    // equal fixed-width columns.
+    let width = ui.available_width();
+    let (area, _) = ui.allocate_exact_size(vec2(width, 140.0), Sense::hover());
+    let col = width / EQ_FREQS.len() as f32;
+    for (i, f) in EQ_FREQS.iter().enumerate() {
+        let rect = Rect::from_min_size(pos2(area.left() + col * i as f32, area.top()), vec2(col, area.height()));
+        let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Center)));
+        c.spacing_mut().slider_width = 112.0;
+        if c.add(egui::Slider::new(&mut st.eq[i], -12.0..=12.0).vertical().show_value(false)).on_hover_text(format!("{:+.0} dB", st.eq[i])).changed() {
+            changed = true;
         }
-    });
+        let label = if *f >= 1000 { format!("{}k", f / 1000) } else { f.to_string() };
+        c.label(RichText::new(label).size(9.5).color(FG_DIM));
+    }
     if changed {
         apply_audio_eq(mpv, &st.eq);
     }
@@ -1547,8 +1635,7 @@ fn inspector(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv) {
 
 /// A labelled drop-down choosing one of `options` (value, label key).
 fn choice(ui: &mut Ui, id: &str, label: &str, value: &mut String, options: &[(&str, &str)]) {
-    row(ui, |ui| {
-        ui.label(t(label));
+    field(ui, label, |ui| {
         let current = options.iter().find(|(k, _)| k == value).map(|(_, l)| t(l)).unwrap_or_else(|| value.clone());
         egui::ComboBox::from_id_salt(id).selected_text(current).width(220.0).show_ui(ui, |ui| {
             for (k, l) in options {
@@ -1566,8 +1653,7 @@ fn section(ui: &mut Ui, title: &str) {
 }
 
 fn text_field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
-    row(ui, |ui| {
-        ui.label(t(label));
+    field(ui, label, |ui| {
         ui.add(egui::TextEdit::singleline(value).desired_width(260.0).hint_text(hint));
     });
 }
@@ -1591,10 +1677,8 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
-        .vscroll(true)
         .min_width(600.0)
         .max_width(600.0)
-        .max_height((ctx.screen_rect().height() - 90.0).max(200.0))
         .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
         .show(ctx, |ui| rtl_window(ui, 600.0, |ui| {
             if rtl_header(ui, &t("Preferences")) {
@@ -1609,11 +1693,11 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                 }
             });
             ui.separator();
-            match prefs_tab {
+            let body_h = (ctx.screen_rect().height() - 200.0).clamp(160.0, 620.0);
+            scroll_v(ui, "prefs-body", Some(body_h), false, |ui| match prefs_tab {
                 // ------------------------------------------------------ General
                 0 => {
-                    row(ui, |ui| {
-                        ui.label(t("Language"));
+                    field(ui, "Language", |ui| {
                         for (code, name) in [("auto", t("Automatic")), ("en", "English".to_string()), ("ar", v("العربية"))] {
                             if ui.selectable_label(s.language == code, name).clicked() {
                                 s.language = code.to_string();
@@ -1629,8 +1713,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     section(ui, "Window");
                     check(ui, &mut s.resize_to_video, t("Resize window to video size when opening a file"));
                     if s.resize_to_video {
-                        row(ui, |ui| {
-                            ui.label(t("Window scale"));
+                        field(ui, "Window scale", |ui| {
                             for k in [0.5, 1.0, 1.5, 2.0] {
                                 if ui.selectable_label((s.resize_scale - k).abs() < 1e-6, format!("{k}×")).clicked() {
                                     s.resize_scale = k;
@@ -1642,16 +1725,14 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     section(ui, "On-screen controller");
                     check(ui, &mut s.osc_autohide, t("Hide the controller automatically"));
                     if s.osc_autohide {
-                        row(ui, |ui| {
-                            ui.label(t("Hide controller after"));
+                        field(ui, "Hide controller after", |ui| {
                             slider(ui, &mut s.osc_hide_secs, 1.0..=10.0, " s", 1);
                         });
                     }
                     check(ui, &mut s.show_remaining, t("Show remaining time"));
                     check(ui, &mut s.thumbnails, t("Show thumbnail preview on the seek bar"));
                     if s.thumbnails {
-                        row(ui, |ui| {
-                            ui.label(t("Thumbnail width"));
+                        field(ui, "Thumbnail width", |ui| {
                             ui.add(egui::DragValue::new(&mut s.thumbnail_width).range(0.0..=480.0).speed(2.0).max_decimals(0));
                             ui.label(RichText::new(t("pt (0 = automatic)")).size(11.0).color(FG_DIM));
                         });
@@ -1659,12 +1740,10 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     section(ui, "On-screen messages");
                     check(ui, &mut s.osd_enabled, t("Show on-screen messages"));
                     if s.osd_enabled {
-                        row(ui, |ui| {
-                            ui.label(t("Duration"));
+                        field(ui, "Duration", |ui| {
                             slider(ui, &mut s.osd_timeout, 0.5..=5.0, " s", 1);
                         });
-                        row(ui, |ui| {
-                            ui.label(t("Text size"));
+                        field(ui, "Text size", |ui| {
                             slider(ui, &mut s.osd_text_size, 12.0..=40.0, "", 0);
                         });
                     }
@@ -1715,8 +1794,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     if !cfg!(target_os = "macos") {
                         check(ui, &mut s.hdr_output, t("HDR output on HDR displays (restart required)"));
                         if s.hdr_output {
-                            row(ui, |ui| {
-                                ui.label(t("HDR peak brightness"));
+                            field(ui, "HDR peak brightness", |ui| {
                                 ui.add(egui::DragValue::new(&mut s.hdr_peak_nits).range(0.0..=10000.0).speed(10.0).max_decimals(0));
                                 ui.label(RichText::new(t("nits (0 = automatic)")).size(11.0).color(FG_DIM));
                             });
@@ -1724,8 +1802,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     }
                     section(ui, "Audio");
                     text_field(ui, "Preferred audio languages", &mut s.audio_languages, "ar,ara,en");
-                    row(ui, |ui| {
-                        ui.label(t("Output device"));
+                    field(ui, "Output device", |ui| {
                         let current = if s.audio_device == "auto" || s.audio_device.is_empty() {
                             t("Automatic")
                         } else {
@@ -1743,8 +1820,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                         });
                     });
                     check(ui, &mut s.remember_volume, t("Remember the last volume"));
-                    row(ui, |ui| {
-                        ui.label(t("Maximum volume"));
+                    field(ui, "Maximum volume", |ui| {
                         slider(ui, &mut s.volume_max, 100.0..=200.0, "%", 0);
                     });
                     ui.label(RichText::new(t("Pass through to an external decoder (S/PDIF / HDMI receiver):")).color(FG_DIM));
@@ -1776,8 +1852,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                         ui.hyperlink_to(t("Get a key"), "https://www.opensubtitles.com/consumers");
                         ui.end_row();
                     });
-                    row(ui, |ui| {
-                        ui.label(t("Languages"));
+                    field(ui, "Languages", |ui| {
                         ui.add(egui::TextEdit::singleline(&mut s.sub_languages).desired_width(120.0).hint_text(t("ar,en")));
                     });
                 }
@@ -1786,12 +1861,10 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     section(ui, "Cache");
                     check(ui, &mut s.cache, t("Enable cache"));
                     if s.cache {
-                        row(ui, |ui| {
-                            ui.label(t("Cache size"));
+                        field(ui, "Cache size", |ui| {
                             ui.add(egui::DragValue::new(&mut s.cache_mib).range(16.0..=4096.0).speed(4.0).suffix(" MiB"));
                         });
-                        row(ui, |ui| {
-                            ui.label(t("Read ahead"));
+                        field(ui, "Read ahead", |ui| {
                             ui.add(egui::DragValue::new(&mut s.cache_secs).range(10.0..=36000.0).speed(10.0).suffix(" s"));
                         });
                     }
@@ -1826,8 +1899,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     section(ui, "Controller buttons");
                     choice(ui, "arrows", "⏪ ⏩ buttons", &mut s.arrow_action, &[("speed", "Change speed"), ("playlist", "Previous / next file"), ("seek", "Seek")]);
                     if s.arrow_action == "seek" {
-                        row(ui, |ui| {
-                            ui.label(t("Seek step"));
+                        field(ui, "Seek step", |ui| {
                             ui.add(egui::DragValue::new(&mut s.arrow_seek_step).range(1.0..=600.0).speed(1.0).suffix(" s"));
                         });
                     }
@@ -1845,7 +1917,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                         cmds.push("open-config-dir".into());
                     }
                 }
-            }
+            });
         }));
     if header_close {
         open = false;
@@ -1926,7 +1998,7 @@ fn history_window(ctx: &egui::Context, st: &mut UiState, hist: &History, cmds: &
             if rows.is_empty() {
                 ui.label(RichText::new(t("No history yet.")).color(FG_DIM));
             }
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            scroll_v(ui, "list", None, true, |ui| {
                 for e in rows {
                     let missing = !e.path.contains("://") && !std::path::Path::new(&e.path).exists();
                     row(ui, |ui| {
@@ -2022,7 +2094,7 @@ fn subtitle_search(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>
             });
             ui.label(RichText::new(v(&s.status)).size(11.5).color(FG_DIM));
             ui.separator();
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            scroll_v(ui, "list", None, true, |ui| {
                 grid(ui, "subs-results", 4, true, vec2(10.0, 4.0), |ui| {
                     for (i, r) in s.results.clone().into_iter().enumerate() {
                         ui.label(RichText::new(r.language.to_uppercase()).monospace());
@@ -2072,14 +2144,12 @@ fn subtitle_search(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>
 
 /// PotPlayer-style subtitle preferences.
 fn subtitle_prefs(ui: &mut Ui, s: &mut crate::settings::SubStyle, fonts: &crate::fonts::Shared, filter: &mut String, cmds: &mut Vec<String>) {
-    row(ui, |ui| {
-        ui.label(t("Preferred languages"));
+    field(ui, "Preferred languages", |ui| {
         ui.add(egui::TextEdit::singleline(&mut s.languages).desired_width(220.0).hint_text("ar,ara,arabic"));
     });
 
     // Font picker with search over installed families.
-    row(ui, |ui| {
-        ui.label(t("Font"));
+    field(ui, "Font", |ui| {
         let shown = if s.font.is_empty() { t("Default font") } else { v(&s.font) };
         egui::ComboBox::from_id_salt("sub-font")
             .selected_text(shown)
@@ -2110,8 +2180,7 @@ fn subtitle_prefs(ui: &mut Ui, s: &mut crate::settings::SubStyle, fonts: &crate:
         check(ui, &mut s.bold, t("Bold"));
         check(ui, &mut s.italic, t("Italic"));
     });
-    row(ui, |ui| {
-        ui.label(t("Size"));
+    field(ui, "Size", |ui| {
         slider(ui, &mut s.size, 16.0..=120.0, "", 0);
     });
 
@@ -2127,20 +2196,16 @@ fn subtitle_prefs(ui: &mut Ui, s: &mut crate::settings::SubStyle, fonts: &crate:
         color(ui, "Outline", &mut s.outline_color);
         color(ui, "Shadow", &mut s.shadow_color);
     });
-    row(ui, |ui| {
-        ui.label(t("Outline"));
+    field(ui, "Outline", |ui| {
         slider(ui, &mut s.outline_size, 0.0..=10.0, "", 1);
     });
-    row(ui, |ui| {
-        ui.label(t("Shadow"));
+    field(ui, "Shadow", |ui| {
         slider(ui, &mut s.shadow_offset, 0.0..=10.0, "", 1);
     });
-    row(ui, |ui| {
-        ui.label(t("Blur"));
+    field(ui, "Blur", |ui| {
         slider(ui, &mut s.blur, 0.0..=20.0, "", 1);
     });
-    row(ui, |ui| {
-        ui.label(t("Letter spacing"));
+    field(ui, "Letter spacing", |ui| {
         slider(ui, &mut s.letter_spacing, -5.0..=20.0, "", 1);
     });
     row_wrapped(ui, |ui| {
@@ -2154,27 +2219,22 @@ fn subtitle_prefs(ui: &mut Ui, s: &mut crate::settings::SubStyle, fonts: &crate:
     if s.border_style != "outline-and-shadow" {
         row(ui, |ui| color(ui, "Box color", &mut s.box_color));
     }
-    row(ui, |ui| {
-        ui.label(t("Vertical position"));
+    field(ui, "Vertical position", |ui| {
         slider(ui, &mut s.position, 0.0..=150.0, "", 0);
     });
-    row(ui, |ui| {
-        ui.label(t("Bottom margin"));
+    field(ui, "Bottom margin", |ui| {
         slider(ui, &mut s.margin, 0.0..=200.0, "", 0);
     });
-    row(ui, |ui| {
-        ui.label(t("Side margin"));
+    field(ui, "Side margin", |ui| {
         slider(ui, &mut s.margin_x, 0.0..=300.0, "", 0);
     });
     check(ui, &mut s.scale_by_window, t("Scale subtitles with the window"));
-    row(ui, |ui| {
-        ui.label(t("Secondary subtitle position"));
+    field(ui, "Secondary subtitle position", |ui| {
         slider(ui, &mut s.secondary_position, 0.0..=100.0, "", 0);
     });
 
     let combo = |ui: &mut Ui, id: &str, label: &str, value: &mut String, options: &[(&str, &str)]| {
-        row(ui, |ui| {
-            ui.label(t(label));
+        field(ui, label, |ui| {
             let current = options.iter().find(|(k, _)| k == value).map(|(_, l)| t(l)).unwrap_or_else(|| value.clone());
             egui::ComboBox::from_id_salt(id).selected_text(current).width(220.0).show_ui(ui, |ui| {
                 for (k, l) in options {
@@ -2205,8 +2265,7 @@ fn subtitle_prefs(ui: &mut Ui, s: &mut crate::settings::SubStyle, fonts: &crate:
     check(ui, &mut s.use_margins, t("Show text subtitles in the black bars"));
     check(ui, &mut s.search_subfolders, t("Also look for subtitles in subfolders (Subs/, Subtitles/…)"));
     check(ui, &mut s.remove_sdh, t("Remove hearing-impaired text"));
-    row(ui, |ui| {
-        ui.label(t("Sync steps (s)"));
+    field(ui, "Sync steps (s)", |ui| {
         for step in s.sync_steps.iter_mut() {
             ui.add(egui::DragValue::new(step).range(0.01..=600.0).speed(0.1).max_decimals(2));
         }
