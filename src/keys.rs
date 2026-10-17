@@ -139,6 +139,64 @@ impl Bindings {
     pub fn lookup(&self, key: &str) -> Option<&Binding> {
         self.map.get(key)
     }
+
+    /// Editable rows (key, command, is app command), sorted by key; keys
+    /// bound to `ignore` are left out.
+    pub fn rows(&self) -> Vec<KeyRow> {
+        let mut v: Vec<KeyRow> = self
+            .map
+            .iter()
+            .filter_map(|(k, b)| {
+                let (cmd, app) = match b {
+                    Binding::Mpv(c) => (c.clone(), false),
+                    Binding::App(c) => (c.clone(), true),
+                };
+                (cmd != "ignore").then(|| KeyRow { key: k.clone(), command: cmd, app })
+            })
+            .collect();
+        v.sort_by(|a, b| a.key.to_lowercase().cmp(&b.key.to_lowercase()).then(a.key.cmp(&b.key)));
+        v
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyRow {
+    pub key: String,
+    pub command: String,
+    /// An IINA-RS command (`#@iina` line) rather than an mpv one.
+    pub app: bool,
+}
+
+/// The `input.conf` that turns the built-in bindings into `rows`: only the
+/// differences are written (changed/added keys, and `ignore` for removed ones).
+pub fn user_conf(rows: &[KeyRow]) -> String {
+    let defaults = Bindings::load(None);
+    let mut out = String::from("# IINA-RS key bindings (written by the Key Bindings window).
+# Format: KEY mpv-command, or \"#@iina KEY app-command\".
+");
+    let mut seen = std::collections::HashSet::new();
+    for r in rows {
+        let key = normalize(&r.key);
+        if key.is_empty() || r.command.trim().is_empty() || !seen.insert(key.clone()) {
+            continue;
+        }
+        let same = match defaults.lookup(&key) {
+            Some(Binding::Mpv(c)) => !r.app && c == r.command.trim(),
+            Some(Binding::App(c)) => r.app && c == r.command.trim(),
+            None => false,
+        };
+        if !same {
+            out.push_str(&format!("{}{} {}
+", if r.app { "#@iina " } else { "" }, key, r.command.trim()));
+        }
+    }
+    let mut removed: Vec<&String> = defaults.map.keys().filter(|k| !seen.contains(*k)).collect();
+    removed.sort();
+    for k in removed {
+        out.push_str(&format!("{k} ignore
+"));
+    }
+    out
 }
 
 fn named(k: &NamedKey) -> Option<&'static str> {
@@ -249,6 +307,33 @@ mod tests {
         assert_eq!(normalize("Ctrl++"), "Ctrl++");
         assert_eq!(normalize("Shift+_"), "_");
         assert_eq!(normalize("Ctrl+Meta+f"), "Ctrl+Alt+f");
+    }
+
+    #[test]
+    fn user_conf_round_trips() {
+        let mut rows = Bindings::load(None).rows();
+        assert_eq!(user_conf(&rows).lines().filter(|l| !l.starts_with('#')).count(), 0);
+        rows.retain(|r| r.key != "f");
+        rows.push(KeyRow { key: "Ctrl+Alt+k".into(), command: "cycle mute".into(), app: false });
+        let conf = user_conf(&rows);
+        assert!(conf.contains("
+f ignore
+"));
+        assert!(conf.contains("
+Ctrl+Alt+k cycle mute
+"));
+        let b = Bindings::load(Some(conf));
+        assert_eq!(b.rows(), rows.iter().cloned().map(|mut r| { r.key = normalize(&r.key); r }).collect::<Vec<_>>().tap_sort());
+    }
+
+    trait TapSort {
+        fn tap_sort(self) -> Self;
+    }
+    impl TapSort for Vec<KeyRow> {
+        fn tap_sort(mut self) -> Self {
+            self.sort_by(|a, b| a.key.to_lowercase().cmp(&b.key.to_lowercase()).then(a.key.cmp(&b.key)));
+            self
+        }
     }
 
     #[test]

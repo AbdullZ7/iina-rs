@@ -15,6 +15,11 @@ pub struct Track {
     pub external: bool,
     #[serde(rename = "demux-channel-count")]
     pub channels: Option<i64>,
+    /// A video track that is really cover art.
+    #[serde(default)]
+    pub albumart: bool,
+    #[serde(default)]
+    pub selected: bool,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -71,6 +76,10 @@ pub struct Player {
     pub sid: String,
     pub secondary_sid: String,
     pub vf: String,
+    pub af: String,
+    /// From the file's tags.
+    pub artist: String,
+    pub album: String,
     pub cache_time: f64,
     pub ab_loop_a: Option<f64>,
     pub ab_loop_b: Option<f64>,
@@ -122,6 +131,9 @@ impl Default for Player {
             sid: String::new(),
             secondary_sid: String::new(),
             vf: String::new(),
+            af: String::new(),
+            artist: String::new(),
+            album: String::new(),
             cache_time: 0.0,
             ab_loop_a: None,
             ab_loop_b: None,
@@ -172,6 +184,8 @@ pub const OBSERVED: &[(&str, i32)] = &[
     ("sid", FORMAT_STRING),
     ("secondary-sid", FORMAT_STRING),
     ("vf", FORMAT_STRING),
+    ("af", FORMAT_STRING),
+    ("metadata", FORMAT_STRING),
     ("demuxer-cache-time", FORMAT_DOUBLE),
     ("ab-loop-a", FORMAT_STRING),
     ("ab-loop-b", FORMAT_STRING),
@@ -189,6 +203,12 @@ pub fn observe_all(mpv: &Mpv) {
 }
 
 impl Player {
+    /// Audio only, or audio with cover art (music-mode material).
+    pub fn is_audio_only(&self) -> bool {
+        !self.idle && self.tracks.iter().any(|t| t.kind == "audio") && !self.tracks.iter().any(|t| t.kind == "video" && !t.albumart)
+    }
+
+
     pub fn apply(&mut self, name: &str, v: &PropValue) {
         use PropValue::*;
         match (name, v) {
@@ -243,6 +263,21 @@ impl Player {
             ("secondary-sid", Str(s)) => self.secondary_sid = s.clone(),
             ("vf", Str(s)) => self.vf = s.clone(),
             ("vf", None) => self.vf.clear(),
+            ("af", Str(s)) => self.af = s.clone(),
+            ("af", None) => self.af.clear(),
+            ("metadata", Str(s)) => {
+                let map: std::collections::HashMap<String, String> = serde_json::from_str(s).unwrap_or_default();
+                let get = |k: &str| map.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.trim().to_string()).unwrap_or_default();
+                self.artist = get("artist");
+                if self.artist.is_empty() {
+                    self.artist = get("album_artist");
+                }
+                self.album = get("album");
+            }
+            ("metadata", None) => {
+                self.artist.clear();
+                self.album.clear();
+            }
             ("demuxer-cache-time", Double(d)) => self.cache_time = *d,
             ("demuxer-cache-time", None) => self.cache_time = 0.0,
             ("ab-loop-a", Str(s)) => self.ab_loop_a = s.parse().ok(),

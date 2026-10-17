@@ -15,6 +15,14 @@ use egui::{
 };
 use std::time::{Duration, Instant};
 
+mod tools;
+pub use tools::{capture_key, KeyEditor, LogLine, ShotPreview, LOG_LIMIT};
+
+/// Music mode layout (logical px): controls panel and expanded playlist.
+pub const MUSIC_PANEL_H: f32 = 136.0;
+pub const MUSIC_LIST_H: f32 = 240.0;
+pub const MUSIC_WIDTH: f32 = 420.0;
+
 /// Second line of an OSD message.
 #[derive(Clone)]
 pub enum OsdDetail {
@@ -91,6 +99,21 @@ pub struct UiState {
     pub osd: Option<Osd>,
     /// Where the controller's volume slider was drawn (wheel over it = volume).
     pub volume_bar_rect: Option<Rect>,
+    /// mpv log lines for the Logs window.
+    pub logs: std::collections::VecDeque<LogLine>,
+    pub show_logs: bool,
+    pub log_filter: String,
+    /// 0 = all, 1 = warnings and errors, 2 = errors.
+    pub log_level: u8,
+    pub key_editor: Option<KeyEditor>,
+    pub show_filters: bool,
+    pub filter_kind: String,
+    pub filter_name: String,
+    pub filter_value: String,
+    pub shot_preview: Option<ShotPreview>,
+    pub update: crate::update::Shared,
+    /// Music mode shows the playlist under the controls.
+    pub music_playlist: bool,
     thumb_path: String,
     thumb_tex: HashMap<usize, egui::TextureHandle>,
 }
@@ -128,6 +151,18 @@ impl UiState {
             fonts: Default::default(),
             font_filter: String::new(),
             prefs_tab: 0,
+            logs: Default::default(),
+            show_logs: false,
+            log_filter: String::new(),
+            log_level: 0,
+            key_editor: None,
+            show_filters: false,
+            filter_kind: "vf".into(),
+            filter_name: String::new(),
+            filter_value: String::new(),
+            shot_preview: None,
+            update: crate::update::shared(),
+            music_playlist: false,
             thumb_path: String::new(),
             thumb_tex: HashMap::new(),
         }
@@ -626,6 +661,8 @@ fn icon_button(ui: &mut Ui, size: f32, tip: &str, icon: IconFn) -> Response {
 
 /// What the pointer is doing over a bar slider.
 struct BarHover {
+    /// Show the preview under the bar (controller at the top).
+    below: bool,
     value: f64,
     /// Point on top of the bar under the pointer (screen coordinates).
     anchor: Pos2,
@@ -677,6 +714,7 @@ fn bar_slider(
             if rtl { (1.0 - f) * max } else { f * max }
         });
     let hover = pointer_value.filter(|_| active && max > 0.0).map(|v| BarHover {
+        below: false,
         value: v,
         anchor: pos2(xpos(v), rect.top()),
     });
@@ -729,7 +767,8 @@ fn seek_preview(ctx: &egui::Context, st: &mut UiState, pl: &Player, thumbs: Opti
     };
     let h = img_size.map_or(0.0, |s| s.y + pad) + galley.size().y + 6.0 + pad;
     let x = (hover.anchor.x - w / 2.0).clamp(screen.left() + 4.0, screen.right() - w - 4.0);
-    let frame = Rect::from_min_size(pos2(x, hover.anchor.y - h - 8.0), vec2(w, h));
+    let y = if hover.below { hover.anchor.y + 8.0 } else { hover.anchor.y - h - 8.0 };
+    let frame = Rect::from_min_size(pos2(x, y), vec2(w, h));
     painter.rect_filled(frame, 6.0, Color32::from_black_alpha(215));
     painter.rect_stroke(frame, 6.0, Stroke::new(1.0_f32, Color32::from_white_alpha(30)), egui::StrokeKind::Inside);
     let mut y = frame.top() + pad;
@@ -762,8 +801,10 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
             || ui_state.context_menu.is_some();
         ui_state.osc_visible = want_osc;
         let alpha = ctx.animate_bool_with_time(egui::Id::new("osc-alpha"), want_osc, 0.18);
-        if alpha > 0.0 {
-            if ui_state.fullscreen || ui_state.music_mode {
+        if ui_state.music_mode {
+            music_panel(ctx, ui_state, pl, mpv, &mut cmds);
+        } else if alpha > 0.0 {
+            if ui_state.fullscreen && ui_state.settings.osc_position != "top" {
                 title_bar(ctx, pl, alpha);
             }
             osc(ctx, ui_state, pl, mpv, thumbs, alpha, &mut cmds);
@@ -784,7 +825,11 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
     preferences(ctx, ui_state, pl, &mut cmds);
     history_window(ctx, ui_state, hist, &mut cmds);
     subtitle_search(ctx, ui_state, &mut cmds);
-    about(ctx, ui_state);
+    tools::key_bindings(ctx, ui_state, &mut cmds);
+    tools::filters(ctx, ui_state, pl, mpv);
+    tools::logs(ctx, ui_state);
+    tools::screenshot_preview(ctx, ui_state, &mut cmds);
+    about(ctx, ui_state, &mut cmds);
 
     if std::env::var_os("IINA_RS_DEBUG").is_some() {
         for name in ["win-Preferences", "win-Inspector", "win-Playback History"] {
@@ -812,7 +857,13 @@ fn osd(ctx: &egui::Context, st: &mut UiState, pl: &Player) {
     ctx.request_repaint();
     let size = st.settings.osd_text_size.clamp(10.0, 60.0);
     let time_text = format!("{} / {}", fmt_time(pl.time_pos), fmt_time(pl.duration));
-    let top = if st.fullscreen || st.music_mode { 58.0 } else { 18.0 };
+    let mut top: f32 = if st.fullscreen || st.music_mode { 58.0 } else { 18.0 };
+    // Keep clear of a controller bar at the top.
+    if st.settings.osc_position == "top" && st.osc_visible && !st.music_mode && !st.pip {
+        if let Some(r) = ctx.memory(|m| m.area_rect(egui::Id::new("osc"))) {
+            top = top.max(r.bottom() + 10.0);
+        }
+    }
     let (align, offset) = if is_rtl() { (Align2::RIGHT_TOP, vec2(-20.0, top)) } else { (Align2::LEFT_TOP, vec2(20.0, top)) };
     egui::Area::new(egui::Id::new("osd"))
         .anchor(align, offset)
@@ -867,6 +918,77 @@ fn osd(ctx: &egui::Context, st: &mut UiState, pl: &Player) {
         });
 }
 
+/// IINA's music mode: cover art on top (mpv draws it above the margin),
+/// then title / artist, seek bar, transport and an optional playlist.
+fn music_panel(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
+    let list_h = if st.music_playlist { MUSIC_LIST_H } else { 0.0 };
+    egui::TopBottomPanel::bottom("music")
+        .exact_height(MUSIC_PANEL_H + list_h)
+        .resizable(false)
+        .frame(egui::Frame::new().fill(Color32::from_rgb(30, 30, 32)).inner_margin(egui::Margin::symmetric(14, 10)))
+        .show(ctx, |ui| {
+            rtl_body(ui, |ui| {
+                let title = if pl.title.is_empty() { file_name(&pl.path) } else { pl.title.clone() };
+                ui.add(egui::Label::new(RichText::new(v(&title)).size(15.0).strong().color(FG)).truncate());
+                let sub = [pl.artist.as_str(), pl.album.as_str()].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" — ");
+                ui.add(egui::Label::new(RichText::new(if sub.is_empty() { " ".to_string() } else { v(&sub) }).size(12.0).color(FG_DIM)).truncate());
+            });
+            ui.add_space(4.0);
+            // Seek bar with times (time keeps left-to-right, as in the controller).
+            ui.horizontal(|ui| {
+                let shown = st.seek_preview.unwrap_or(pl.time_pos);
+                ui.label(RichText::new(fmt_time(shown)).monospace().size(11.0).color(FG));
+                let w = ui.available_width() - 52.0;
+                let (r, val, _) = bar_slider(ui, w, shown, pl.duration, &[], &[], false);
+                st.seek_bar_rect = Some(r.rect);
+                if let Some((x, finished)) = val {
+                    st.seek_preview = if finished { None } else { Some(x) };
+                    mpv.command(&["seek", &format!("{x:.3}"), if finished { "absolute+exact" } else { "absolute+keyframes" }]);
+                }
+                ui.label(RichText::new(fmt_time(pl.duration)).monospace().size(11.0).color(FG));
+            });
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let icon: IconFn = if pl.mute || pl.volume <= 0.0 { icon_muted } else { icon_volume };
+                if icon_button(ui, 26.0, &t("Mute"), icon).clicked() {
+                    mpv.command(&["cycle", "mute"]);
+                }
+                let (r, vol, _) = bar_slider(ui, 70.0, pl.volume, st.settings.volume_max.max(100.0), &[], &[], is_rtl());
+                st.volume_bar_rect = Some(r.rect);
+                if let Some((x, _)) = vol {
+                    mpv.set_double("volume", x.round());
+                }
+                // Three columns: volume | transport (centred) | toggles.
+                let used = 26.0 + 70.0 + 2.0 * ui.spacing().item_spacing.x;
+                let side = (ui.available_width() + used - 3.0 * (34.0 + ui.spacing().item_spacing.x)) / 2.0;
+                ui.add_space((side - used).max(4.0));
+                if icon_button(ui, 34.0, &t("Previous"), icon_prev).clicked() {
+                    mpv.command(&["playlist-prev"]);
+                }
+                let (icon, tip): (IconFn, &str) = if pl.pause { (icon_play, "Play") } else { (icon_pause, "Pause") };
+                if icon_button(ui, 34.0, &t(tip), icon).clicked() {
+                    cmds.push("toggle-pause".into());
+                }
+                if icon_button(ui, 34.0, &t("Next"), icon_next).clicked() {
+                    mpv.command(&["playlist-next"]);
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if icon_button(ui, 26.0, &t("Exit Music Mode"), icon_pip).clicked() {
+                        cmds.push("toggle-music-mode".into());
+                    }
+                    let tip = if st.music_playlist { "Hide Playlist" } else { "Show Playlist" };
+                    if icon_button(ui, 26.0, &t(tip), icon_playlist).clicked() {
+                        cmds.push("music-playlist".into());
+                    }
+                });
+            });
+            if st.music_playlist {
+                ui.separator();
+                scroll_v(ui, "music-list", Some(MUSIC_LIST_H - 16.0), true, |ui| playlist_tab(ui, pl, mpv, cmds));
+            }
+        });
+}
+
 fn title_bar(ctx: &egui::Context, pl: &Player, alpha: f32) {
     let max_w = ctx.screen_rect().width() - 80.0;
     egui::Area::new(egui::Id::new("title"))
@@ -890,21 +1012,32 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
     let screen = ctx.screen_rect();
     let sidebar_w = if st.sidebar.is_some() { 340.0 } else { 0.0 };
     let avail = (screen.width() - sidebar_w - 24.0).max(200.0);
-    let width = avail.min(560.0);
+    // IINA's controller layouts: floating HUD, or a bar along the top/bottom.
+    let bar = if st.pip { "" } else { st.settings.osc_position.as_str() };
+    let (is_bar, at_top) = (bar == "top" || bar == "bottom", bar == "top");
+    let width = if is_bar { screen.width() - sidebar_w } else { avail.min(560.0) };
     let compact = st.pip || screen.height() < 160.0;
     let mut hover: Option<BarHover> = None;
     // Filled inside the controller's closures, applied afterwards.
     let mut ctl_cmds: Vec<String> = Vec::new();
     let vol_rect: std::cell::Cell<Option<Rect>> = std::cell::Cell::new(None);
 
+    let x_off = if is_rtl() { sidebar_w / 2.0 } else { -sidebar_w / 2.0 };
+    let (align, y_off) = if at_top {
+        (Align2::CENTER_TOP, 0.0)
+    } else if is_bar {
+        (Align2::CENTER_BOTTOM, 0.0)
+    } else {
+        (Align2::CENTER_BOTTOM, if compact { -6.0 } else { -22.0 })
+    };
     let area = egui::Area::new(egui::Id::new("osc"))
-        .anchor(Align2::CENTER_BOTTOM, vec2(if is_rtl() { sidebar_w / 2.0 } else { -sidebar_w / 2.0 }, if compact { -6.0 } else { -22.0 }))
+        .anchor(align, vec2(x_off, y_off))
         .show(ctx, |ui| {
             ui.multiply_opacity(alpha);
             egui::Frame::new()
                 .fill(HUD_BG)
-                .corner_radius(12)
-                .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(18)))
+                .corner_radius(if is_bar { 0 } else { 12 })
+                .stroke(if is_bar { Stroke::NONE } else { Stroke::new(1.0_f32, Color32::from_white_alpha(18)) })
                 .inner_margin(egui::Margin::symmetric(14, 8))
                 .show(ui, |ui| {
                     ui.set_width(width - 28.0);
@@ -1026,8 +1159,13 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
     cmds.extend(ctl_cmds);
     st.volume_bar_rect = vol_rect.get();
     if let Some(mut h) = hover {
-        // Float the preview above the whole controller, like IINA.
-        h.anchor.y = area.response.rect.top();
+        // Float the preview above (or under, for a top bar) the controller.
+        if at_top {
+            h.below = true;
+            h.anchor.y = area.response.rect.bottom();
+        } else {
+            h.anchor.y = area.response.rect.top();
+        }
         seek_preview(ctx, st, pl, thumbs, &h);
     }
 }
@@ -1040,6 +1178,7 @@ fn welcome(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
             .inner_margin(egui::Margin::same(24))
             .show(ui, |ui| {
                 ui.set_width(560.0_f32.min(ctx.screen_rect().width() - 40.0));
+                tools::update_notice(ui, st);
                 ui.horizontal_top(|ui| {
                     ui.allocate_ui_with_layout(vec2(190.0, 0.0), Layout::top_down_justified(Align::Center), |ui| {
                         ui.add(egui::Image::new(egui::include_image!("../assets/iina-rs.png")).fit_to_exact_size(vec2(110.0, 110.0)));
@@ -1479,6 +1618,9 @@ fn context_menu(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut V
                 }
                 ui.separator();
                 item(ui, "Inspector", "Ctrl+I", "inspector");
+                item(ui, "Filters…", "", "filters");
+                item(ui, "Key Bindings…", "", "keybindings");
+                item(ui, "Logs", "", "logs");
                 item(ui, "Playback History", "Ctrl+H", "history");
                 item(ui, "Preferences…", "Ctrl+,", "preferences");
                 item(ui, "About IINA-RS", "", "about");
@@ -1734,6 +1876,8 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     check(ui, &mut s.pause_on_open, t("Pause when a file opens"));
                     check(ui, &mut s.fullscreen_on_open, t("Enter fullscreen when a file opens"));
                     check(ui, &mut s.prevent_sleep, t("Keep the display awake during playback"));
+                    check(ui, &mut s.pause_minimized, t("Pause when minimized, resume when restored"));
+                    check(ui, &mut s.auto_music_mode, t("Switch to music mode for audio files"));
                     section(ui, "Window");
                     check(ui, &mut s.resize_to_video, t("Resize window to video size when opening a file"));
                     if s.resize_to_video {
@@ -1746,7 +1890,9 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                         });
                     }
                     check(ui, &mut s.single_instance, t("Open files in the running window (single instance)"));
+                    check(ui, &mut s.blackout_monitors, t("Black out other displays in fullscreen"));
                     section(ui, "On-screen controller");
+                    choice(ui, "osc-pos", "Position", &mut s.osc_position, &[("floating", "Floating"), ("bottom", "Bar at the bottom"), ("top", "Bar at the top")]);
                     check(ui, &mut s.osc_autohide, t("Hide the controller automatically"));
                     if s.osc_autohide {
                         field(ui, "Hide controller after", |ui| {
@@ -1783,6 +1929,10 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     choice(ui, "shot-fmt", "Format", &mut s.screenshot_format, &[("png", "PNG"), ("jpg", "JPEG"), ("webp", "WebP"), ("jxl", "JPEG XL"), ("avif", "AVIF")]);
                     text_field(ui, "File name template", &mut s.screenshot_template, "%F-%n");
                     check(ui, &mut s.screenshot_with_subs, t("Include subtitles"));
+                    check(ui, &mut s.screenshot_clipboard, t("Copy to the clipboard"));
+                    check(ui, &mut s.screenshot_preview, t("Show a preview after taking a screenshot"));
+                    section(ui, "Updates");
+                    check(ui, &mut s.check_updates, t("Check for updates automatically (once a day, GitHub)"));
                     section(ui, "System");
                     row_wrapped(ui, |ui| {
                         if cfg!(windows) {
@@ -1928,6 +2078,10 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                         });
                     }
                     ui.add_space(4.0);
+                    section(ui, "Keyboard");
+                    if ui.button(t("Edit Key Bindings…")).clicked() {
+                        cmds.push("keybindings".into());
+                    }
                     ui.label(RichText::new(t("Key bindings: input.conf in the settings folder (IINA / mpv format).")).size(11.0).color(FG_DIM));
                 }
                 // ----------------------------------------------------- Advanced
@@ -1954,7 +2108,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
     st.show_prefs = open;
 }
 
-fn about(ctx: &egui::Context, st: &mut UiState) {
+fn about(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
     let mut open = st.show_about;
     let mut header_close = false;
     egui::Window::new(t("About IINA-RS"))
@@ -1981,7 +2135,9 @@ fn about(ctx: &egui::Context, st: &mut UiState) {
                 ui.add_space(6.0);
                 ui.hyperlink_to(t("IINA (GPLv3)"), "https://github.com/iina/iina");
                 ui.hyperlink_to(t("mpv"), "https://mpv.io");
+                ui.add_space(6.0);
             });
+            tools::update_status_line(ui, st, cmds);
         }));
     if header_close {
         open = false;

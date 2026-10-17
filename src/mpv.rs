@@ -17,6 +17,7 @@ pub const FORMAT_DOUBLE: c_int = 5;
 
 pub const EVENT_NONE: c_int = 0;
 pub const EVENT_SHUTDOWN: c_int = 1;
+pub const EVENT_LOG_MESSAGE: c_int = 2;
 pub const EVENT_START_FILE: c_int = 6;
 pub const EVENT_END_FILE: c_int = 7;
 pub const EVENT_FILE_LOADED: c_int = 8;
@@ -49,6 +50,14 @@ struct RawEventProperty {
     name: *const c_char,
     format: c_int,
     data: *mut c_void,
+}
+
+#[repr(C)]
+struct RawLogMessage {
+    prefix: *const c_char,
+    level: *const c_char,
+    text: *const c_char,
+    log_level: c_int,
 }
 
 #[repr(C)]
@@ -95,6 +104,7 @@ struct Api {
     free: unsafe extern "C" fn(*mut c_void),
     hook_add: unsafe extern "C" fn(*mut mpv_handle, u64, *const c_char, c_int) -> c_int,
     hook_continue: unsafe extern "C" fn(*mut mpv_handle, u64) -> c_int,
+    request_log_messages: unsafe extern "C" fn(*mut mpv_handle, *const c_char) -> c_int,
     error_string: unsafe extern "C" fn(c_int) -> *const c_char,
     render_context_create:
         unsafe extern "C" fn(*mut *mut mpv_render_context, *mut mpv_handle, *mut RenderParam) -> c_int,
@@ -167,6 +177,7 @@ impl Api {
             free: sym!("mpv_free"),
             hook_add: sym!("mpv_hook_add"),
             hook_continue: sym!("mpv_hook_continue"),
+            request_log_messages: sym!("mpv_request_log_messages"),
             error_string: sym!("mpv_error_string"),
             render_context_create: sym!("mpv_render_context_create"),
             render_context_set_update_callback: sym!("mpv_render_context_set_update_callback"),
@@ -199,6 +210,8 @@ pub enum Event {
     Seek,
     /// A hook registered with `hook_add`; call `hook_continue(id)` when done.
     Hook(String, u64),
+    /// A log line (after `request_log_messages`): prefix, level, text.
+    Log(String, String, String),
     Property(String, PropValue),
     Other,
 }
@@ -323,6 +336,12 @@ impl Mpv {
         unsafe { (self.api.hook_continue)(self.handle, id) };
     }
 
+    /// Delivers mpv's log lines at `level` and above as `Event::Log`.
+    pub fn request_log_messages(&self, level: &str) {
+        let l = cstr(level);
+        unsafe { (self.api.request_log_messages)(self.handle, l.as_ptr()) };
+    }
+
     pub fn set_wakeup_callback(&mut self, f: impl Fn() + Send + Sync + 'static) {
         let b: Box<Box<dyn Fn() + Send + Sync>> = Box::new(Box::new(f));
         let ctx = &*b as *const _ as *mut c_void;
@@ -340,6 +359,11 @@ impl Mpv {
             EVENT_VIDEO_RECONFIG => Event::VideoReconfig,
             EVENT_PLAYBACK_RESTART => Event::PlaybackRestart,
             EVENT_SEEK => Event::Seek,
+            EVENT_LOG_MESSAGE => {
+                let m = unsafe { &*(ev.data as *const RawLogMessage) };
+                let s = |p: *const c_char| if p.is_null() { String::new() } else { unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned() };
+                Event::Log(s(m.prefix), s(m.level), s(m.text).trim_end().to_string())
+            }
             EVENT_HOOK => {
                 let h = unsafe { &*(ev.data as *const RawEventHook) };
                 Event::Hook(unsafe { CStr::from_ptr(h.name) }.to_string_lossy().into_owned(), h.id)

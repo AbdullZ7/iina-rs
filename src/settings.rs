@@ -22,6 +22,16 @@ pub struct Settings {
     pub fullscreen_on_open: bool,
     /// Keep the display awake while video plays (IINA: on).
     pub prevent_sleep: bool,
+    /// Pause when the window is minimized, resume when it's restored.
+    pub pause_minimized: bool,
+    /// Black out the other monitors while in fullscreen (IINA: off).
+    pub blackout_monitors: bool,
+    /// Switch to music mode for audio files (IINA: on).
+    pub auto_music_mode: bool,
+    /// Check GitHub for a newer release once a day.
+    pub check_updates: bool,
+    /// Unix time of the last update check.
+    pub last_update_check: u64,
     /// Interface language: "auto" (system), "en" or "ar".
     pub language: String,
 
@@ -32,6 +42,8 @@ pub struct Settings {
     pub thumbnail_width: f32,
     /// Auto-hide the on-screen controller (IINA: on).
     pub osc_autohide: bool,
+    /// Controller layout: "floating", "top" or "bottom" (IINA's OSC position).
+    pub osc_position: String,
     /// Seconds of inactivity before the on-screen controller hides.
     pub osc_hide_secs: f32,
     /// Show remaining time instead of total duration.
@@ -71,6 +83,12 @@ pub struct Settings {
     pub screenshot_format: String,
     pub screenshot_template: String,
     pub screenshot_with_subs: bool,
+    /// Also copy screenshots to the clipboard.
+    pub screenshot_clipboard: bool,
+    /// Show a small preview of the screenshot just taken.
+    pub screenshot_preview: bool,
+    /// User filters from the Filters window (IINA's saved filters).
+    pub saved_filters: Vec<SavedFilter>,
 
     // ---------------------------------------------------------------- control
     /// What the controller's ⏪ ⏩ buttons do: "speed" (IINA), "playlist" or "seek".
@@ -120,6 +138,28 @@ pub struct Settings {
 
     /// Last Picture-in-Picture window (x, y, width, height in physical pixels).
     pub pip_rect: Option<[i32; 4]>,
+}
+
+/// A saved video/audio filter (mpv `vf`/`af` syntax), toggled from the
+/// Filters window.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct SavedFilter {
+    pub name: String,
+    /// "vf" or "af".
+    pub kind: String,
+    pub value: String,
+}
+
+impl SavedFilter {
+    /// mpv label used while the filter is active.
+    pub fn label(&self) -> String {
+        let mut h: u32 = 0x811c9dc5;
+        for b in self.kind.bytes().chain(self.value.bytes()) {
+            h = (h ^ b as u32).wrapping_mul(0x01000193);
+        }
+        format!("iina-user-{h:08x}")
+    }
 }
 
 /// Subtitle preferences (PotPlayer-style), applied as mpv options.
@@ -218,11 +258,17 @@ impl Default for Settings {
             pause_on_open: false,
             fullscreen_on_open: false,
             prevent_sleep: true,
+            pause_minimized: false,
+            blackout_monitors: false,
+            auto_music_mode: true,
+            check_updates: true,
+            last_update_check: 0,
             language: "auto".into(),
 
             thumbnails: true,
             thumbnail_width: 0.0,
             osc_autohide: true,
+            osc_position: "floating".into(),
             osc_hide_secs: 2.5,
             show_remaining: false,
             osd_enabled: true,
@@ -250,6 +296,9 @@ impl Default for Settings {
             screenshot_format: "png".into(),
             screenshot_template: "%F-%n".into(),
             screenshot_with_subs: true,
+            screenshot_clipboard: false,
+            screenshot_preview: true,
+            saved_filters: Vec::new(),
 
             arrow_action: "speed".into(),
             arrow_seek_step: 10.0,

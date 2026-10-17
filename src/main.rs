@@ -11,12 +11,14 @@ mod history;
 mod i18n;
 mod instance;
 mod keys;
+mod media_keys;
 mod mpv;
 mod settings;
 mod state;
 mod sub_finder;
 mod subtitles;
 mod thumbs;
+mod update;
 mod ui;
 mod vk_present;
 
@@ -50,6 +52,29 @@ enum UserEvent {
     /// Files handed over by a second instance.
     OpenPaths(Vec<String>),
     Repaint(Duration),
+    /// System media controls (media keys, SMTC / MPRIS / Now Playing).
+    Media(media_keys::MediaCmd),
+    UpdateChecked,
+}
+
+/// A black window covering another monitor while in fullscreen.
+struct Blackout {
+    window: Arc<Window>,
+    surface: softbuffer::Surface<Arc<Window>, Arc<Window>>,
+    _context: softbuffer::Context<Arc<Window>>,
+}
+
+impl Blackout {
+    fn paint(&mut self) {
+        let size = self.window.inner_size();
+        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
+        if self.surface.resize(w, h).is_ok() {
+            if let Ok(mut buf) = self.surface.buffer_mut() {
+                buf.fill(0);
+                let _ = buf.present();
+            }
+        }
+    }
 }
 
 struct Gfx {
@@ -118,6 +143,18 @@ struct App {
     save_settings_at: Option<Instant>,
     /// A resize cursor is shown on a PiP window edge.
     pip_cursor_set: bool,
+    media: Option<media_keys::Media>,
+    /// Send the playback position to the system controls (after seeks).
+    media_sync: bool,
+    /// Music mode was entered automatically for an audio file.
+    auto_music: bool,
+    /// Paused because the window was minimized (resume on restore).
+    minimized_paused: bool,
+    /// Latest minimized state seen in a window event (applied in about_to_wait).
+    minimized_state: Option<bool>,
+    blackout: Vec<Blackout>,
+    /// A screenshot was requested at this time (preview / clipboard pending).
+    shot_pending: Option<(Instant, std::time::SystemTime)>,
     /// The PiP window moved/resized: remember its rect (in about_to_wait).
     pip_moved: bool,
     /// The window has been centred once (later resizes keep its centre).
@@ -200,6 +237,8 @@ impl App {
         state::observe_all(&mpv);
         // Subfolder subtitles are added while the file loads (see on_load).
         mpv.hook_add("on_load", 50);
+        // For the Logs window.
+        mpv.request_log_messages("info");
         let p = proxy.clone();
         mpv.set_wakeup_callback(move || {
             let _ = p.send_event(UserEvent::MpvEvents);
@@ -243,6 +282,13 @@ impl App {
             click_pause_at: None,
             save_settings_at: None,
             pip_cursor_set: false,
+            media: None,
+            media_sync: false,
+            auto_music: false,
+            minimized_paused: false,
+            minimized_state: None,
+            blackout: Vec::new(),
+            shot_pending: None,
             pip_moved: false,
             window_centred: false,
             keep_awake: false,
@@ -443,6 +489,11 @@ impl App {
     }
 
     fn after_window_created(&mut self) {
+        self.start_media_controls();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if self.ui.settings.check_updates && now.saturating_sub(self.ui.settings.last_update_check) > 24 * 3600 && std::env::var_os("IINA_RS_SNAPSHOT").is_none() {
+            self.check_updates();
+        }
         if self.player.fullscreen {
             self.apply_fullscreen();
         }
@@ -583,7 +634,10 @@ impl App {
             "sub-panel" => self.ui.toggle_tab(Tab::Subtitles),
             "toggle-fullscreen" => self.mpv.command(&["cycle", "fullscreen"]),
             "toggle-pip" => self.toggle_pip(),
-            "toggle-music-mode" => self.toggle_music_mode(),
+            "toggle-music-mode" => {
+                self.auto_music = false;
+                self.toggle_music_mode();
+            }
             "fit-to-screen" => {
                 if let Some(w) = self.window() {
                     w.set_maximized(!w.is_maximized());
@@ -596,6 +650,30 @@ impl App {
                 reveal(&p);
             }
             "reveal" => reveal(arg),
+            "open-external" => open_external(arg),
+            "minimize" => {
+                if let Some(w) = self.window() {
+                    w.set_minimized(true);
+                }
+            }
+            "copy-image" => {
+                if copy_image_to_clipboard(Path::new(arg)) {
+                    self.ui.show_osd(i18n::tl("Screenshot copied to clipboard"), None);
+                }
+            }
+            "keybindings" => {
+                self.ui.key_editor = Some(ui::KeyEditor { rows: self.bindings.rows(), filter: String::new(), capture: None, dirty: false });
+            }
+            "keybindings-save" => self.save_key_bindings(),
+            "filters" => self.ui.show_filters = !self.ui.show_filters,
+            "logs" => self.ui.show_logs = !self.ui.show_logs,
+            "check-updates" => self.check_updates(),
+            "music-playlist" => {
+                self.ui.music_playlist = !self.ui.music_playlist;
+                if self.ui.music_mode {
+                    self.music_layout();
+                }
+            }
             "about" => self.ui.show_about = true,
             // Debug aid: open the context menu at the window center.
             "ctx-menu" => {
@@ -873,6 +951,7 @@ impl App {
     fn toggle_music_mode(&mut self) {
         if self.ui.music_mode {
             self.ui.music_mode = false;
+            self.mpv.set_string("video-margin-ratio-bottom", "0");
             self.restore_geometry();
             return;
         }
@@ -888,8 +967,243 @@ impl App {
             self.save_geometry();
         }
         self.ui.music_mode = true;
+        self.ui.sidebar = None;
         if let Some(w) = self.window() {
-            let _ = w.request_inner_size(LogicalSize::new(480.0, 270.0));
+            if w.is_maximized() {
+                w.set_maximized(false);
+            }
+        }
+        self.music_layout();
+    }
+
+    /// Music mode window: cover art (or the video) on top, mpv keeps it
+    /// above the controls through a bottom margin.
+    fn music_layout(&mut self) {
+        let Some(w) = self.window().cloned() else { return };
+        let has_picture = self.player.tracks.iter().any(|t| t.kind == "video" && t.selected);
+        let (vw, vh) = (
+            self.mpv.get_string("dwidth").and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0),
+            self.mpv.get_string("dheight").and_then(|s| s.parse::<f64>().ok()).unwrap_or(1.0),
+        );
+        let width = ui::MUSIC_WIDTH as f64;
+        let art = if has_picture { (width * vh.max(1.0) / vw.max(1.0)).min(width) } else { 0.0 };
+        let controls = ui::MUSIC_PANEL_H as f64 + if self.ui.music_playlist { ui::MUSIC_LIST_H as f64 } else { 0.0 };
+        let total = art + controls;
+        let _ = w.request_inner_size(LogicalSize::new(width, total));
+        self.mpv.set_string("video-margin-ratio-bottom", &format!("{:.4}", controls / total));
+    }
+
+    /// IINA switches to music mode for audio files (and back for videos).
+    fn check_auto_music(&mut self) {
+        if self.player.tracks.is_empty() || self.player.idle {
+            return;
+        }
+        if self.ui.music_mode {
+            if self.auto_music && !self.player.is_audio_only() {
+                self.auto_music = false;
+                self.toggle_music_mode();
+            } else {
+                self.music_layout();
+            }
+        } else if self.ui.settings.auto_music_mode && !self.ui.pip && !self.player.fullscreen && self.player.is_audio_only() {
+            self.toggle_music_mode();
+            self.auto_music = true;
+        }
+    }
+
+    // ---------------------------------------------------- system media keys
+
+    fn start_media_controls(&mut self) {
+        if std::env::var_os("IINA_RS_SNAPSHOT").is_some() || self.media.is_some() {
+            return;
+        }
+        #[allow(unused_mut)]
+        let mut hwnd = None;
+        #[cfg(windows)]
+        if let Some(w) = self.window() {
+            if let Ok(h) = w.window_handle() {
+                if let winit::raw_window_handle::RawWindowHandle::Win32(h) = h.as_raw() {
+                    hwnd = Some(h.hwnd.get() as *mut std::ffi::c_void);
+                }
+            }
+        }
+        if cfg!(windows) && hwnd.is_none() {
+            return;
+        }
+        let p = self.proxy.clone();
+        self.media = media_keys::Media::new(hwnd, move |cmd| {
+            let _ = p.send_event(UserEvent::Media(cmd));
+        });
+        self.media_sync = true;
+    }
+
+    fn update_media(&mut self) {
+        let Some(m) = self.media.as_mut() else { return };
+        let now = media_keys::NowPlaying {
+            title: self.player.title.clone(),
+            artist: self.player.artist.clone(),
+            album: self.player.album.clone(),
+            duration: (self.player.duration * 10.0).round() / 10.0,
+            idle: self.player.idle,
+            paused: self.player.pause,
+        };
+        m.update(&now, self.player.time_pos, std::mem::take(&mut self.media_sync));
+    }
+
+    fn media_command(&mut self, cmd: media_keys::MediaCmd) {
+        use media_keys::MediaCmd::*;
+        match cmd {
+            Play => self.mpv.set_flag("pause", false),
+            Pause => self.mpv.set_flag("pause", true),
+            Toggle => self.toggle_pause(),
+            Next => self.mpv.command(&["playlist-next"]),
+            Previous => self.mpv.command(&["playlist-prev"]),
+            Stop => self.run_app_command("close-file"),
+            SeekBy(s) => self.mpv.command(&["seek", &format!("{s:.3}"), "relative"]),
+            SetPosition(p) => self.mpv.command(&["seek", &format!("{p:.3}"), "absolute"]),
+            Raise => {
+                if let Some(w) = self.window() {
+                    w.set_minimized(false);
+                    w.focus_window();
+                }
+            }
+            Quit => self.mpv.command(&["quit"]),
+        }
+        self.media_sync = true;
+        self.redraw();
+    }
+
+    // ------------------------------------------------------------- updates
+
+    fn check_updates(&mut self) {
+        self.ui.settings.last_update_check = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        self.save_settings_at = Some(Instant::now() + Duration::from_secs(2));
+        let p = self.proxy.clone();
+        update::check(self.ui.update.clone(), move || {
+            let _ = p.send_event(UserEvent::UpdateChecked);
+        });
+    }
+
+    // ------------------------------------------------------------- minimize
+
+    fn on_minimized(&mut self, minimized: bool) {
+        if minimized {
+            if self.ui.settings.pause_minimized && !self.player.pause && !self.player.idle && !self.ui.pip {
+                self.mpv.set_flag("pause", true);
+                self.minimized_paused = true;
+            }
+        } else if std::mem::take(&mut self.minimized_paused) {
+            self.mpv.set_flag("pause", false);
+        }
+    }
+
+    // -------------------------------------------------------------- blackout
+
+    fn update_blackout(&mut self, el: &ActiveEventLoop) {
+        let want = self.ui.settings.blackout_monitors && self.player.fullscreen && !self.ui.pip;
+        if !want {
+            self.blackout.clear();
+            return;
+        }
+        if !self.blackout.is_empty() {
+            return;
+        }
+        let Some(main) = self.window().cloned() else { return };
+        let current = main.current_monitor();
+        for mon in el.available_monitors() {
+            if current.as_ref().is_some_and(|c| c.position() == mon.position() && c.size() == mon.size()) {
+                continue;
+            }
+            #[allow(unused_mut)]
+            let mut attrs = WindowAttributes::default()
+                .with_title("IINA-RS")
+                .with_decorations(false)
+                .with_active(false)
+                .with_position(mon.position())
+                .with_inner_size(mon.size());
+            #[cfg(windows)]
+            {
+                use winit::platform::windows::WindowAttributesExtWindows;
+                attrs = attrs.with_skip_taskbar(true);
+            }
+            let Ok(window) = el.create_window(attrs) else { continue };
+            let window = Arc::new(window);
+            let Ok(context) = softbuffer::Context::new(window.clone()) else { continue };
+            let Ok(surface) = softbuffer::Surface::new(&context, window.clone()) else { continue };
+            let mut b = Blackout { window, surface, _context: context };
+            b.paint();
+            self.blackout.push(b);
+        }
+        if !self.blackout.is_empty() {
+            main.focus_window();
+        }
+    }
+
+    // ------------------------------------------------------------ screenshots
+
+    /// After a screenshot: find the new file, copy it / show its preview.
+    fn poll_screenshot(&mut self) {
+        let Some((asked, since)) = self.shot_pending else { return };
+        if asked.elapsed() > Duration::from_secs(5) {
+            self.shot_pending = None;
+            return;
+        }
+        let dir = PathBuf::from(&self.ui.settings.screenshot_dir);
+        let newest = std::fs::read_dir(&dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let m = e.metadata().ok()?.modified().ok()?;
+                (m + Duration::from_secs(1) >= since && e.path().is_file()).then(|| (m, e.path()))
+            })
+            .max_by_key(|(m, _)| *m)
+            .map(|(_, p)| p);
+        let image = newest.as_ref().and_then(|p| image::open(p).ok());
+        let (Some(path), Some(image)) = (newest, image) else {
+            // Not written (or not decodable) yet: look again shortly.
+            let t = Instant::now() + Duration::from_millis(150);
+            if self.repaint_at.is_none_or(|r| t < r) {
+                self.repaint_at = Some(t);
+            }
+            return;
+        };
+        self.shot_pending = None;
+        let rgba = image.to_rgba8();
+        let mut copied = false;
+        if self.ui.settings.screenshot_clipboard {
+            copied = copy_rgba_to_clipboard(&rgba);
+            if copied && !self.ui.settings.screenshot_preview {
+                self.ui.show_osd(i18n::tl("Screenshot copied to clipboard"), None);
+            }
+        }
+        if self.ui.settings.screenshot_preview {
+            if let Some(g) = self.gfx.as_ref() {
+                let small = image::imageops::thumbnail(&rgba, 440, (440 * rgba.height() / rgba.width().max(1)).max(1));
+                let img = egui::ColorImage::from_rgba_unmultiplied([small.width() as usize, small.height() as usize], small.as_raw());
+                let tex = g.egui.egui_ctx.load_texture("shot-preview", img, egui::TextureOptions::LINEAR);
+                self.ui.shot_preview = Some(ui::ShotPreview { path, tex, copied, at: Instant::now() });
+            }
+        }
+        self.redraw();
+    }
+
+    fn save_key_bindings(&mut self) {
+        let Some(ed) = self.ui.key_editor.as_mut() else { return };
+        let conf = keys::user_conf(&ed.rows);
+        let path = self.config_dir.join("input.conf");
+        if path.exists() {
+            let _ = std::fs::copy(&path, self.config_dir.join("input.conf.bak"));
+        }
+        match std::fs::write(&path, &conf) {
+            Ok(()) => {
+                self.bindings = Bindings::load(Some(conf));
+                ed.rows = self.bindings.rows();
+                ed.dirty = false;
+                self.ui.show_osd(i18n::tl("Key bindings saved"), None);
+            }
+            Err(e) => self.ui.show_osd(format!("input.conf: {e}"), None),
         }
     }
 
@@ -910,7 +1224,17 @@ impl App {
                         self.mpv.hook_continue(id);
                     }
                 }
+                Event::Log(prefix, level, text) => {
+                    if self.ui.logs.len() >= ui::LOG_LIMIT {
+                        self.ui.logs.pop_front();
+                    }
+                    self.ui.logs.push_back(ui::LogLine { level, prefix, text });
+                    if self.ui.show_logs {
+                        self.redraw();
+                    }
+                }
                 Event::Seek => {
+                    self.media_sync = true;
                     // IINA shows the position on every seek (keys, bar, mpv).
                     if self.osd_armed_at.is_some_and(|t| Instant::now() >= t) {
                         self.show_seek_osd();
@@ -960,6 +1284,14 @@ impl App {
                     }
                     let before = (self.player.fullscreen, self.player.ontop, self.player.window_scale);
                     self.player.apply(&name, &value);
+                    if matches!(name.as_str(), "pause" | "idle-active") {
+                        self.media_sync = true;
+                    }
+                    if name == "track-list" {
+                        self.check_auto_music();
+                    } else if name == "vid" && self.ui.music_mode {
+                        self.music_layout();
+                    }
                     self.osd_for_property(&name);
                     if name == "chapter" && std::mem::take(&mut self.osd_chapter) {
                         let n = self.player.chapters.len();
@@ -1290,6 +1622,9 @@ impl App {
         let mode = if self.ui.settings.screenshot_with_subs { "subtitles" } else { "video" };
         self.mpv.command(&["screenshot", mode]);
         self.ui.show_osd(i18n::tl("Screenshot Captured"), None);
+        if self.ui.settings.screenshot_preview || self.ui.settings.screenshot_clipboard {
+            self.shot_pending = Some((Instant::now(), std::time::SystemTime::now()));
+        }
     }
 
     /// Mouse actions from Preferences.
@@ -1751,6 +2086,33 @@ fn reveal(path: &str) {
     }
 }
 
+fn open_external(path: &str) {
+    if path.is_empty() {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer").arg(path).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+fn copy_rgba_to_clipboard(img: &image::RgbaImage) -> bool {
+    let data = arboard::ImageData { width: img.width() as usize, height: img.height() as usize, bytes: std::borrow::Cow::Borrowed(img.as_raw()) };
+    arboard::Clipboard::new().and_then(|mut c| c.set_image(data)).map_err(|e| eprintln!("clipboard: {e}")).is_ok()
+}
+
+fn copy_image_to_clipboard(path: &Path) -> bool {
+    image::open(path).map(|i| copy_rgba_to_clipboard(&i.to_rgba8())).unwrap_or(false)
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.gfx.is_none() {
@@ -1771,6 +2133,8 @@ impl ApplicationHandler<UserEvent> for App {
                     w.focus_window();
                 }
             }
+            UserEvent::Media(cmd) => self.media_command(cmd),
+            UserEvent::UpdateChecked => self.redraw(),
             UserEvent::Repaint(delay) => {
                 if delay.is_zero() {
                     self.redraw();
@@ -1818,6 +2182,12 @@ impl ApplicationHandler<UserEvent> for App {
         if std::mem::take(&mut self.pip_moved) && self.ui.pip {
             self.remember_pip();
         }
+        if let Some(m) = self.minimized_state.take() {
+            self.on_minimized(m);
+        }
+        self.update_media();
+        self.update_blackout(el);
+        self.poll_screenshot();
         if let Some(t) = self.save_settings_at {
             if t <= Instant::now() {
                 self.save_settings_at = None;
@@ -1838,6 +2208,12 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, id: winit::window::WindowId, event: WindowEvent) {
+        if let Some(b) = self.blackout.iter_mut().find(|b| b.window.id() == id) {
+            if matches!(event, WindowEvent::RedrawRequested | WindowEvent::Resized(_)) {
+                b.paint();
+            }
+            return;
+        }
         let Some(gfx) = self.gfx.as_mut() else { return };
         // Only the main window matters (not the hidden GL helper window, nor a
         // window discarded when HDR output wasn't possible).
@@ -1857,10 +2233,15 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Destroyed => el.exit(),
             WindowEvent::Moved(_) if self.ui.pip => self.pip_moved = true,
+            WindowEvent::Occluded(_) => {
+                self.minimized_state = Some(gfx.window.is_minimized() == Some(true));
+            }
             WindowEvent::Resized(size) => {
                 if self.ui.pip {
                     self.pip_moved = true;
                 }
+                // Handled in about_to_wait (gfx is borrowed here).
+                self.minimized_state = Some(size.width == 0 || size.height == 0 || gfx.window.is_minimized() == Some(true));
                 dbg_log(format!("Resized {}x{} win_fs={} mpv_fs={}", size.width, size.height, gfx.window.fullscreen().is_some(), self.player.fullscreen));
                 if let Some(vk) = gfx.vk.as_mut() {
                     if size.width > 0 && size.height > 0 {
@@ -1897,6 +2278,15 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
                 if let Some(spec) = keys::event_to_spec(&event, self.modifiers) {
+                    if ui::capture_key(&mut self.ui, &spec) {
+                        self.redraw();
+                        return;
+                    }
+                    // With system media controls active, media keys arrive
+                    // through them; don't handle them twice.
+                    if self.media.is_some() && matches!(spec.as_str(), "PLAYPAUSE" | "PLAY" | "PAUSE" | "STOP" | "NEXT" | "PREV") {
+                        return;
+                    }
                     match self.bindings.lookup(&spec).cloned() {
                         Some(Binding::Mpv(cmd)) => self.run_mpv_binding(&cmd),
                         Some(Binding::App(cmd)) => self.run_app_command(&cmd),

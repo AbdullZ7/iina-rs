@@ -31,11 +31,16 @@ sys-locale = "0.3.2"
 ash = "0.38"
 ash-window = "0.13"
 trash = "5"
+arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
+softbuffer = "0.4.8"
+
+[target.'cfg(not(windows))'.dependencies]
+souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
 windows-sys = { version = "0.60", features = ["Win32_UI_Shell"] }
-windows = { version = "0.61", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Devices_Display", "Win32_System_Power", "Win32_UI_Input_KeyboardAndMouse"] }
+windows = { version = "0.61", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Devices_Display", "Win32_System_Power", "Win32_UI_Input_KeyboardAndMouse", "Media", "Foundation", "Win32_System_WinRT"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
