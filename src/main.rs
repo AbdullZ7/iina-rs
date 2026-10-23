@@ -16,6 +16,7 @@ mod mpv;
 mod settings;
 mod state;
 mod sub_finder;
+mod sub_preview;
 mod subtitles;
 mod thumbs;
 mod update;
@@ -667,7 +668,11 @@ impl App {
             "keybindings-save" => self.save_key_bindings(),
             "font-dialog" => {
                 if self.ui.font_dialog.is_none() {
-                    self.ui.font_dialog = Some(ui::FontDialog::new(self.ui.settings.subs.clone()));
+                    let p = self.proxy.clone();
+                    let preview = sub_preview::Preview::start(self.config_dir.join("fonts"), move || {
+                        let _ = p.send_event(UserEvent::MpvRender);
+                    });
+                    self.ui.font_dialog = Some(ui::FontDialog::new(self.ui.settings.subs.clone(), preview));
                 }
             }
             "filters" => self.ui.show_filters = !self.ui.show_filters,

@@ -404,11 +404,15 @@ pub struct FontDialog {
     loaded: Option<(std::path::PathBuf, u32)>,
     /// Scroll the family list to the selection once.
     scroll_to_selection: bool,
+    /// libass rendering of the sample (exactly as on the video).
+    preview: crate::sub_preview::Preview,
+    sent: Option<crate::settings::SubStyle>,
+    tex: Option<(u64, egui::TextureHandle)>,
 }
 
 impl FontDialog {
-    pub fn new(before: crate::settings::SubStyle) -> Self {
-        FontDialog { filter: String::new(), before, loaded: None, scroll_to_selection: true }
+    pub fn new(before: crate::settings::SubStyle, preview: crate::sub_preview::Preview) -> Self {
+        FontDialog { filter: String::new(), before, loaded: None, scroll_to_selection: true, preview, sent: None, tex: None }
     }
 }
 
@@ -571,6 +575,24 @@ pub fn font_dialog(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>
         });
         ui.add_space(6.0);
         ui.label(RichText::new(t("Sample")).strong());
+        // libass's own rendering when ready; drawn here meanwhile (or if
+        // the preview player can't start).
+        if dlg.sent.as_ref() != Some(&s) {
+            dlg.preview.show(&s);
+            dlg.sent = Some(s.clone());
+        }
+        {
+            let out = dlg.preview.out.lock().unwrap();
+            if let Some(img) = out.image.as_ref().filter(|_| dlg.tex.as_ref().is_none_or(|(g, _)| *g != out.generation)) {
+                let tex = ui.ctx().load_texture("sub-sample", img.clone(), egui::TextureOptions::LINEAR);
+                dlg.tex = Some((out.generation, tex));
+            }
+        }
+        if let Some((_, tex)) = &dlg.tex {
+            let w = ui.available_width();
+            let size = tex.size_vec2();
+            ui.add(egui::Image::new((tex.id(), vec2(w, w * size.y / size.x))).corner_radius(6));
+        } else {
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 150.0), Sense::hover());
         let painter = ui.painter_at(rect);
         // A video-like backdrop, so outline and shadow read as on screen.
@@ -580,6 +602,7 @@ pub fn font_dialog(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>
         let font = FontId::new(size, egui::FontFamily::Name(PREVIEW_FAMILY.into()));
         sample_text(&painter, pos2(rect.center().x, rect.top() + rect.height() * 0.3), "AaBbYyZz 0123", font.clone(), &s);
         sample_text(&painter, pos2(rect.center().x, rect.top() + rect.height() * 0.72), &v("أبجد هوز حطي كلمن"), font, &s);
+        }
         ui.label(RichText::new(t("The subtitle on the video changes as you choose.")).size(11.0).color(FG_DIM));
         ui.add_space(4.0);
         row(ui, |ui| {
