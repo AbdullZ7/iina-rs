@@ -16,7 +16,7 @@ use egui::{
 use std::time::{Duration, Instant};
 
 mod tools;
-pub use tools::{capture_key, KeyEditor, LogLine, ShotPreview, LOG_LIMIT};
+pub use tools::{capture_key, FontDialog, KeyEditor, LogLine, ShotPreview, LOG_LIMIT};
 
 /// Music mode layout (logical px): controls panel and expanded playlist.
 pub const MUSIC_PANEL_H: f32 = 136.0;
@@ -92,7 +92,6 @@ pub struct UiState {
     pub output_mode: String,
     /// Installed font families (scanned on demand for the font picker).
     pub fonts: crate::fonts::Shared,
-    pub font_filter: String,
     /// Preferences tab: 0 = general, 1 = subtitles.
     pub prefs_tab: u8,
     /// IINA-style on-screen message.
@@ -114,6 +113,7 @@ pub struct UiState {
     pub update: crate::update::Shared,
     /// Music mode shows the playlist under the controls.
     pub music_playlist: bool,
+    pub font_dialog: Option<FontDialog>,
     thumb_path: String,
     thumb_tex: HashMap<usize, egui::TextureHandle>,
 }
@@ -149,7 +149,6 @@ impl UiState {
             volume_bar_rect: None,
             output_mode: String::new(),
             fonts: Default::default(),
-            font_filter: String::new(),
             prefs_tab: 0,
             logs: Default::default(),
             show_logs: false,
@@ -163,6 +162,7 @@ impl UiState {
             shot_preview: None,
             update: crate::update::shared(),
             music_playlist: false,
+            font_dialog: None,
             thumb_path: String::new(),
             thumb_tex: HashMap::new(),
         }
@@ -280,6 +280,10 @@ fn install_fallback_fonts(ctx: &egui::Context) {
             }
         }
     }
+    // The font dialog's sample uses its own family (the chosen font first).
+    let base = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    fonts.families.insert(egui::FontFamily::Name(tools::PREVIEW_FAMILY.into()), base);
+    let _ = tools::BASE_FONTS.set(fonts.clone());
     ctx.set_fonts(fonts);
 }
 
@@ -826,6 +830,7 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
     history_window(ctx, ui_state, hist, &mut cmds);
     subtitle_search(ctx, ui_state, &mut cmds);
     tools::key_bindings(ctx, ui_state, &mut cmds);
+    tools::font_dialog(ctx, ui_state, &mut cmds);
     tools::filters(ctx, ui_state, pl, mpv);
     tools::logs(ctx, ui_state);
     tools::screenshot_preview(ctx, ui_state, &mut cmds);
@@ -1833,9 +1838,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
     let mut open = true;
     let before = st.settings.clone();
     let assoc_status = st.assoc_status.clone();
-    let st_fonts = st.fonts.clone();
     let mut prefs_tab = st.prefs_tab;
-    let mut st_font_filter = std::mem::take(&mut st.font_filter);
     let mut header_close = false;
     egui::Window::new(t("Preferences"))
         .title_bar(!is_rtl())
@@ -2014,7 +2017,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                 }
                 // ---------------------------------------------------- Subtitles
                 2 => {
-                    subtitle_prefs(ui, &mut s.subs, &st_fonts, &mut st_font_filter, cmds);
+                    subtitle_prefs(ui, &mut s.subs, cmds);
                     section(ui, "Online subtitles");
                     grid(ui, "sub-keys", 3, false, vec2(8.0, 4.0), |ui| {
                         ui.label(t("SubDL key"));
@@ -2100,7 +2103,6 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
     if header_close {
         open = false;
     }
-    st.font_filter = st_font_filter;
     st.prefs_tab = prefs_tab;
     if st.settings != before {
         st.settings_dirty = true;
@@ -2323,40 +2325,17 @@ fn subtitle_search(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>
 }
 
 /// PotPlayer-style subtitle preferences.
-fn subtitle_prefs(ui: &mut Ui, s: &mut crate::settings::SubStyle, fonts: &crate::fonts::Shared, filter: &mut String, cmds: &mut Vec<String>) {
+fn subtitle_prefs(ui: &mut Ui, s: &mut crate::settings::SubStyle, cmds: &mut Vec<String>) {
     field(ui, "Preferred languages", |ui| {
         ui.add(egui::TextEdit::singleline(&mut s.languages).desired_width(220.0).hint_text("ar,ara,arabic"));
     });
 
-    // Font picker with search over installed families.
+    // Font: PotPlayer-style dialog with a live preview.
     field(ui, "Font", |ui| {
         let shown = if s.font.is_empty() { t("Default font") } else { v(&s.font) };
-        egui::ComboBox::from_id_salt("sub-font")
-            .selected_text(shown)
-            .width(240.0)
-            .height(320.0)
-            .show_ui(ui, |ui| {
-                if fonts.lock().unwrap().is_none() {
-                    cmds.push("scan-fonts".into());
-                }
-                ui.add(egui::TextEdit::singleline(filter).hint_text(t("Search fonts…")).desired_width(220.0));
-                if ui.selectable_label(s.font.is_empty(), t("Default font")).clicked() {
-                    s.font.clear();
-                }
-                match fonts.lock().unwrap().as_ref() {
-                    None => {
-                        ui.label(RichText::new(t("Loading fonts…")).color(FG_DIM));
-                    }
-                    Some(list) => {
-                        let f = filter.to_lowercase();
-                        for name in list.iter().filter(|n| f.is_empty() || n.to_lowercase().contains(&f)).take(400) {
-                            if ui.selectable_label(&s.font == name, v(name)).clicked() {
-                                s.font = name.clone();
-                            }
-                        }
-                    }
-                }
-            });
+        if ui.add(egui::Button::new(shown).min_size(vec2(240.0, 0.0))).on_hover_text(t("Choose a font…")).clicked() {
+            cmds.push("font-dialog".into());
+        }
         check(ui, &mut s.bold, t("Bold"));
         check(ui, &mut s.italic, t("Italic"));
     });

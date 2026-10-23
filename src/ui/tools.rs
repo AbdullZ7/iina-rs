@@ -390,6 +390,226 @@ pub fn update_status_line(ui: &mut Ui, st: &UiState, cmds: &mut Vec<String>) {
     }
 }
 
+// -------------------------------------------------------------- font dialog
+
+pub const PREVIEW_FAMILY: &str = "sub-preview";
+/// The UI's font set, kept so the sample's font can be swapped in.
+pub static BASE_FONTS: std::sync::OnceLock<egui::FontDefinitions> = std::sync::OnceLock::new();
+
+pub struct FontDialog {
+    pub filter: String,
+    /// Subtitle style when the dialog opened (Cancel restores it).
+    pub before: crate::settings::SubStyle,
+    /// Face currently loaded for the sample: (path, index).
+    loaded: Option<(std::path::PathBuf, u32)>,
+    /// Scroll the family list to the selection once.
+    scroll_to_selection: bool,
+}
+
+impl FontDialog {
+    pub fn new(before: crate::settings::SubStyle) -> Self {
+        FontDialog { filter: String::new(), before, loaded: None, scroll_to_selection: true }
+    }
+}
+
+const SIZES: [f64; 16] = [16.0, 20.0, 24.0, 28.0, 32.0, 36.0, 40.0, 44.0, 48.0, 55.0, 60.0, 66.0, 72.0, 80.0, 96.0, 120.0];
+
+fn style_label(style: &str) -> String {
+    match style.to_lowercase().as_str() {
+        "regular" | "normal" | "book" | "roman" => t("Regular"),
+        "bold" => t("Bold"),
+        "italic" | "oblique" => t("Italic"),
+        "bold italic" | "bold oblique" => t("Bold Italic"),
+        _ => style.to_string(),
+    }
+}
+
+/// Puts the chosen face first in the sample's font family.
+fn load_preview_font(ctx: &egui::Context, face: Option<&crate::fonts::Face>) {
+    let Some(base) = BASE_FONTS.get() else { return };
+    let mut defs = base.clone();
+    if let Some(face) = face {
+        if let Ok(bytes) = std::fs::read(&face.path) {
+            let mut data = egui::FontData::from_owned(bytes);
+            data.index = face.index;
+            defs.font_data.insert("sub-preview-face".into(), std::sync::Arc::new(data));
+            defs.families.entry(egui::FontFamily::Name(PREVIEW_FAMILY.into())).or_default().insert(0, "sub-preview-face".into());
+        }
+    }
+    ctx.set_fonts(defs);
+}
+
+/// Text with outline and shadow, roughly as libass draws it.
+fn sample_text(painter: &Painter, center: Pos2, text: &str, font: FontId, s: &crate::settings::SubStyle) {
+    let c = |c: [u8; 4]| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+    let galley = |color| painter.layout_no_wrap(text.to_string(), font.clone(), color);
+    let main = galley(c(s.color));
+    let origin = center - main.size() / 2.0;
+    let scale = font.size / 40.0;
+    let outline = s.outline_size as f32 * scale;
+    let shadow = s.shadow_offset as f32 * scale;
+    if s.border_style == "outline-and-shadow" {
+        if shadow > 0.0 {
+            painter.galley(origin + vec2(shadow, shadow), galley(c(s.shadow_color)), Color32::WHITE);
+        }
+        if outline > 0.0 {
+            let g = galley(c(s.outline_color));
+            let steps = 16;
+            for i in 0..steps {
+                let a = i as f32 / steps as f32 * std::f32::consts::TAU;
+                painter.galley(origin + vec2(a.cos(), a.sin()) * outline, g.clone(), Color32::WHITE);
+            }
+        }
+    } else {
+        let pad = vec2(outline.max(2.0) + 4.0, outline.max(2.0));
+        painter.rect_filled(Rect::from_min_size(origin - pad, main.size() + pad * 2.0), 2.0, c(s.box_color));
+    }
+    painter.galley(origin, main, Color32::WHITE);
+}
+
+fn column<R>(ui: &mut Ui, width: f32, height: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let align = if is_rtl() { Align::Max } else { Align::Min };
+    ui.allocate_ui_with_layout(vec2(width, height), Layout::top_down(align), |ui| {
+        ui.set_width(width);
+        add(ui)
+    })
+    .inner
+}
+
+fn list<R>(ui: &mut Ui, id: &str, height: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let align = if is_rtl() { Align::Max } else { Align::Min };
+    egui::Frame::new().fill(Color32::from_black_alpha(60)).corner_radius(4).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(id).max_height(height).auto_shrink([false, false]).show(ui, |ui| ui.with_layout(Layout::top_down_justified(align), add).inner).inner
+    })
+    .inner
+}
+
+pub fn font_dialog(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
+    let Some(mut dlg) = st.font_dialog.take() else { return };
+    let mut open = true;
+    let mut done: Option<bool> = None; // Some(true) = OK, Some(false) = Cancel
+    let all = st.fonts.lock().unwrap().clone();
+    if all.is_none() {
+        cmds.push("scan-fonts".into());
+    }
+    let mut s = st.settings.subs.clone();
+
+    // The sample shows the face libass would pick for these flags.
+    let family = all.as_ref().and_then(|l| l.iter().find(|f| f.name.eq_ignore_ascii_case(&s.font)).cloned());
+    let face = family.as_ref().and_then(|f| f.face(s.bold, s.italic)).cloned();
+    let want = face.as_ref().map(|f| (f.path.clone(), f.index));
+    if want != dlg.loaded {
+        load_preview_font(ctx, face.as_ref());
+        dlg.loaded = want;
+        ctx.request_repaint();
+    }
+
+    tool_window(ctx, "Font", &mut open, vec2(640.0, 560.0), |ui| {
+        let list_h = 220.0;
+        row(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            column(ui, 300.0, list_h + 64.0, |ui| {
+                ui.label(RichText::new(t("Font")).strong());
+                ui.add(egui::TextEdit::singleline(&mut dlg.filter).hint_text(t("Search fonts…")).desired_width(300.0));
+                let f = dlg.filter.to_lowercase();
+                // Scroll to the current font once the list has loaded.
+                let scroll = dlg.scroll_to_selection && all.is_some();
+                if scroll {
+                    dlg.scroll_to_selection = false;
+                }
+                list(ui, "font-families", list_h, |ui| {
+                    if f.is_empty() && ui.selectable_label(s.font.is_empty(), t("Default font")).clicked() {
+                        s.font.clear();
+                    }
+                    match &all {
+                        None => {
+                            ui.label(RichText::new(t("Loading fonts…")).color(FG_DIM));
+                        }
+                        Some(fams) => {
+                            for fam in fams.iter().filter(|n| f.is_empty() || n.name.to_lowercase().contains(&f)) {
+                                let sel = fam.name.eq_ignore_ascii_case(&s.font);
+                                let r = ui.selectable_label(sel, &fam.name);
+                                if sel && scroll {
+                                    r.scroll_to_me(Some(Align::Center));
+                                }
+                                if r.clicked() {
+                                    s.font = fam.name.clone();
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+            column(ui, 150.0, list_h + 64.0, |ui| {
+                ui.label(RichText::new(t("Font style")).strong());
+                ui.add_space(ui.spacing().interact_size.y + ui.spacing().item_spacing.y);
+                list(ui, "font-styles", list_h, |ui| {
+                    let faces: Vec<(String, bool, bool)> = match &family {
+                        Some(fam) => fam.faces.iter().map(|f| (f.style.clone(), f.bold, f.italic)).collect(),
+                        None => vec![("Regular".into(), false, false), ("Bold".into(), true, false), ("Italic".into(), false, true), ("Bold Italic".into(), true, true)],
+                    };
+                    for (style, bold, italic) in faces {
+                        let sel = face.as_ref().map_or(s.bold == bold && s.italic == italic, |f| f.style == style);
+                        if ui.selectable_label(sel, style_label(&style)).clicked() {
+                            s.bold = bold;
+                            s.italic = italic;
+                        }
+                    }
+                });
+            });
+            column(ui, 100.0, list_h + 64.0, |ui| {
+                ui.label(RichText::new(t("Size")).strong());
+                ui.add(egui::DragValue::new(&mut s.size).range(8.0..=200.0).speed(0.5).max_decimals(0));
+                list(ui, "font-sizes", list_h, |ui| {
+                    for size in SIZES {
+                        if ui.selectable_label((s.size - size).abs() < 0.5, format!("{size:.0}")).clicked() {
+                            s.size = size;
+                        }
+                    }
+                });
+            });
+        });
+        ui.add_space(6.0);
+        ui.label(RichText::new(t("Sample")).strong());
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 150.0), Sense::hover());
+        let painter = ui.painter_at(rect);
+        // A video-like backdrop, so outline and shadow read as on screen.
+        painter.rect_filled(rect, 6.0, Color32::from_rgb(70, 82, 96));
+        painter.rect_filled(Rect::from_min_max(pos2(rect.left(), rect.center().y), rect.max), 0.0, Color32::from_rgb(40, 44, 50));
+        let size = (s.size as f32 * 0.7).clamp(12.0, 70.0);
+        let font = FontId::new(size, egui::FontFamily::Name(PREVIEW_FAMILY.into()));
+        sample_text(&painter, pos2(rect.center().x, rect.top() + rect.height() * 0.3), "AaBbYyZz 0123", font.clone(), &s);
+        sample_text(&painter, pos2(rect.center().x, rect.top() + rect.height() * 0.72), &v("أبجد هوز حطي كلمن"), font, &s);
+        ui.label(RichText::new(t("The subtitle on the video changes as you choose.")).size(11.0).color(FG_DIM));
+        ui.add_space(4.0);
+        row(ui, |ui| {
+            if ui.button(t("OK")).clicked() {
+                done = Some(true);
+            }
+            if ui.button(t("Cancel")).clicked() {
+                done = Some(false);
+            }
+        });
+    });
+
+    if !open && done.is_none() {
+        done = Some(false); // Closing the window cancels, as in PotPlayer.
+    }
+    if done == Some(false) {
+        s = dlg.before.clone();
+    }
+    if s != st.settings.subs {
+        st.settings.subs = s;
+        st.settings_dirty = true;
+    }
+    if done.is_none() {
+        st.font_dialog = Some(dlg);
+    } else {
+        // Back to the plain UI fonts.
+        load_preview_font(ctx, None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

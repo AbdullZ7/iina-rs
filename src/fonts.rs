@@ -7,7 +7,34 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-pub type Shared = Arc<Mutex<Option<Vec<String>>>>;
+/// One face of a family (e.g. "Bold Italic"), as libass selects it: by
+/// family name plus the bold / italic flags.
+#[derive(Clone, Debug)]
+pub struct Face {
+    pub style: String,
+    pub path: PathBuf,
+    /// Face index inside a .ttc collection.
+    pub index: u32,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Family {
+    pub name: String,
+    pub faces: Vec<Face>,
+}
+
+impl Family {
+    /// The face closest to the bold / italic flags.
+    pub fn face(&self, bold: bool, italic: bool) -> Option<&Face> {
+        self.faces
+            .iter()
+            .min_by_key(|f| (f.bold != bold) as u8 * 2 + (f.italic != italic) as u8 + (!f.style.eq_ignore_ascii_case("regular") && !f.bold && !f.italic) as u8)
+    }
+}
+
+pub type Shared = Arc<Mutex<Option<Vec<Family>>>>;
 
 fn font_dirs() -> Vec<PathBuf> {
     let mut v = Vec::new();
@@ -48,8 +75,9 @@ fn u32_at(b: &[u8], i: usize) -> u32 {
     u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
 }
 
-/// Family names (name ID 1, Windows platform) of a .ttf/.otf/.ttc file.
-pub fn families(path: &Path) -> Vec<String> {
+/// (family, style, face index) of each face in a .ttf/.otf/.ttc file
+/// (name IDs 1 and 2, Windows platform).
+pub fn faces(path: &Path) -> Vec<(String, String, u32)> {
     let Ok(mut f) = File::open(path) else { return vec![] };
     let Some(head) = read_at(&mut f, 0, 12) else { return vec![] };
     let offsets: Vec<u64> = if &head[..4] == b"ttcf" {
@@ -60,17 +88,16 @@ pub fn families(path: &Path) -> Vec<String> {
         vec![0]
     };
     let mut out = Vec::new();
-    for off in offsets {
-        if let Some(name) = family_at(&mut f, off) {
-            if !out.contains(&name) {
-                out.push(name);
-            }
+    for (i, off) in offsets.into_iter().enumerate() {
+        if let Some(name) = name_at(&mut f, off, 1) {
+            let style = name_at(&mut f, off, 2).unwrap_or_else(|| "Regular".into());
+            out.push((name, style, i as u32));
         }
     }
     out
 }
 
-fn family_at(f: &mut File, off: u64) -> Option<String> {
+fn name_at(f: &mut File, off: u64, wanted: u16) -> Option<String> {
     let dir = read_at(f, off, 12)?;
     let ntables = u16_at(&dir, 4) as usize;
     let records = read_at(f, off + 12, ntables.min(512) * 16)?;
@@ -89,7 +116,7 @@ fn family_at(f: &mut File, off: u64) -> Option<String> {
         }
         let (platform, lang, name_id) = (u16_at(&table, r), u16_at(&table, r + 4), u16_at(&table, r + 6));
         let (len, offset) = (u16_at(&table, r + 8) as usize, u16_at(&table, r + 10) as usize);
-        if name_id != 1 || platform != 3 {
+        if name_id != wanted || platform != 3 {
             continue;
         }
         let start = strings + offset;
@@ -108,7 +135,7 @@ fn family_at(f: &mut File, off: u64) -> Option<String> {
     fallback
 }
 
-fn walk(dir: &Path, depth: usize, out: &mut Vec<String>) {
+fn walk(dir: &Path, depth: usize, out: &mut std::collections::HashMap<String, Family>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let p = e.path();
@@ -120,7 +147,14 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<String>) {
         }
         let ext = p.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
         if matches!(ext.as_str(), "ttf" | "otf" | "ttc" | "otc") {
-            out.extend(families(&p));
+            for (name, style, index) in faces(&p) {
+                let low = style.to_lowercase();
+                let face = Face { bold: low.contains("bold"), italic: low.contains("italic") || low.contains("oblique"), style, path: p.clone(), index };
+                let fam = out.entry(name.to_lowercase()).or_insert_with(|| Family { name: name.clone(), faces: Vec::new() });
+                if !fam.faces.iter().any(|f| f.style.eq_ignore_ascii_case(&face.style)) {
+                    fam.faces.push(face);
+                }
+            }
         }
     }
 }
@@ -128,13 +162,16 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<String>) {
 /// Scans installed fonts on a background thread; `wake` runs when done.
 pub fn scan(shared: Shared, extra_dir: PathBuf, wake: impl Fn() + Send + 'static) {
     std::thread::spawn(move || {
-        let mut names = Vec::new();
+        let mut map = std::collections::HashMap::new();
         for d in font_dirs().into_iter().chain(std::iter::once(extra_dir)) {
-            walk(&d, 0, &mut names);
+            walk(&d, 0, &mut map);
         }
-        names.sort_by_key(|n| n.to_lowercase());
-        names.dedup();
-        *shared.lock().unwrap() = Some(names);
+        let mut list: Vec<Family> = map.into_values().collect();
+        for f in &mut list {
+            f.faces.sort_by_key(|f| (f.bold, f.italic, f.style.to_lowercase()));
+        }
+        list.sort_by_key(|f| f.name.to_lowercase());
+        *shared.lock().unwrap() = Some(list);
         wake();
     });
 }

@@ -621,7 +621,7 @@ impl App {
                     self.mpv.command(&["write-watch-later-config"]);
                 }
                 self.mpv.command(&["stop"]);
-                self.ui.show_osd(i18n::tl("Stop"), None);
+                self.ui.show_osd(i18n::tl("Stopped"), None);
             }
             "clear-recent" => {
                 self.ui.recent.clear();
@@ -665,6 +665,11 @@ impl App {
                 self.ui.key_editor = Some(ui::KeyEditor { rows: self.bindings.rows(), filter: String::new(), capture: None, dirty: false });
             }
             "keybindings-save" => self.save_key_bindings(),
+            "font-dialog" => {
+                if self.ui.font_dialog.is_none() {
+                    self.ui.font_dialog = Some(ui::FontDialog::new(self.ui.settings.subs.clone()));
+                }
+            }
             "filters" => self.ui.show_filters = !self.ui.show_filters,
             "logs" => self.ui.show_logs = !self.ui.show_logs,
             "check-updates" => self.check_updates(),
@@ -1772,7 +1777,7 @@ impl App {
         let vmax = self.ui.settings.volume_max.max(100.0);
         match name {
             "pause" => {
-                self.ui.show_osd_ex(tl(if p.pause { "Pause" } else { "Resume" }), ui::OsdDetail::Time(String::new()), ui::OsdBar::None);
+                self.ui.show_osd_ex(tl(if p.pause { "Paused" } else { "Resume" }), ui::OsdDetail::Time(String::new()), ui::OsdBar::None);
                 return;
             }
             "sub-delay" | "audio-delay" => {
@@ -1784,7 +1789,7 @@ impl App {
         }
         let msg: Option<(String, Option<f32>)> = match name {
             "volume" => Some((tlf("Volume: {}", &[&format!("{:.0}", p.volume)]), Some((p.volume / vmax) as f32))),
-            "mute" => Some((tl(if p.mute { "Mute" } else { "Unmute" }), None)),
+            "mute" => Some((tl(if p.mute { "Muted" } else { "Unmuted" }), None)),
             "speed" => Some((tlf("Speed: {}x", &[&trim_num(p.speed)]), None)),
             "sid" => Some((tlf("Subtitle: {}", &[&self.track_desc("sub", &p.sid)]), None)),
             "secondary-sid" => Some((tlf("Secondary Subtitle: {}", &[&self.track_desc("sub", &p.secondary_sid)]), None)),
