@@ -457,6 +457,8 @@ const AR: &[(&str, &str)] = &[
     ("Sample", "عيّنة"),
     ("The subtitle on the video changes as you choose.", "تتغيّر الترجمة على المرئي مع كل اختيار."),
     ("OK", "موافق"),
+    ("Side buttons (4 / 5)", "الزرّان الجانبيان (4 / 5)"),
+    ("Side button step", "خطوة الزرّين الجانبيين"),
     // App messages
     (
         "Registered. Pick IINA-RS under “Open with”, or set it as default in Default apps.",

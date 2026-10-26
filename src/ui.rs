@@ -2073,6 +2073,10 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     let scroll: &[(&str, &str)] = &[("volume", "Volume"), ("seek", "Seek"), ("speed", "Speed"), ("none", "None")];
                     choice(ui, "scrollv", "Vertical scroll", &mut s.scroll_vertical, scroll);
                     choice(ui, "scrollh", "Horizontal scroll", &mut s.scroll_horizontal, scroll);
+                    choice(ui, "side", "Side buttons (4 / 5)", &mut s.side_buttons, &[("seek", "Seek"), ("playlist", "Previous / next file"), ("speed", "Change speed"), ("none", "None")]);
+                    if s.side_buttons == "seek" {
+                        field(ui, "Side button step", |ui| ui.add(egui::DragValue::new(&mut s.side_seek_step).range(1.0..=600.0).speed(1.0).suffix(" s")));
+                    }
                     section(ui, "Controller buttons");
                     choice(ui, "arrows", "⏪ ⏩ buttons", &mut s.arrow_action, &[("speed", "Change speed"), ("playlist", "Previous / next file"), ("seek", "Seek")]);
                     if s.arrow_action == "seek" {

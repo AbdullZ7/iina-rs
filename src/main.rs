@@ -95,6 +95,8 @@ struct VkMode {
     targets: vk_present::GlTargets,
     display: display_info::HdrDisplay,
     video_hdr: Option<bool>,
+    /// Last mpv output target set: (HDR, SDR transfer curve).
+    video_target: Option<(bool, String)>,
 }
 
 const GL_RGBA16F: i32 = 0x881A;
@@ -462,7 +464,7 @@ impl App {
             surface,
             context,
             egui,
-            vk: Some(VkMode { _helper: helper, presenter, targets, display: display_info, video_hdr: None }),
+            vk: Some(VkMode { _helper: helper, presenter, targets, display: display_info, video_hdr: None, video_target: None }),
         })
     }
 
@@ -473,20 +475,27 @@ impl App {
         let gamma = self.mpv.get_string("video-params/gamma").unwrap_or_default();
         // PQ output only on an HDR10 swapchain (not in the SDR test mode).
         let hdr = matches!(gamma.as_str(), "pq" | "hlg") && vk.presenter.hdr;
-        if vk.video_hdr == Some(hdr) {
+        // SDR: mpv outputs the video's own transfer curve unchanged, and the
+        // composite reads it as sRGB, which is how Windows (and players
+        // like PotPlayer) show SDR in HDR mode. Converting BT.1886 (gamma
+        // 2.4) to sRGB instead made shadows ~2.5× darker than elsewhere.
+        let sdr_trc = if gamma.is_empty() || gamma == "auto" { "bt.1886".to_string() } else { gamma.clone() };
+        let key = (hdr, if hdr { String::new() } else { sdr_trc.clone() });
+        if vk.video_target.as_ref() == Some(&key) {
             return;
         }
+        vk.video_target = Some(key);
         vk.video_hdr = Some(hdr);
         if hdr {
             self.mpv.set_string("target-trc", "pq");
             self.mpv.set_string("target-prim", "bt.2020");
             self.mpv.set_string("target-peak", &format!("{:.0}", vk.display.max_nits));
         } else {
-            self.mpv.set_string("target-trc", "srgb");
+            self.mpv.set_string("target-trc", &sdr_trc);
             self.mpv.set_string("target-prim", "bt.709");
             self.mpv.set_string("target-peak", "auto");
         }
-        dbg_log(format!("video {} → mpv target {}", gamma, if hdr { "PQ/BT.2020" } else { "sRGB" }));
+        dbg_log(format!("video {} → mpv target {}", gamma, if hdr { "PQ/BT.2020".to_string() } else { format!("{sdr_trc} (passthrough, shown as sRGB)") }));
     }
 
     fn after_window_created(&mut self) {
@@ -1628,6 +1637,25 @@ impl App {
         }
     }
 
+    /// Mouse buttons 4 / 5 (also sent as the keyboard's Back / Forward keys
+    /// by some mouse drivers).
+    fn side_button(&mut self, forward: bool) {
+        match self.ui.settings.side_buttons.as_str() {
+            "none" => {}
+            "playlist" => self.mpv.command(&[if forward { "playlist-next" } else { "playlist-prev" }]),
+            "speed" => {
+                let speed = self.player.speed;
+                let new = if forward { (speed + 0.25).min(4.0) } else { (speed - 0.25).max(0.25) };
+                self.mpv.set_double("speed", new);
+            }
+            _ => {
+                let step = self.ui.settings.side_seek_step.max(1.0);
+                self.mpv.command(&["seek", &format!("{}", if forward { step } else { -step })]);
+            }
+        }
+        self.redraw();
+    }
+
     fn take_screenshot(&mut self) {
         let mode = if self.ui.settings.screenshot_with_subs { "subtitles" } else { "video" };
         self.mpv.command(&["screenshot", mode]);
@@ -2292,6 +2320,10 @@ impl ApplicationHandler<UserEvent> for App {
                         self.redraw();
                         return;
                     }
+                    if matches!(spec.as_str(), "BROWSER_BACK" | "BROWSER_FORWARD") {
+                        self.side_button(spec == "BROWSER_FORWARD");
+                        return;
+                    }
                     // With system media controls active, media keys arrive
                     // through them; don't handle them twice.
                     if self.media.is_some() && matches!(spec.as_str(), "PLAYPAUSE" | "PLAY" | "PAUSE" | "STOP" | "NEXT" | "PREV") {
@@ -2379,8 +2411,8 @@ impl ApplicationHandler<UserEvent> for App {
                         let a = self.ui.settings.middle_click.clone();
                         self.mouse_action(&a);
                     }
-                    (MouseButton::Back, ElementState::Pressed) => self.mpv.command(&["seek", "-10"]),
-                    (MouseButton::Forward, ElementState::Pressed) => self.mpv.command(&["seek", "10"]),
+                    (MouseButton::Back, ElementState::Pressed) => self.side_button(false),
+                    (MouseButton::Forward, ElementState::Pressed) => self.side_button(true),
                     _ => {}
                 }
                 self.on_activity();

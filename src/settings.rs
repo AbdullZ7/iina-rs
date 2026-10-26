@@ -44,6 +44,11 @@ pub struct Settings {
     pub osc_autohide: bool,
     /// Controller layout: "floating", "top" or "bottom" (IINA's OSC position).
     pub osc_position: String,
+    /// Mouse side buttons (4 = back, 5 = forward): "seek", "playlist",
+    /// "speed" or "none".
+    pub side_buttons: String,
+    /// Seconds per side-button press when they seek.
+    pub side_seek_step: f64,
     /// Seconds of inactivity before the on-screen controller hides.
     pub osc_hide_secs: f32,
     /// Show remaining time instead of total duration.
@@ -269,6 +274,8 @@ impl Default for Settings {
             thumbnail_width: 0.0,
             osc_autohide: true,
             osc_position: "floating".into(),
+            side_buttons: "seek".into(),
+            side_seek_step: 10.0,
             osc_hide_secs: 2.5,
             show_remaining: false,
             osd_enabled: true,

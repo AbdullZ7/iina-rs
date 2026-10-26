@@ -228,6 +228,8 @@ fn named(k: &NamedKey) -> Option<&'static str> {
         AudioVolumeUp => "VOLUME_UP",
         AudioVolumeDown => "VOLUME_DOWN",
         AudioVolumeMute => "MUTE",
+        BrowserBack => "BROWSER_BACK",
+        BrowserForward => "BROWSER_FORWARD",
         F1 => "F1",
         F2 => "F2",
         F3 => "F3",
