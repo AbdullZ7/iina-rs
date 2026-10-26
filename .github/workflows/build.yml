@@ -65,10 +65,15 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      # Release notes: docs/releases/<tag>.md (the release fails without
+      # them, so a version can't go out undescribed).
+      - run: test -s "docs/releases/${GITHUB_REF_NAME}.md"
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          body_path: docs/releases/${{ github.ref_name }}.md
