@@ -149,7 +149,7 @@ pub struct Settings {
     pub pip_rect: Option<[i32; 4]>,
 }
 
-pub const SETTINGS_VERSION: u32 = 1;
+pub const SETTINGS_VERSION: u32 = 2;
 
 /// A saved video/audio filter (mpv `vf`/`af` syntax), toggled from the
 /// Filters window.
@@ -246,7 +246,7 @@ impl Default for SubStyle {
             // Size follows the video (PotPlayer), not the window, so it
             // stays in proportion to the picture in any window shape.
             scale_by_window: false,
-            lift_above_controller: false,
+            lift_above_controller: true,
             encoding: "auto".into(),
             ass_override: "scale".into(),
             autoload: "fuzzy".into(),
@@ -378,6 +378,12 @@ impl Settings {
             }
             s.version = 1;
         }
+        // v2: subtitles glide above the controller again (now only as far
+        // as it covers them, at a constant size).
+        if s.version < 2 {
+            s.subs.lift_above_controller = true;
+            s.version = 2;
+        }
         s
     }
 
@@ -500,7 +506,7 @@ mod tests {
         old["subs"]["scale_by_window"] = true.into();
         std::fs::write(dir.join("settings.json"), old.to_string()).unwrap();
         let s = Settings::load(&dir);
-        assert_eq!((s.middle_click.as_str(), s.volume_max, s.subs.scale_by_window, s.version), ("pause", 150.0, false, 1));
+        assert_eq!((s.middle_click.as_str(), s.volume_max, s.subs.scale_by_window, s.version), ("pause", 150.0, false, SETTINGS_VERSION));
         // A choice the user made is kept.
         old["middle_click"] = "fullscreen".into();
         old["volume_max"] = 200.0.into();

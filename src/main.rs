@@ -132,6 +132,10 @@ struct App {
     cursor: PhysicalPosition<f64>,
     cursor_hidden: bool,
     sub_margin_applied: Option<i64>,
+    /// Subtitle margin while gliding above / back from the controller.
+    sub_margin_cur: Option<f64>,
+    /// Displayed video size (dwidth, dheight), from VideoReconfig.
+    video_dims: Option<(f64, f64)>,
     repaint_at: Option<Instant>,
     /// Debug aid: `IINA_RS_SNAPSHOT=out.png` saves the composited frame after
     /// a few seconds and quits (desktop capture tools often miss GL windows).
@@ -307,6 +311,8 @@ impl App {
             cursor: PhysicalPosition::new(0.0, 0.0),
             cursor_hidden: false,
             sub_margin_applied: None,
+            sub_margin_cur: None,
+            video_dims: None,
             repaint_at: None,
             snapshot: std::env::var("IINA_RS_SNAPSHOT").ok(),
             started: Instant::now(),
@@ -1382,6 +1388,13 @@ impl App {
                     }
                 }
                 Event::VideoReconfig => {
+                    self.video_dims = match (
+                        self.mpv.get_string("dwidth").and_then(|s| s.parse::<f64>().ok()),
+                        self.mpv.get_string("dheight").and_then(|s| s.parse::<f64>().ok()),
+                    ) {
+                        (Some(w), Some(h)) if w > 0.0 && h > 0.0 => Some((w, h)),
+                        _ => None,
+                    };
                     self.update_hdr_target();
                     if self.resize_on_video && self.fit_to_video(1.0) {
                         self.resize_on_video = false;
@@ -1644,18 +1657,38 @@ impl App {
             dbg_log(format!("slow frame: mpv={:?} ui={:?} swap={:?} size={}x{}", t_mpv, t1 - t0 - t_mpv, t_swap, size.width, size.height));
         }
 
-        // Like IINA, lift subtitles above the controller while it is shown.
-        // sub-margin-y is in units of a 720px-tall frame; the bar is ~130pt high.
-        // The user's bottom margin is the base; the controller lifts it further.
-        let lift = self.ui.settings.subs.lift_above_controller && self.ui.osc_visible && !self.player.idle && !self.ui.pip;
+        // Like IINA, keep subtitles clear of the controller while it shows:
+        // lift them only as far as the controller actually covers the
+        // picture (not at all over a wide black bar), gliding there. The
+        // size stays (it follows the video, not the window).
         let base = self.ui.settings.subs.margin;
-        let margin = if lift {
-            let h_pt = size.height as f64 / window.scale_factor();
-            (130.0 / h_pt * 720.0).clamp(22.0, 300.0).max(base)
-        } else {
-            base
+        let mut target = base;
+        if self.ui.settings.subs.lift_above_controller && self.ui.osc_visible && !self.player.idle && !self.ui.pip && !self.ui.music_mode {
+            let osc = gfx.egui.egui_ctx.memory(|m| m.area_rect(egui::Id::new("osc")));
+            if let (Some(osc), Some((vw, vh))) = (osc, self.video_dims) {
+                let ppp = gfx.egui.egui_ctx.pixels_per_point() as f64;
+                let (ww, wh) = (size.width as f64, size.height as f64);
+                // Displayed video height (letterboxed into the window).
+                let shown_h = (ww * vh / vw).min(wh);
+                let bar_px = (wh - shown_h) / 2.0;
+                // Controller's top, from the window bottom, plus a gap.
+                let covered = wh - osc.top() as f64 * ppp + 8.0 * ppp;
+                // sub-margin-y: 720 units = video height; measured from the
+                // window bottom when subtitles may use the black bars.
+                let from = if self.ui.settings.subs.use_margins { 0.0 } else { bar_px };
+                let lift_px = covered - from;
+                if lift_px > 0.0 && shown_h > 0.0 {
+                    target = target.max(lift_px / shown_h * 720.0);
+                }
+            }
         }
-        .round() as i64;
+        let cur = self.sub_margin_cur.unwrap_or(target);
+        let next = if (target - cur).abs() < 0.75 { target } else { cur + (target - cur) * 0.3 };
+        self.sub_margin_cur = Some(next);
+        if next != target {
+            window.request_redraw();
+        }
+        let margin = next.round() as i64;
         if Some(margin) != self.sub_margin_applied {
             self.sub_margin_applied = Some(margin);
             self.mpv.set_string("sub-margin-y", &margin.to_string());
