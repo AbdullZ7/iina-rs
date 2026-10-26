@@ -36,6 +36,9 @@ const RENDER_PARAM_SW_SIZE: c_int = 17;
 const RENDER_PARAM_SW_FORMAT: c_int = 18;
 const RENDER_PARAM_SW_STRIDE: c_int = 19;
 const RENDER_PARAM_SW_POINTER: c_int = 20;
+/// 0: return at once instead of waiting until the frame is due (mpv then
+/// hands frames over at their display time: video-timing-offset=0).
+const RENDER_PARAM_BLOCK_FOR_TARGET_TIME: c_int = 12;
 
 #[repr(C)]
 struct RawEvent {
@@ -491,9 +494,11 @@ impl Mpv {
         }
         let mut fbo = OpenGlFbo { fbo, w, h, internal_format };
         let mut flip: c_int = 1;
+        let mut block: c_int = 0;
         let mut params = [
             RenderParam { kind: RENDER_PARAM_OPENGL_FBO, data: &mut fbo as *mut _ as *mut c_void },
             RenderParam { kind: RENDER_PARAM_FLIP_Y, data: &mut flip as *mut _ as *mut c_void },
+            RenderParam { kind: RENDER_PARAM_BLOCK_FOR_TARGET_TIME, data: &mut block as *mut _ as *mut c_void },
             RenderParam { kind: RENDER_PARAM_INVALID, data: ptr::null_mut() },
         ];
         unsafe { (self.api.render_context_render)(self.render, params.as_mut_ptr()) };

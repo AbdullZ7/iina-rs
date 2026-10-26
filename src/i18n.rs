@@ -465,6 +465,7 @@ const AR: &[(&str, &str)] = &[
     ("Normalize audio (boost quiet parts)", "تسوية الصوت (رفع المقاطع الخافتة)"),
     ("Audio normalization: On", "تسوية الصوت: يعمل"),
     ("Audio normalization: Off", "تسوية الصوت: مغلق"),
+    ("Touchpad: follow the fingers (two fingers up = louder)", "لوحة اللمس: اتباع الأصابع (إصبعان للأعلى = صوت أعلى)"),
     // App messages
     (
         "Registered. Pick IINA-RS under “Open with”, or set it as default in Default apps.",

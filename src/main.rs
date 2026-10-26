@@ -132,6 +132,13 @@ struct App {
     cursor: PhysicalPosition<f64>,
     cursor_hidden: bool,
     sub_margin_applied: Option<i64>,
+    /// Size of the last video frame rendered into the video target; None
+    /// when it must be rendered again (new target, resize).
+    video_valid: Option<(i32, i32)>,
+    /// mpv signalled a new frame that hasn't been rendered yet.
+    video_pending: bool,
+    /// OpenGL mode: offscreen copy of the video frame (fbo, texture, size).
+    gl_video: Option<(u32, u32, i32, i32)>,
     /// Subtitle margin while gliding above / back from the controller.
     sub_margin_cur: Option<f64>,
     /// Displayed video size (dwidth, dheight), from VideoReconfig.
@@ -234,6 +241,9 @@ impl App {
             ("input-builtin-bindings", "no"),
             // mpv's built-in OSD/OSC are replaced by IINA-RS's own UI.
             ("osd-level", "0"),
+            // With the non-blocking render (see render()), frames are handed
+            // over at their display time rather than 50 ms early.
+            ("video-timing-offset", "0"),
             ("osd-bar", "no"),
             ("osd-on-seek", "no"),
             // A-B loops are per file (IINA).
@@ -313,6 +323,9 @@ impl App {
             cursor: PhysicalPosition::new(0.0, 0.0),
             cursor_hidden: false,
             sub_margin_applied: None,
+            video_valid: None,
+            video_pending: false,
+            gl_video: None,
             sub_margin_cur: None,
             video_dims: None,
             repaint_at: None,
@@ -1553,11 +1566,23 @@ impl App {
             return;
         }
         let t0 = Instant::now();
-        self.mpv.render_update();
+        // Only render the video when mpv has a new frame (or the target
+        // changed); UI-only redraws (hovering, the controller) reuse the
+        // last one. Rendering doesn't wait for the frame's display time
+        // (mpv hands frames over on time: video-timing-offset=0); waiting
+        // held every UI redraw for ~30 ms during playback.
+        if self.mpv.render_update() {
+            self.video_pending = true;
+        }
+        let new_frame = self.video_pending;
         if let Some(vk) = gfx.vk.as_mut() {
             let (w, h) = vk.targets.size();
             vk.targets.begin_frame();
-            self.mpv.render(vk.targets.video_fbo as i32, w, h, GL_RGBA16F);
+            if new_frame || self.video_valid != Some((w, h)) {
+                self.mpv.render(vk.targets.video_fbo as i32, w, h, GL_RGBA16F);
+                self.video_valid = Some((w, h));
+                self.video_pending = false;
+            }
             // The UI goes into its own (transparent) texture.
             use glow::HasContext;
             let gl = gfx.egui.painter.gl();
@@ -1569,14 +1594,42 @@ impl App {
                 gl.clear(glow::COLOR_BUFFER_BIT);
             }
         } else {
-            self.mpv.render(0, size.width as i32, size.height as i32, 0);
+            let (w, h) = (size.width as i32, size.height as i32);
+            let gl = gfx.egui.painter.gl().clone();
+            let cache = gl_video_cache(&gl, &mut self.gl_video, w, h);
+            if new_frame || self.video_valid != Some((w, h)) {
+                match cache {
+                    Some(fbo) => self.mpv.render(fbo as i32, w, h, GL_RGBA8),
+                    None => self.mpv.render(0, w, h, 0),
+                }
+                self.video_valid = Some((w, h));
+                self.video_pending = false;
+            }
+            if let Some(fbo) = cache {
+                use glow::HasContext;
+                unsafe {
+                    gl.disable(glow::SCISSOR_TEST);
+                    gl.bind_framebuffer(glow::READ_FRAMEBUFFER, NonZeroU32::new(fbo).map(glow::NativeFramebuffer));
+                    gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
+                    gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                }
+            }
         }
         let t_mpv = t0.elapsed();
+        if std::env::var_os("IINA_RS_FRAME_TIMES").is_some() {
+            eprintln!("[frame] mpv {:.1} ms", t_mpv.as_secs_f64() * 1000.0);
+        }
 
         let window = gfx.window.clone();
         let (player, ui_state, mpv, history) = (&self.player, &mut self.ui, &self.mpv, &self.history);
-        // Debug aid: IINA_RS_HOVER=0.4 hovers the seek bar at 40% (for snapshots).
-        if let (Some(f), Some(r)) = (std::env::var("IINA_RS_HOVER").ok().and_then(|v| v.parse::<f32>().ok()), ui_state.seek_bar_rect) {
+        // Debug aid: IINA_RS_HOVER=0.4 hovers the seek bar at 40% (for
+        // snapshots); IINA_RS_HOVER=sweep moves along it every frame.
+        let hover_f = std::env::var("IINA_RS_HOVER").ok().and_then(|v| if v == "sweep" { Some((self.frames % 240) as f32 / 240.0) } else { v.parse::<f32>().ok() });
+        if hover_f.is_some() && std::env::var("IINA_RS_HOVER").as_deref() == Ok("sweep") {
+            window.request_redraw();
+        }
+        if let (Some(f), Some(r)) = (hover_f, ui_state.seek_bar_rect) {
             ui_state.last_activity = Instant::now();
             let pos = egui::pos2(r.left() + r.width() * f, r.center().y);
             gfx.egui.egui_winit.egui_input_mut().events.push(egui::Event::PointerMoved(pos));
@@ -1650,6 +1703,10 @@ impl App {
             } else {
                 save_snapshot(gfx.egui.painter.gl(), size, path);
             }
+            if std::env::var_os("IINA_RS_FRAME_TIMES").is_some() {
+                let g = |p: &str| self.mpv.get_string(p).unwrap_or_else(|| "-".into());
+                eprintln!("[frames] drops {} delayed {} mistimed {} estimated-fps {}", g("frame-drop-count"), g("vo-delayed-frame-count"), g("mistimed-frame-count"), g("estimated-display-fps"));
+            }
             self.snapshot = None;
             self.mpv.command(&["quit"]);
         }
@@ -1661,7 +1718,7 @@ impl App {
                 Ok(true) => {}
                 Ok(false) => {
                     let s = gfx.window.inner_size();
-                    if let Err(e) = vk.presenter.resize(s.width, s.height).and_then(|_| vk.targets.recreate(&gl, &vk.presenter)) {
+                    if let Err(e) = vk.presenter.resize(s.width, s.height).and_then(|_| vk.targets.recreate(&gl, &vk.presenter)).inspect(|_| self.video_valid = None) {
                         eprintln!("Vulkan resize: {e}");
                     }
                 }
@@ -2250,6 +2307,43 @@ fn trim_num(v: f64) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
+const GL_RGBA8: i32 = 0x8058;
+
+/// The offscreen framebuffer holding the video frame (OpenGL mode), created
+/// or resized as needed. Returns its GL name, or None if unavailable.
+fn gl_video_cache(gl: &glow::Context, cache: &mut Option<(u32, u32, i32, i32)>, w: i32, h: i32) -> Option<u32> {
+    use glow::HasContext;
+    if let Some((fbo, _, cw, ch)) = *cache {
+        if (cw, ch) == (w, h) {
+            return Some(fbo);
+        }
+    }
+    unsafe {
+        if let Some((fbo, tex, _, _)) = cache.take() {
+            gl.delete_framebuffer(glow::NativeFramebuffer(NonZeroU32::new(fbo)?));
+            gl.delete_texture(glow::NativeTexture(NonZeroU32::new(tex)?));
+        }
+        let tex = gl.create_texture().ok()?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_image_2d(glow::TEXTURE_2D, 0, GL_RGBA8, w, h, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        let fbo = gl.create_framebuffer().ok()?;
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
+        let ok = gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE;
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        if !ok {
+            gl.delete_framebuffer(fbo);
+            gl.delete_texture(tex);
+            return None;
+        }
+        *cache = Some((fbo.0.get(), tex.0.get(), w, h));
+        Some(fbo.0.get())
+    }
+}
+
 fn save_snapshot(gl: &glow::Context, size: PhysicalSize<u32>, path: &str) {
     save_snapshot_ex(gl, size, path, true)
 }
@@ -2498,7 +2592,7 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(vk) = gfx.vk.as_mut() {
                     if size.width > 0 && size.height > 0 {
                         let gl = gfx.egui.painter.gl().clone();
-                        if let Err(e) = vk.presenter.resize(size.width, size.height).and_then(|_| vk.targets.recreate(&gl, &vk.presenter)) {
+                        if let Err(e) = vk.presenter.resize(size.width, size.height).and_then(|_| vk.targets.recreate(&gl, &vk.presenter)).inspect(|_| self.video_valid = None) {
                             eprintln!("Vulkan resize: {e}");
                         }
                     }
@@ -2645,10 +2739,18 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.player.idle {
                     return;
                 }
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
-                    MouseScrollDelta::PixelDelta(p) => (p.x / 40.0, p.y / 40.0),
+                let (mut dx, mut dy, touchpad) = match delta {
+                    // Windows sends touchpads as the wheel too, in fractions
+                    // of a notch; a wheel moves whole notches.
+                    MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64, x.fract() != 0.0 || y.fract() != 0.0),
+                    MouseScrollDelta::PixelDelta(p) => (p.x / 40.0, p.y / 40.0, true),
                 };
+                // Touchpads scroll "naturally" (fingers up = content down), so
+                // fingers up would lower the volume: follow the fingers.
+                if touchpad && self.ui.settings.touchpad_follow_fingers {
+                    dx = -dx;
+                    dy = -dy;
+                }
                 // Over the seek bar the wheel seeks, over the volume slider it
                 // changes the volume (IINA); elsewhere on the UI it does nothing.
                 let ppp = egui_ctx.pixels_per_point() as f64;

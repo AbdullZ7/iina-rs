@@ -49,6 +49,8 @@ pub struct Settings {
     pub side_buttons: String,
     /// Seconds per side-button press when they seek.
     pub side_seek_step: f64,
+    /// Two-finger touchpad gestures follow the fingers (up = more volume).
+    pub touchpad_follow_fingers: bool,
     /// Seconds of inactivity before the on-screen controller hides.
     pub osc_hide_secs: f32,
     /// Show remaining time instead of total duration.
@@ -287,6 +289,7 @@ impl Default for Settings {
             osc_position: "floating".into(),
             side_buttons: "seek".into(),
             side_seek_step: 10.0,
+            touchpad_follow_fingers: true,
             osc_hide_secs: 2.5,
             show_remaining: false,
             osd_enabled: true,
