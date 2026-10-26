@@ -217,6 +217,11 @@ impl App {
             ("input-vo-keyboard", "no"),
             ("osc", "no"),
             ("watch-later-dir", &format!("{cfg}/watch_later")),
+            ("sub-fonts-dir", &format!("{cfg}/fonts")),
+            // mpv's other built-in UI scripts (keyboard-driven; never shown).
+            ("load-stats-overlay", "no"),
+            ("load-console", "no"),
+            ("input-builtin-bindings", "no"),
             // mpv's built-in OSD/OSC are replaced by IINA-RS's own UI.
             ("osd-level", "0"),
             ("osd-bar", "no"),
@@ -226,7 +231,11 @@ impl App {
             ("sub-auto", "fuzzy"),
             ("audio-file-auto", "fuzzy"),
             ("config-dir", &cfg),
-            ("config", "yes"),
+            // No config files from mpv itself: on Linux it would also read
+            // /etc/mpv (mpv.conf, scripts such as uosc), which loads after
+            // these options and brings back mpv's own controller and OSD.
+            // IINA-RS reads its own mpv.conf and scripts (below).
+            ("config", "no"),
             ("terminal", if cfg!(debug_assertions) { "yes" } else { "no" }),
             ("msg-level", "all=warn"),
         ] {
@@ -236,8 +245,9 @@ impl App {
             mpv.set_option(k, &v);
         }
         mpv.set_option("volume", &format!("{}", settings.volume.min(settings.volume_max.max(100.0)).round() as i64));
-        // Advanced: the user's own mpv options, after ours.
-        for (k, v) in settings.extra_mpv_options() {
+        // The settings folder's mpv.conf, then Advanced options, after ours.
+        let conf = std::fs::read_to_string(config_dir.join("mpv.conf")).unwrap_or_default();
+        for (k, v) in settings::parse_mpv_conf(&conf).into_iter().chain(settings.extra_mpv_options()) {
             mpv.set_option(&k, &v);
         }
         // `--name=value` / `--flag` / `--no-flag` arguments are passed to mpv, like iina-cli.
@@ -245,11 +255,23 @@ impl App {
             mpv.set_option(k, v);
         }
         mpv.init()?;
+        // For the Logs window (before scripts load, to catch their output).
+        mpv.request_log_messages("info");
+        // mpv scripts from the settings folder (with config=no mpv doesn't
+        // look for them itself).
+        if let Ok(entries) = std::fs::read_dir(config_dir.join("scripts")) {
+            let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            for p in paths {
+                let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+                if matches!(ext.as_str(), "lua" | "js") || p.join("main.lua").exists() || p.join("main.js").exists() {
+                    mpv.command(&["load-script", &p.to_string_lossy()]);
+                }
+            }
+        }
         state::observe_all(&mpv);
         // Subfolder subtitles are added while the file loads (see on_load).
         mpv.hook_add("on_load", 50);
-        // For the Logs window.
-        mpv.request_log_messages("info");
         let p = proxy.clone();
         mpv.set_wakeup_callback(move || {
             let _ = p.send_event(UserEvent::MpvEvents);

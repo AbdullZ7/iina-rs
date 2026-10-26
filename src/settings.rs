@@ -370,18 +370,7 @@ impl Settings {
 
     /// The user's extra mpv options (`name=value` per line, `#` comments).
     pub fn extra_mpv_options(&self) -> Vec<(String, String)> {
-        self.mpv_options
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .filter_map(|l| {
-                let l = l.trim_start_matches("--");
-                match l.split_once('=') {
-                    Some((k, v)) => Some((k.trim().to_string(), v.trim().to_string())),
-                    None => Some((l.to_string(), "yes".into())),
-                }
-            })
-            .collect()
+        parse_mpv_conf(&self.mpv_options)
     }
 
     /// mpv options derived from these settings.
@@ -445,9 +434,44 @@ impl Settings {
     }
 }
 
+/// `name=value` lines of an mpv.conf (top level only: `[profile]` sections
+/// are skipped; `#` comments and leading `--` allowed).
+pub fn parse_mpv_conf(text: &str) -> Vec<(String, String)> {
+    let mut in_profile = false;
+    let mut out = Vec::new();
+    for l in text.lines().map(str::trim) {
+        if l.starts_with('[') {
+            in_profile = !l.eq_ignore_ascii_case("[default]");
+            continue;
+        }
+        if in_profile || l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let l = l.trim_start_matches("--");
+        // Strip a trailing comment.
+        let l = l.split(" #").next().unwrap_or(l).trim();
+        out.push(match l.split_once('=') {
+            Some((k, v)) => (k.trim().to_string(), v.trim().trim_matches('"').to_string()),
+            None => (l.to_string(), "yes".into()),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_mpv_conf_sections() {
+        let v = parse_mpv_conf("deband=yes  # nicer
+[extension.gif]
+loop-file=inf
+[default]
+volume=50
+");
+        assert_eq!(v, vec![("deband".to_string(), "yes".to_string()), ("volume".to_string(), "50".to_string())]);
+    }
 
     #[test]
     fn parses_extra_options() {
