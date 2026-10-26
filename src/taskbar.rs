@@ -8,7 +8,44 @@ use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPRO
 use windows::Win32::UI::Shell::{
     DefSubclassProc, ITaskbarList3, SetWindowSubclass, TaskbarList, THBF_ENABLED, THBN_CLICKED, THB_FLAGS, THB_ICON, THB_TOOLTIP, THUMBBUTTON,
 };
-use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, GetSystemMetrics, RegisterWindowMessageW, HICON, ICONINFO, SM_CXSMICON, WM_COMMAND};
+use windows::Win32::Foundation::RECT;
+use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, GetSystemMetrics, RegisterWindowMessageW, HICON, ICONINFO, SM_CXSMICON, WM_COMMAND, WM_SIZING};
+
+/// Width / height to keep while the user resizes the window (PiP), as
+/// f64 bits; 0 = free.
+pub static KEEP_ASPECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Adjusts the rectangle being dragged (WM_SIZING) to the aspect ratio,
+/// moving the edge the user isn't holding.
+fn keep_aspect(edge: usize, r: &mut RECT, aspect: f64) {
+    const LEFT: usize = 1;
+    const RIGHT: usize = 2;
+    const TOP: usize = 3;
+    const TOPLEFT: usize = 4;
+    const TOPRIGHT: usize = 5;
+    const BOTTOM: usize = 6;
+    let (w, h) = ((r.right - r.left) as f64, (r.bottom - r.top) as f64);
+    match edge {
+        // Dragging a side: the height follows the width.
+        LEFT | RIGHT => r.bottom = r.top + (w / aspect).round() as i32,
+        // Top / bottom: the width follows the height.
+        TOP | BOTTOM => r.right = r.left + (h * aspect).round() as i32,
+        // Corners: the larger change wins; the opposite corner stays put.
+        _ => {
+            let (nw, nh) = if w / h > aspect { (w, w / aspect) } else { (h * aspect, h) };
+            if matches!(edge, TOPLEFT | TOPRIGHT) {
+                r.top = r.bottom - nh.round() as i32;
+            } else {
+                r.bottom = r.top + nh.round() as i32;
+            }
+            if matches!(edge, TOPLEFT) || edge == 7 {
+                r.left = r.right - nw.round() as i32;
+            } else {
+                r.right = r.left + nw.round() as i32;
+            }
+        }
+    }
+}
 
 /// PotPlayer's thumbnail toolbar.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -52,6 +89,13 @@ unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM,
         if let Some(b) = b {
             (hook.on_click)(b);
             return LRESULT(0);
+        }
+    }
+    if msg == WM_SIZING {
+        let aspect = f64::from_bits(KEEP_ASPECT.load(std::sync::atomic::Ordering::Relaxed));
+        if aspect > 0.0 && lp.0 != 0 {
+            keep_aspect(wp.0, unsafe { &mut *(lp.0 as *mut RECT) }, aspect);
+            return LRESULT(1);
         }
     }
     if msg == hook.created_msg {
@@ -215,8 +259,12 @@ impl Taskbar {
             return;
         }
         let b = self.buttons(paused);
-        if unsafe { self.list.ThumbBarUpdateButtons(self.hwnd, &b) }.is_ok() {
-            self.paused = Some(paused);
+        match unsafe { self.list.ThumbBarUpdateButtons(self.hwnd, &b) } {
+            Ok(()) => {
+                self.paused = Some(paused);
+                crate::dbg_log(format!("taskbar: {}", if paused { "play" } else { "pause" }));
+            }
+            Err(e) => crate::dbg_log(format!("taskbar update failed: {e}")),
         }
     }
 
@@ -224,6 +272,11 @@ impl Taskbar {
     pub fn recreated(&mut self, paused: bool) {
         self.added = false;
         self.add(paused);
+        // If the buttons already existed (the first "created" message often
+        // arrives after our early add), Windows keeps their old icons:
+        // push the current state explicitly.
+        self.paused = None;
+        self.set_paused(paused);
     }
 }
 

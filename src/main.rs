@@ -2633,6 +2633,15 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(tb) = self.taskbar.as_mut() {
             tb.set_paused(self.player.pause || self.player.idle);
         }
+        // PiP keeps the video's shape while being resized from its edges.
+        #[cfg(windows)]
+        {
+            let aspect = match (self.ui.pip, self.video_dims) {
+                (true, Some((w, h))) if h > 0.0 => w / h,
+                _ => 0.0,
+            };
+            taskbar::KEEP_ASPECT.store(aspect.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
         self.update_blackout(el);
         self.poll_screenshot();
         if let Some(t) = self.save_settings_at {
