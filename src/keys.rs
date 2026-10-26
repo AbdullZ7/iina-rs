@@ -57,16 +57,26 @@ u add saturation 1
 \\ ab-loop
 d frame-back-step
 #@iina Shift+N toggle-normalize
+#@iina ` window-size min
 #@iina 1 window-size 0.5
 #@iina 2 window-size 1
 #@iina 3 window-size 1.5
 #@iina 4 window-size 2
-#@iina 5 fit-to-screen
-#@iina Alt+1 window-size 0.5
-#@iina Alt+2 window-size 1
-#@iina Alt+3 window-size 1.5
-#@iina Alt+4 window-size 2
-#@iina Alt+5 fit-to-screen
+#@iina 5 window-size max
+#@iina 6 fit-to-screen
+#@iina 7 toggle-fullscreen
+#@iina 8 window-fit-aspect
+#@iina Ctrl+Alt+KP_ADD bigger-window
+#@iina Ctrl+Alt+KP_SUBTRACT smaller-window
+#@iina Ctrl+Alt+KP4 move-window -1 0
+#@iina Ctrl+Alt+KP6 move-window 1 0
+#@iina Ctrl+Alt+KP8 move-window 0 -1
+#@iina Ctrl+Alt+KP2 move-window 0 1
+#@iina Ctrl+Alt+KP5 place-window center
+#@iina Ctrl+Alt+KP7 place-window top-left
+#@iina Ctrl+Alt+KP9 place-window top-right
+#@iina Ctrl+Alt+KP1 place-window bottom-left
+#@iina Ctrl+Alt+KP3 place-window bottom-right
 ";
 
 #[derive(Clone, Debug)]
@@ -287,6 +297,51 @@ fn named(k: &NamedKey) -> Option<&'static str> {
     })
 }
 
+/// mpv's names for numpad keys.
+fn numpad(key: PhysicalKey) -> Option<&'static str> {
+    use KeyCode::*;
+    let PhysicalKey::Code(code) = key else { return None };
+    Some(match code {
+        Numpad0 => "KP0",
+        Numpad1 => "KP1",
+        Numpad2 => "KP2",
+        Numpad3 => "KP3",
+        Numpad4 => "KP4",
+        Numpad5 => "KP5",
+        Numpad6 => "KP6",
+        Numpad7 => "KP7",
+        Numpad8 => "KP8",
+        Numpad9 => "KP9",
+        NumpadAdd => "KP_ADD",
+        NumpadSubtract => "KP_SUBTRACT",
+        NumpadMultiply => "KP_MULTIPLY",
+        NumpadDivide => "KP_DIVIDE",
+        NumpadDecimal => "KP_DEC",
+        NumpadEnter => "KP_ENTER",
+        _ => return None,
+    })
+}
+
+/// A numpad key with no binding of its own acts as the plain key
+/// ("KP1" -> "1", "Ctrl+KP_ADD" -> "Ctrl++").
+pub fn numpad_fallback(spec: &str) -> Option<String> {
+    let (mods, key) = match spec.rfind('+') {
+        Some(i) if spec[i + 1..].starts_with("KP") => (&spec[..i + 1], &spec[i + 1..]),
+        _ if spec.starts_with("KP") => ("", spec),
+        _ => return None,
+    };
+    let plain = match key {
+        "KP_ADD" => "+",
+        "KP_SUBTRACT" => "-",
+        "KP_MULTIPLY" => "*",
+        "KP_DIVIDE" => "/",
+        "KP_DEC" => ".",
+        "KP_ENTER" => "ENTER",
+        k => k.strip_prefix("KP")?,
+    };
+    Some(normalize(&format!("{mods}{plain}")))
+}
+
 /// The character a key gives on a US layout.
 fn us_char(key: PhysicalKey, shift: bool) -> Option<char> {
     use KeyCode::*;
@@ -324,6 +379,20 @@ pub fn event_to_spec(ev: &KeyEvent, mods: ModifiersState) -> Option<String> {
     // With a non-Latin layout (e.g. Arabic) letter and digit keys produce
     // other characters; shortcuts then follow the key's place on a US
     // keyboard, as in other players.
+    if let Some(kp) = numpad(ev.physical_key) {
+        let mut spec = String::new();
+        if ctrl {
+            spec.push_str("Ctrl+");
+        }
+        if alt {
+            spec.push_str("Alt+");
+        }
+        if shift {
+            spec.push_str("Shift+");
+        }
+        spec.push_str(kp);
+        return Some(normalize(&spec));
+    }
     let latin;
     let logical = match &ev.logical_key {
         Key::Character(s) if s.chars().next().is_some_and(|c| !c.is_ascii()) => match us_char(ev.physical_key, shift) {
@@ -389,6 +458,17 @@ mod tests {
         assert_eq!(normalize("Ctrl++"), "Ctrl++");
         assert_eq!(normalize("Shift+_"), "_");
         assert_eq!(normalize("Ctrl+Meta+f"), "Ctrl+Alt+f");
+    }
+
+    #[test]
+    fn numpad_falls_back_to_plain_keys() {
+        assert_eq!(numpad_fallback("KP1").as_deref(), Some("1"));
+        assert_eq!(numpad_fallback("Ctrl+Alt+KP_ADD").as_deref(), Some("Ctrl+Alt++"));
+        assert_eq!(numpad_fallback("KP_ENTER").as_deref(), Some("ENTER"));
+        assert_eq!(numpad_fallback("1"), None);
+        let b = Bindings::load(None);
+        assert!(matches!(b.lookup("Ctrl+Alt+KP5"), Some(Binding::App(c)) if c == "place-window center"));
+        assert!(matches!(b.lookup("5"), Some(Binding::App(c)) if c == "window-size max"));
     }
 
     #[test]

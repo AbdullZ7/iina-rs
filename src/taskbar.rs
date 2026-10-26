@@ -10,11 +10,20 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, GetSystemMetrics, RegisterWindowMessageW, HICON, ICONINFO, SM_CXSMICON, WM_COMMAND};
 
-#[derive(Clone, Copy, Debug)]
+/// PotPlayer's thumbnail toolbar.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Button {
     Previous = 1,
-    PlayPause = 2,
-    Next = 3,
+    Rewind = 2,
+    Stop = 3,
+    PlayPause = 4,
+    Forward = 5,
+    Next = 6,
+    Fullscreen = 7,
+}
+
+impl Button {
+    const ALL: [Button; 7] = [Button::Previous, Button::Rewind, Button::Stop, Button::PlayPause, Button::Forward, Button::Next, Button::Fullscreen];
 }
 
 struct Hook {
@@ -28,19 +37,18 @@ pub struct Taskbar {
     list: ITaskbarList3,
     added: bool,
     paused: Option<bool>,
-    icons: [HICON; 4], // previous, play, pause, next
-    tips: [String; 4],
+    /// Previous, rewind, stop, play, pause, forward, next, fullscreen.
+    icons: [HICON; 8],
+    tips: [String; 8],
+    /// Right-to-left order (Arabic UI), as Windows shows RTL apps.
+    rtl: bool,
 }
 
 unsafe extern "system" fn subclass(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, data: usize) -> LRESULT {
     let hook = unsafe { &*(data as *const Hook) };
     if msg == WM_COMMAND && ((wp.0 >> 16) & 0xffff) as u32 == THBN_CLICKED {
-        let b = match wp.0 & 0xffff {
-            1 => Some(Button::Previous),
-            2 => Some(Button::PlayPause),
-            3 => Some(Button::Next),
-            _ => None,
-        };
+        let id = (wp.0 & 0xffff) as u32;
+        let b = Button::ALL.into_iter().find(|b| *b as u32 == id);
         if let Some(b) = b {
             (hook.on_click)(b);
             return LRESULT(0);
@@ -109,7 +117,8 @@ fn rect(x: f32, y: f32, x0: f32, x1: f32, y0: f32, y1: f32) -> bool {
 impl Taskbar {
     /// Installs the toolbar on `hwnd`. `on_created` runs when Explorer
     /// (re)creates the taskbar button; call `add()` then.
-    pub fn new(hwnd: *mut std::ffi::c_void, tips: [String; 4], on_click: impl Fn(Button) + 'static, on_created: impl Fn() + 'static) -> Option<Taskbar> {
+    /// `tips`: previous, rewind, stop, play, pause, forward, next, fullscreen.
+    pub fn new(hwnd: *mut std::ffi::c_void, tips: [String; 8], rtl: bool, on_click: impl Fn(Button) + 'static, on_created: impl Fn() + 'static) -> Option<Taskbar> {
         let hwnd = HWND(hwnd);
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -123,20 +132,34 @@ impl Taskbar {
                 return None;
             }
             let s = GetSystemMetrics(SM_CXSMICON).max(16);
+            // Corner brackets for fullscreen.
+            let corner = |x: f32, y: f32| {
+                let (t, l) = (0.1, 0.32);
+                let near = |v: f32, a: f32| v >= a && v <= a + t;
+                let edge_x = near(x, 0.14) || near(x, 0.76);
+                let edge_y = near(y, 0.14) || near(y, 0.76);
+                let in_x = x <= 0.14 + l || x >= 0.86 - l;
+                let in_y = y <= 0.14 + l || y >= 0.86 - l;
+                (edge_x && in_y && (0.14..=0.86).contains(&y)) || (edge_y && in_x && (0.14..=0.86).contains(&x))
+            };
             let icons = [
                 icon(s, |x, y| rect(x, y, 0.18, 0.28, 0.22, 0.78) || triangle(x, y, 0.28, 0.82, 0.22, 0.78, -1.0)),
+                icon(s, |x, y| triangle(x, y, 0.12, 0.5, 0.24, 0.76, -1.0) || triangle(x, y, 0.5, 0.88, 0.24, 0.76, -1.0)),
+                icon(s, |x, y| rect(x, y, 0.24, 0.76, 0.24, 0.76)),
                 icon(s, |x, y| triangle(x, y, 0.26, 0.84, 0.18, 0.82, 1.0)),
                 icon(s, |x, y| rect(x, y, 0.24, 0.42, 0.2, 0.8) || rect(x, y, 0.58, 0.76, 0.2, 0.8)),
+                icon(s, |x, y| triangle(x, y, 0.12, 0.5, 0.24, 0.76, 1.0) || triangle(x, y, 0.5, 0.88, 0.24, 0.76, 1.0)),
                 icon(s, |x, y| triangle(x, y, 0.18, 0.72, 0.22, 0.78, 1.0) || rect(x, y, 0.72, 0.82, 0.22, 0.78)),
+                icon(s, corner),
             ];
             if icons.iter().any(|i| i.is_none()) {
                 return None;
             }
-            Some(Taskbar { hwnd, list, added: false, paused: None, icons: icons.map(|i| i.unwrap()), tips })
+            Some(Taskbar { hwnd, list, added: false, paused: None, icons: icons.map(|i| i.unwrap()), tips, rtl })
         }
     }
 
-    fn buttons(&self, paused: bool) -> [THUMBBUTTON; 3] {
+    fn buttons(&self, paused: bool) -> Vec<THUMBBUTTON> {
         let make = |id: Button, icon: HICON, tip: &str| {
             let mut b = THUMBBUTTON { dwMask: THB_ICON | THB_TOOLTIP | THB_FLAGS, iId: id as u32, hIcon: icon, dwFlags: THBF_ENABLED, ..Default::default() };
             for (i, c) in tip.encode_utf16().take(259).enumerate() {
@@ -144,8 +167,26 @@ impl Taskbar {
             }
             b
         };
-        let (play_icon, play_tip) = if paused { (self.icons[1], &self.tips[1]) } else { (self.icons[2], &self.tips[2]) };
-        [make(Button::Previous, self.icons[0], &self.tips[0]), make(Button::PlayPause, play_icon, play_tip), make(Button::Next, self.icons[3], &self.tips[3])]
+        let mut v: Vec<THUMBBUTTON> = Button::ALL
+            .into_iter()
+            .map(|b| {
+                let i = match b {
+                    Button::Previous => 0,
+                    Button::Rewind => 1,
+                    Button::Stop => 2,
+                    Button::PlayPause if paused => 3,
+                    Button::PlayPause => 4,
+                    Button::Forward => 5,
+                    Button::Next => 6,
+                    Button::Fullscreen => 7,
+                };
+                make(b, self.icons[i], &self.tips[i])
+            })
+            .collect();
+        if self.rtl {
+            v.reverse();
+        }
+        v
     }
 
     /// Adds the buttons (once the taskbar button exists).

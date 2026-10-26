@@ -58,7 +58,7 @@ enum UserEvent {
     /// System media controls (media keys, SMTC / MPRIS / Now Playing).
     Media(media_keys::MediaCmd),
     UpdateChecked,
-    /// Taskbar thumbnail button: 1 previous, 2 play/pause, 3 next.
+    /// Taskbar thumbnail button (taskbar::Button as u8).
     TaskbarButton(u8),
     /// Explorer (re)created our taskbar button.
     TaskbarCreated,
@@ -712,8 +712,21 @@ impl App {
                 self.toggle_music_mode();
             }
             // PotPlayer's number keys: window at 50 / 100 / 150 / 200 %.
+            "window-fit-aspect" => self.window_fit_aspect(),
+            "move-window" => {
+                let v: Vec<f64> = arg.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+                if let [dx, dy] = v[..] {
+                    self.move_window(dx, dy);
+                }
+            }
+            "place-window" => self.place_window(arg.trim()),
             "window-size" => {
-                if let Ok(scale) = arg.trim().parse::<f64>() {
+                let scale = match arg.trim() {
+                    "min" => Some(-1.0),
+                    "max" => Some(1000.0),
+                    a => a.parse::<f64>().ok(),
+                };
+                if let Some(scale) = scale {
                     let mut wait = false;
                     if self.player.fullscreen {
                         self.leave_fullscreen_now();
@@ -733,7 +746,12 @@ impl App {
                         // PotPlayer: 100 % = the video's own pixels.
                         let _ = self.fit_window(scale, false);
                     }
-                    self.ui.show_osd(i18n::tlf("Window size: {}%", &[&format!("{:.0}", scale * 100.0)]), None);
+                    let msg = match arg.trim() {
+                        "min" => i18n::tl("Window size: Minimum"),
+                        "max" => i18n::tl("Window size: Maximum"),
+                        _ => i18n::tlf("Window size: {}%", &[&format!("{:.0}", scale * 100.0)]),
+                    };
+                    self.ui.show_osd(msg, None);
                 }
             }
             "fit-to-screen" => {
@@ -909,6 +927,84 @@ impl App {
 
     /// Sizes the window to the video × `scale`, in physical pixels (times
     /// the display's DPI scale when `dpi`), within the screen.
+    /// The monitor's work area (without the taskbar): x, y, width, height.
+    fn work_area(&self) -> Option<(f64, f64, f64, f64)> {
+        let window = self.window()?;
+        #[cfg(windows)]
+        unsafe {
+            use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+            if let Ok(h) = window.window_handle() {
+                if let winit::raw_window_handle::RawWindowHandle::Win32(h) = h.as_raw() {
+                    let mon = MonitorFromWindow(windows::Win32::Foundation::HWND(h.hwnd.get() as *mut _), MONITOR_DEFAULTTONEAREST);
+                    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                    if GetMonitorInfoW(mon, &mut mi).as_bool() {
+                        let r = mi.rcWork;
+                        return Some((r.left as f64, r.top as f64, (r.right - r.left) as f64, (r.bottom - r.top) as f64));
+                    }
+                }
+            }
+        }
+        let mon = window.current_monitor()?;
+        let (p, s) = (mon.position(), mon.size());
+        Some((p.x as f64, p.y as f64, s.width as f64, s.height as f64))
+    }
+
+    /// Window frame size (outer minus inner), in pixels.
+    fn frame_extra(&self) -> (f64, f64) {
+        self.window().map_or((0.0, 0.0), |w| {
+            let (o, i) = (w.outer_size(), w.inner_size());
+            (o.width.saturating_sub(i.width) as f64, o.height.saturating_sub(i.height) as f64)
+        })
+    }
+
+    /// PotPlayer's 8: keep the width, make the height match the video.
+    fn window_fit_aspect(&mut self) {
+        let (Some(vw), Some(vh)) = (
+            self.mpv.get_string("dwidth").and_then(|s| s.parse::<f64>().ok()),
+            self.mpv.get_string("dheight").and_then(|s| s.parse::<f64>().ok()),
+        ) else {
+            return;
+        };
+        let Some(w) = self.window().cloned() else { return };
+        if w.is_maximized() || self.player.fullscreen {
+            return;
+        }
+        let (_, _, _, ah) = self.work_area().unwrap_or((0.0, 0.0, 1e9, 1e9));
+        let (_, dy) = self.frame_extra();
+        let width = w.inner_size().width as f64;
+        let mut height = width * vh / vw;
+        let mut width2 = width;
+        if height + dy > ah {
+            height = ah - dy;
+            width2 = height * vw / vh;
+        }
+        let _ = w.request_inner_size(PhysicalSize::new(width2 as u32, height as u32));
+    }
+
+    /// PotPlayer's Ctrl+Alt+Numpad 4/6/8/2: nudge the window.
+    fn move_window(&mut self, dx: f64, dy: f64) {
+        let Some(w) = self.window().cloned() else { return };
+        let Ok(p) = w.outer_position() else { return };
+        let step = 20.0 * w.scale_factor();
+        w.set_outer_position(PhysicalPosition::new(p.x + (dx * step) as i32, p.y + (dy * step) as i32));
+    }
+
+    /// PotPlayer's Ctrl+Alt+Numpad 5/7/9/1/3: centre or a corner.
+    fn place_window(&mut self, where_: &str) {
+        let Some(w) = self.window().cloned() else { return };
+        let Some((ax, ay, aw, ah)) = self.work_area() else { return };
+        let o = w.outer_size();
+        let (ow, oh) = (o.width as f64, o.height as f64);
+        let (x, y) = match where_ {
+            "top-left" => (ax, ay),
+            "top-right" => (ax + aw - ow, ay),
+            "bottom-left" => (ax, ay + ah - oh),
+            "bottom-right" => (ax + aw - ow, ay + ah - oh),
+            _ => (ax + (aw - ow) / 2.0, ay + (ah - oh) / 2.0),
+        };
+        w.set_outer_position(PhysicalPosition::new(x as i32, y as i32));
+    }
+
     fn fit_window(&mut self, scale: f64, dpi_aware: bool) -> bool {
         let (Some(w), Some(h)) = (
             self.mpv.get_string("dwidth").and_then(|s| s.parse::<f64>().ok()),
@@ -921,33 +1017,33 @@ impl App {
             return true;
         }
         let dpi = if dpi_aware { window.scale_factor() } else { 1.0 };
+        // scale < 0: the smallest window (PotPlayer's `).
+        let scale = if scale < 0.0 { 285.0 * window.scale_factor() / w } else { scale };
         let (mut tw, mut th) = (w * scale * dpi, h * scale * dpi);
-        if let Some(mon) = window.current_monitor() {
-            let ms = mon.size();
-            let (mw, mh) = (ms.width as f64 * 0.85, ms.height as f64 * 0.85);
-            let k = (mw / tw).min(mh / th).min(1.0);
-            tw *= k;
-            th *= k;
-            let old_inner = window.inner_size();
-            let old_pos = window.outer_position().ok();
+        let (dx, dy) = self.frame_extra();
+        let Some((ax, ay, aw, ah)) = self.work_area() else {
             let _ = window.request_inner_size(PhysicalSize::new(tw as u32, th as u32));
-            let mp = mon.position();
-            let outer = window.outer_size();
-            let dx = outer.width.saturating_sub(old_inner.width) as f64;
-            let dy = outer.height.saturating_sub(old_inner.height) as f64;
-            // Like IINA: centre on the screen the first time, afterwards keep
-            // the window's centre where it is.
-            let (cx, cy) = match old_pos.filter(|_| self.window_centred) {
-                Some(p) => (p.x as f64 + (old_inner.width as f64 + dx) / 2.0, p.y as f64 + (old_inner.height as f64 + dy) / 2.0),
-                None => (mp.x as f64 + ms.width as f64 / 2.0, mp.y as f64 + ms.height as f64 / 2.0),
-            };
-            self.window_centred = true;
-            let x = (cx - (tw + dx) / 2.0).clamp(mp.x as f64, (mp.x as f64 + ms.width as f64 - tw - dx).max(mp.x as f64));
-            let y = (cy - (th + dy) / 2.0).clamp(mp.y as f64, (mp.y as f64 + ms.height as f64 - th - dy).max(mp.y as f64));
-            window.set_outer_position(PhysicalPosition::new(x as i32, y as i32));
-        } else {
-            let _ = window.request_inner_size(PhysicalSize::new(tw as u32, th as u32));
-        }
+            return true;
+        };
+        // Opening a file (IINA): at most 85 % of the screen. Number keys
+        // (PotPlayer): up to the whole work area.
+        let room = if dpi_aware { 0.85 } else { 1.0 };
+        let k = ((aw * room - dx) / tw).min((ah * room - dy) / th).min(1.0);
+        tw *= k;
+        th *= k;
+        let old_inner = window.inner_size();
+        let old_pos = window.outer_position().ok();
+        let _ = window.request_inner_size(PhysicalSize::new(tw as u32, th as u32));
+        // Like IINA: centre on the screen the first time, afterwards keep
+        // the window's centre where it is (within the work area).
+        let (cx, cy) = match old_pos.filter(|_| self.window_centred) {
+            Some(p) => (p.x as f64 + (old_inner.width as f64 + dx) / 2.0, p.y as f64 + (old_inner.height as f64 + dy) / 2.0),
+            None => (ax + aw / 2.0, ay + ah / 2.0),
+        };
+        self.window_centred = true;
+        let x = (cx - (tw + dx) / 2.0).clamp(ax, (ax + aw - tw - dx).max(ax));
+        let y = (cy - (th + dy) / 2.0).clamp(ay, (ay + ah - th - dy).max(ay));
+        window.set_outer_position(PhysicalPosition::new(x as i32, y as i32));
         true
     }
 
@@ -1147,11 +1243,12 @@ impl App {
         let Some(w) = self.window() else { return };
         let Ok(h) = w.window_handle() else { return };
         let winit::raw_window_handle::RawWindowHandle::Win32(h) = h.as_raw() else { return };
-        let tips = ["Previous", "Play", "Pause", "Next"].map(i18n::tl);
+        let tips = ["Previous", "Rewind", "Stop", "Play", "Pause", "Forward", "Next", "Fullscreen"].map(i18n::tl);
         let (p1, p2) = (self.proxy.clone(), self.proxy.clone());
         self.taskbar = taskbar::Taskbar::new(
             h.hwnd.get() as *mut std::ffi::c_void,
             tips,
+            i18n::is_rtl(),
             move |b| {
                 let _ = p1.send_event(UserEvent::TaskbarButton(b as u8));
             },
@@ -2454,8 +2551,12 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::TaskbarButton(b) => {
                 match b {
                     1 => self.mpv.command(&["playlist-prev"]),
-                    2 => self.toggle_pause(),
-                    _ => self.mpv.command(&["playlist-next"]),
+                    2 => self.mpv.command(&["seek", "-5"]),
+                    3 => self.run_app_command("close-file"),
+                    4 => self.toggle_pause(),
+                    5 => self.mpv.command(&["seek", "5"]),
+                    6 => self.mpv.command(&["playlist-next"]),
+                    _ => self.mpv.command(&["cycle", "fullscreen"]),
                 }
                 self.redraw();
             }
@@ -2639,7 +2740,8 @@ impl ApplicationHandler<UserEvent> for App {
                     if self.media.is_some() && matches!(spec.as_str(), "PLAYPAUSE" | "PLAY" | "PAUSE" | "STOP" | "NEXT" | "PREV") {
                         return;
                     }
-                    match self.bindings.lookup(&spec).cloned() {
+                    let binding = self.bindings.lookup(&spec).cloned().or_else(|| keys::numpad_fallback(&spec).and_then(|s| self.bindings.lookup(&s).cloned()));
+                    match binding {
                         Some(Binding::Mpv(cmd)) => self.run_mpv_binding(&cmd),
                         Some(Binding::App(cmd)) => self.run_app_command(&cmd),
                         None => {}
