@@ -59,8 +59,10 @@ enum UserEvent {
     Media(media_keys::MediaCmd),
     UpdateChecked,
     /// Taskbar thumbnail button (taskbar::Button as u8).
+    #[cfg_attr(not(windows), allow(dead_code))]
     TaskbarButton(u8),
     /// Explorer (re)created our taskbar button.
+    #[cfg_attr(not(windows), allow(dead_code))]
     TaskbarCreated,
 }
 
@@ -185,6 +187,10 @@ struct App {
     normalize_applied: bool,
     /// The PiP window moved/resized: remember its rect (in about_to_wait).
     pip_moved: bool,
+    /// Last PiP resize (outside Windows the shape is fixed once it stops).
+    pip_resized_at: Option<Instant>,
+    /// PiP size after the last shape fix (which side a resize changed).
+    pip_shape: Option<(f64, f64)>,
     /// The window has been centred once (later resizes keep its centre).
     window_centred: bool,
     /// Last state requested from the OS for keeping the display awake.
@@ -353,6 +359,8 @@ impl App {
             shot_to_clipboard: false,
             normalize_applied: false,
             pip_moved: false,
+            pip_resized_at: None,
+            pip_shape: None,
             window_centred: false,
             keep_awake: false,
             fullscreen_applied: false,
@@ -1098,6 +1106,26 @@ impl App {
     fn pip_edge(&self) -> Option<ResizeDirection> {
         let g = self.gfx.as_ref()?;
         pip_edge_at(self.ui.pip, &g.window, self.cursor)
+    }
+
+    /// After a PiP resize: match the video's shape, keeping the side the
+    /// user changed most (so shrinking from a side edge stays shrunk).
+    fn fix_pip_aspect(&mut self, aspect: f64) {
+        let Some(w) = self.window().cloned() else { return };
+        let s = w.inner_size();
+        let (cw, ch) = (s.width as f64, s.height as f64);
+        if cw < 1.0 || ch < 1.0 {
+            return;
+        }
+        if ((cw / ch) - aspect).abs() / aspect < 0.01 {
+            self.pip_shape = Some((cw, ch));
+            return;
+        }
+        let (pw, ph) = self.pip_shape.unwrap_or((cw, cw / aspect));
+        let keep_width = (cw - pw).abs() / pw >= (ch - ph).abs() / ph;
+        let (nw, nh) = if keep_width { (cw, cw / aspect) } else { (ch * aspect, ch) };
+        self.pip_shape = Some((nw, nh));
+        let _ = w.request_inner_size(PhysicalSize::new(nw.round() as u32, nh.round() as u32));
     }
 
     fn remember_pip(&mut self) {
@@ -2633,14 +2661,27 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(tb) = self.taskbar.as_mut() {
             tb.set_paused(self.player.pause || self.player.idle);
         }
-        // PiP keeps the video's shape while being resized from its edges.
+        // PiP keeps the video's shape while being resized from its edges:
+        // live on Windows (WM_SIZING), elsewhere once the resize stops.
+        let aspect = match (self.ui.pip, self.video_dims) {
+            (true, Some((w, h))) if h > 0.0 => w / h,
+            _ => 0.0,
+        };
+        let live = cfg!(windows) && std::env::var_os("IINA_RS_TEST_ASPECT_FALLBACK").is_none();
         #[cfg(windows)]
-        {
-            let aspect = match (self.ui.pip, self.video_dims) {
-                (true, Some((w, h))) if h > 0.0 => w / h,
-                _ => 0.0,
-            };
-            taskbar::KEEP_ASPECT.store(aspect.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        taskbar::KEEP_ASPECT.store(if live { aspect } else { 0.0 }.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.pip_resized_at {
+            if aspect <= 0.0 || live {
+                self.pip_resized_at = None;
+            } else if t.elapsed() >= Duration::from_millis(250) {
+                self.pip_resized_at = None;
+                self.fix_pip_aspect(aspect);
+            } else {
+                let at = t + Duration::from_millis(260);
+                if self.repaint_at.is_none_or(|r| at < r) {
+                    self.repaint_at = Some(at);
+                }
+            }
         }
         self.update_blackout(el);
         self.poll_screenshot();
@@ -2695,6 +2736,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(size) => {
                 if self.ui.pip {
                     self.pip_moved = true;
+                    self.pip_resized_at = Some(Instant::now());
                 }
                 // Handled in about_to_wait (gfx is borrowed here).
                 self.minimized_state = Some(size.width == 0 || size.height == 0 || gfx.window.is_minimized() == Some(true));
