@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use winit::event::KeyEvent;
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
 pub const IINA_DEFAULT: &str = include_str!("../assets/iina-default-input.conf");
@@ -287,6 +287,31 @@ fn named(k: &NamedKey) -> Option<&'static str> {
     })
 }
 
+/// The character a key gives on a US layout.
+fn us_char(key: PhysicalKey, shift: bool) -> Option<char> {
+    use KeyCode::*;
+    let PhysicalKey::Code(code) = key else { return None };
+    let letter = |c: char| Some(if shift { c.to_ascii_uppercase() } else { c });
+    let pick = |plain: char, shifted: char| Some(if shift { shifted } else { plain });
+    match code {
+        KeyA => letter('a'), KeyB => letter('b'), KeyC => letter('c'), KeyD => letter('d'), KeyE => letter('e'),
+        KeyF => letter('f'), KeyG => letter('g'), KeyH => letter('h'), KeyI => letter('i'), KeyJ => letter('j'),
+        KeyK => letter('k'), KeyL => letter('l'), KeyM => letter('m'), KeyN => letter('n'), KeyO => letter('o'),
+        KeyP => letter('p'), KeyQ => letter('q'), KeyR => letter('r'), KeyS => letter('s'), KeyT => letter('t'),
+        KeyU => letter('u'), KeyV => letter('v'), KeyW => letter('w'), KeyX => letter('x'), KeyY => letter('y'),
+        KeyZ => letter('z'),
+        Digit1 => pick('1', '!'), Digit2 => pick('2', '@'), Digit3 => pick('3', '#'), Digit4 => pick('4', '$'),
+        Digit5 => pick('5', '%'), Digit6 => pick('6', '^'), Digit7 => pick('7', '&'), Digit8 => pick('8', '*'),
+        Digit9 => pick('9', '('), Digit0 => pick('0', ')'),
+        Numpad0 => Some('0'), Numpad1 => Some('1'), Numpad2 => Some('2'), Numpad3 => Some('3'), Numpad4 => Some('4'),
+        Numpad5 => Some('5'), Numpad6 => Some('6'), Numpad7 => Some('7'), Numpad8 => Some('8'), Numpad9 => Some('9'),
+        Minus => pick('-', '_'), Equal => pick('=', '+'), BracketLeft => pick('[', '{'), BracketRight => pick(']', '}'),
+        Backslash => pick('\\', '|'), Semicolon => pick(';', ':'), Quote => pick('\'', '"'), Comma => pick(',', '<'),
+        Period => pick('.', '>'), Slash => pick('/', '?'), Backquote => pick('`', '~'),
+        _ => None,
+    }
+}
+
 /// Converts a winit key press into the canonical binding string.
 pub fn event_to_spec(ev: &KeyEvent, mods: ModifiersState) -> Option<String> {
     // Cmd/Win counts as Ctrl (IINA's Meta). Ctrl+Cmd together is IINA's
@@ -296,7 +321,21 @@ pub fn event_to_spec(ev: &KeyEvent, mods: ModifiersState) -> Option<String> {
         mods.alt_key() || (mods.control_key() && mods.super_key()),
         mods.shift_key(),
     );
-    let key = match &ev.logical_key {
+    // With a non-Latin layout (e.g. Arabic) letter and digit keys produce
+    // other characters; shortcuts then follow the key's place on a US
+    // keyboard, as in other players.
+    let latin;
+    let logical = match &ev.logical_key {
+        Key::Character(s) if s.chars().next().is_some_and(|c| !c.is_ascii()) => match us_char(ev.physical_key, shift) {
+            Some(c) => {
+                latin = Key::Character(c.to_string().into());
+                &latin
+            }
+            None => &ev.logical_key,
+        },
+        other => other,
+    };
+    let key = match logical {
         Key::Named(n) => named(n)?.to_string(),
         Key::Character(s) => {
             let c = s.chars().next()?;

@@ -167,6 +167,8 @@ struct App {
     minimized_paused: bool,
     /// Latest minimized state seen in a window event (applied in about_to_wait).
     minimized_state: Option<bool>,
+    /// Number-key window size waiting for un-maximize / fullscreen exit.
+    pending_window_size: Option<(f64, Instant)>,
     blackout: Vec<Blackout>,
     /// A screenshot was requested at this time (preview / clipboard pending).
     shot_pending: Option<(Instant, std::time::SystemTime)>,
@@ -332,6 +334,7 @@ impl App {
             auto_music: false,
             minimized_paused: false,
             minimized_state: None,
+            pending_window_size: None,
             blackout: Vec::new(),
             shot_pending: None,
             shot_to_clipboard: false,
@@ -698,15 +701,25 @@ impl App {
             // PotPlayer's number keys: window at 50 / 100 / 150 / 200 %.
             "window-size" => {
                 if let Ok(scale) = arg.trim().parse::<f64>() {
+                    let mut wait = false;
                     if self.player.fullscreen {
                         self.leave_fullscreen_now();
+                        wait = true;
                     }
                     if let Some(w) = self.window() {
                         if w.is_maximized() {
                             w.set_maximized(false);
+                            wait = true;
                         }
                     }
-                    let _ = self.fit_to_video(scale);
+                    // Leaving maximized/fullscreen completes asynchronously:
+                    // resize once it has (see about_to_wait).
+                    if wait {
+                        self.pending_window_size = Some((scale, Instant::now()));
+                    } else {
+                        // PotPlayer: 100 % = the video's own pixels.
+                        let _ = self.fit_window(scale, false);
+                    }
                     self.ui.show_osd(i18n::tlf("Window size: {}%", &[&format!("{:.0}", scale * 100.0)]), None);
                 }
             }
@@ -875,6 +888,15 @@ impl App {
     /// Resizes the window to the video size (like IINA). Returns false if the
     /// video dimensions aren't known yet.
     fn fit_to_video(&mut self, scale: f64) -> bool {
+        // mpv sizes windows in physical pixels scaled by the display's DPI
+        // (hidpi-window-scale); do the same.
+        let k = scale * self.ui.settings.resize_scale.clamp(0.25, 4.0);
+        self.fit_window(k, true)
+    }
+
+    /// Sizes the window to the video × `scale`, in physical pixels (times
+    /// the display's DPI scale when `dpi`), within the screen.
+    fn fit_window(&mut self, scale: f64, dpi_aware: bool) -> bool {
         let (Some(w), Some(h)) = (
             self.mpv.get_string("dwidth").and_then(|s| s.parse::<f64>().ok()),
             self.mpv.get_string("dheight").and_then(|s| s.parse::<f64>().ok()),
@@ -885,10 +907,7 @@ impl App {
         if self.player.fullscreen || window.is_maximized() || self.ui.pip || self.ui.music_mode {
             return true;
         }
-        // mpv sizes windows in physical pixels scaled by the display's DPI
-        // (hidpi-window-scale); do the same.
-        let dpi = window.scale_factor();
-        let scale = scale * self.ui.settings.resize_scale.clamp(0.25, 4.0);
+        let dpi = if dpi_aware { window.scale_factor() } else { 1.0 };
         let (mut tw, mut th) = (w * scale * dpi, h * scale * dpi);
         if let Some(mon) = window.current_monitor() {
             let ms = mon.size();
@@ -2399,6 +2418,18 @@ impl ApplicationHandler<UserEvent> for App {
         if std::mem::take(&mut self.pip_moved) && self.ui.pip {
             self.remember_pip();
         }
+        if let Some((scale, since)) = self.pending_window_size {
+            let ready = self.window().is_some_and(|w| !w.is_maximized() && w.fullscreen().is_none()) && !self.player.fullscreen;
+            if ready || since.elapsed() > Duration::from_secs(1) {
+                self.pending_window_size = None;
+                let _ = self.fit_window(scale, false);
+            } else {
+                let t = Instant::now() + Duration::from_millis(30);
+                if self.repaint_at.is_none_or(|r| t < r) {
+                    self.repaint_at = Some(t);
+                }
+            }
+        }
         if let Some(m) = self.minimized_state.take() {
             self.on_minimized(m);
         }
@@ -2498,7 +2529,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.state != ElementState::Pressed || egui_ctx.wants_keyboard_input() {
                     return;
                 }
-                if let Some(spec) = keys::event_to_spec(&event, self.modifiers) {
+                let spec = keys::event_to_spec(&event, self.modifiers);
+                dbg_log(format!("key {:?} / {:?} -> {spec:?}", event.logical_key, event.physical_key));
+                if let Some(spec) = spec {
                     if ui::capture_key(&mut self.ui, &spec) {
                         self.redraw();
                         return;
