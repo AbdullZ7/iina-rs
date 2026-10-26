@@ -459,6 +459,7 @@ const AR: &[(&str, &str)] = &[
     ("OK", "موافق"),
     ("Side buttons (4 / 5)", "الزرّان الجانبيان (4 / 5)"),
     ("Side button step", "خطوة الزرّين الجانبيين"),
+    ("Window size: {}%", "حجم النافذة: {}%"),
     // App messages
     (
         "Registered. Pick IINA-RS under “Open with”, or set it as default in Default apps.",

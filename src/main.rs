@@ -17,6 +17,8 @@ mod settings;
 mod state;
 mod sub_finder;
 mod sub_preview;
+#[cfg(windows)]
+mod taskbar;
 mod subtitles;
 mod thumbs;
 mod update;
@@ -56,6 +58,10 @@ enum UserEvent {
     /// System media controls (media keys, SMTC / MPRIS / Now Playing).
     Media(media_keys::MediaCmd),
     UpdateChecked,
+    /// Taskbar thumbnail button: 1 previous, 2 play/pause, 3 next.
+    TaskbarButton(u8),
+    /// Explorer (re)created our taskbar button.
+    TaskbarCreated,
 }
 
 /// A black window covering another monitor while in fullscreen.
@@ -147,6 +153,8 @@ struct App {
     /// A resize cursor is shown on a PiP window edge.
     pip_cursor_set: bool,
     media: Option<media_keys::Media>,
+    #[cfg(windows)]
+    taskbar: Option<taskbar::Taskbar>,
     /// Send the playback position to the system controls (after seeks).
     media_sync: bool,
     /// Music mode was entered automatically for an audio file.
@@ -286,6 +294,8 @@ impl App {
             save_settings_at: None,
             pip_cursor_set: false,
             media: None,
+            #[cfg(windows)]
+            taskbar: None,
             media_sync: false,
             auto_music: false,
             minimized_paused: false,
@@ -500,6 +510,8 @@ impl App {
 
     fn after_window_created(&mut self) {
         self.start_media_controls();
+        #[cfg(windows)]
+        self.start_taskbar();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         if self.ui.settings.check_updates && now.saturating_sub(self.ui.settings.last_update_check) > 24 * 3600 && std::env::var_os("IINA_RS_SNAPSHOT").is_none() {
             self.check_updates();
@@ -647,6 +659,21 @@ impl App {
             "toggle-music-mode" => {
                 self.auto_music = false;
                 self.toggle_music_mode();
+            }
+            // PotPlayer's number keys: window at 50 / 100 / 150 / 200 %.
+            "window-size" => {
+                if let Ok(scale) = arg.trim().parse::<f64>() {
+                    if self.player.fullscreen {
+                        self.leave_fullscreen_now();
+                    }
+                    if let Some(w) = self.window() {
+                        if w.is_maximized() {
+                            w.set_maximized(false);
+                        }
+                    }
+                    let _ = self.fit_to_video(scale);
+                    self.ui.show_osd(i18n::tlf("Window size: {}%", &[&format!("{:.0}", scale * 100.0)]), None);
+                }
             }
             "fit-to-screen" => {
                 if let Some(w) = self.window() {
@@ -1031,6 +1058,32 @@ impl App {
     }
 
     // ---------------------------------------------------- system media keys
+
+    /// Previous / Play·Pause / Next under the taskbar thumbnail.
+    #[cfg(windows)]
+    fn start_taskbar(&mut self) {
+        if self.taskbar.is_some() {
+            return;
+        }
+        let Some(w) = self.window() else { return };
+        let Ok(h) = w.window_handle() else { return };
+        let winit::raw_window_handle::RawWindowHandle::Win32(h) = h.as_raw() else { return };
+        let tips = ["Previous", "Play", "Pause", "Next"].map(i18n::tl);
+        let (p1, p2) = (self.proxy.clone(), self.proxy.clone());
+        self.taskbar = taskbar::Taskbar::new(
+            h.hwnd.get() as *mut std::ffi::c_void,
+            tips,
+            move |b| {
+                let _ = p1.send_event(UserEvent::TaskbarButton(b as u8));
+            },
+            move || {
+                let _ = p2.send_event(UserEvent::TaskbarCreated);
+            },
+        );
+        if let Some(tb) = self.taskbar.as_mut() {
+            tb.add(self.player.pause || self.player.idle);
+        }
+    }
 
     fn start_media_controls(&mut self) {
         if std::env::var_os("IINA_RS_SNAPSHOT").is_some() || self.media.is_some() {
@@ -2173,6 +2226,20 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::Media(cmd) => self.media_command(cmd),
             UserEvent::UpdateChecked => self.redraw(),
+            UserEvent::TaskbarButton(b) => {
+                match b {
+                    1 => self.mpv.command(&["playlist-prev"]),
+                    2 => self.toggle_pause(),
+                    _ => self.mpv.command(&["playlist-next"]),
+                }
+                self.redraw();
+            }
+            UserEvent::TaskbarCreated => {
+                #[cfg(windows)]
+                if let Some(tb) = self.taskbar.as_mut() {
+                    tb.recreated(self.player.pause || self.player.idle);
+                }
+            }
             UserEvent::Repaint(delay) => {
                 if delay.is_zero() {
                     self.redraw();
@@ -2224,6 +2291,10 @@ impl ApplicationHandler<UserEvent> for App {
             self.on_minimized(m);
         }
         self.update_media();
+        #[cfg(windows)]
+        if let Some(tb) = self.taskbar.as_mut() {
+            tb.set_paused(self.player.pause || self.player.idle);
+        }
         self.update_blackout(el);
         self.poll_screenshot();
         if let Some(t) = self.save_settings_at {

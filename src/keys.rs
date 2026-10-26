@@ -26,6 +26,16 @@ const DESKTOP_EXTRAS: &str = "
 #@iina Meta+, preferences
 Meta+q quit
 #@iina F11 toggle-fullscreen
+#@iina 1 window-size 0.5
+#@iina 2 window-size 1
+#@iina 3 window-size 1.5
+#@iina 4 window-size 2
+#@iina 5 fit-to-screen
+#@iina Alt+1 window-size 0.5
+#@iina Alt+2 window-size 1
+#@iina Alt+3 window-size 1.5
+#@iina Alt+4 window-size 2
+#@iina Alt+5 fit-to-screen
 ";
 
 #[derive(Clone, Debug)]
