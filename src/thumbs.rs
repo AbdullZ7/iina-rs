@@ -8,16 +8,40 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Number of thumbnails per file (IINA uses ~100).
-const COUNT: usize = 100;
-/// Thumbnail width in pixels; height follows the video's aspect ratio.
-const WIDTH: i32 = 320;
+/// About one thumbnail every few seconds, within these bounds (IINA: ~100).
+const MIN_COUNT: usize = 120;
+const MAX_COUNT: usize = 480;
+const SECONDS_PER_THUMB: f64 = 4.0;
+/// Thumbnail width in pixels (sharp at ~150 % display scaling); height
+/// follows the video's aspect ratio.
+const WIDTH: i32 = 480;
+const JPEG_QUALITY: u8 = 85;
+
+/// A thumbnail kept as JPEG (decoded when shown), so hundreds stay small.
+pub struct Thumb {
+    pub time: f64,
+    pub jpeg: Vec<u8>,
+}
+
+impl Thumb {
+    pub fn decode(&self) -> Option<egui::ColorImage> {
+        let img = image::load_from_memory_with_format(&self.jpeg, image::ImageFormat::Jpeg).ok()?.to_rgba8();
+        Some(egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()))
+    }
+}
+
+fn encode_jpeg(rgb: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    let mut jpeg = Vec::new();
+    let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, JPEG_QUALITY);
+    image::ImageEncoder::write_image(enc, rgb, w, h, image::ExtendedColorType::Rgb8).ok()?;
+    Some(jpeg)
+}
 
 #[derive(Default)]
 pub struct Thumbnails {
     pub path: String,
-    /// `(time, image)` in increasing time order.
-    pub images: Vec<(f64, egui::ColorImage)>,
+    /// In increasing time order.
+    pub images: Vec<Thumb>,
     pub done: bool,
 }
 
@@ -27,9 +51,9 @@ impl Thumbnails {
         if self.images.is_empty() {
             return None;
         }
-        let i = self.images.partition_point(|(ts, _)| *ts < t);
+        let i = self.images.partition_point(|th| th.time < t);
         let best = match (i.checked_sub(1), self.images.get(i)) {
-            (Some(a), Some(_)) if (t - self.images[a].0).abs() <= (self.images[i].0 - t).abs() => a,
+            (Some(a), Some(_)) if (t - self.images[a].time).abs() <= (self.images[i].time - t).abs() => a,
             (Some(a), None) => a,
             _ => i,
         };
@@ -92,7 +116,10 @@ mod cache {
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
 
-    const MAGIC: &[u8; 8] = b"IRSTHMB1";
+    use super::Thumb;
+
+    /// v2: 480 px, more thumbnails (v1 caches are rebuilt).
+    const MAGIC: &[u8; 8] = b"IRSTHMB2";
 
     /// FNV-1a: stable across runs (unlike std's hasher).
     fn fnv(s: &str) -> u64 {
@@ -108,7 +135,7 @@ mod cache {
         Some((dir.join(format!("{:016x}.thumbs", fnv(video))), key))
     }
 
-    pub fn load(file: &Path, key: u64) -> Option<Vec<(f64, egui::ColorImage)>> {
+    pub fn load(file: &Path, key: u64) -> Option<Vec<Thumb>> {
         let mut data = Vec::new();
         std::fs::File::open(file).ok()?.read_to_end(&mut data).ok()?;
         if data.len() < 20 || &data[..8] != MAGIC || u64::from_le_bytes(data[8..16].try_into().ok()?) != key {
@@ -120,18 +147,16 @@ mod cache {
         for _ in 0..count {
             let t = f64::from_le_bytes(data.get(pos..pos + 8)?.try_into().ok()?);
             let len = u32::from_le_bytes(data.get(pos + 8..pos + 12)?.try_into().ok()?) as usize;
-            let jpeg = data.get(pos + 12..pos + 12 + len)?;
+            let jpeg = data.get(pos + 12..pos + 12 + len)?.to_vec();
             pos += 12 + len;
-            let img = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).ok()?.to_rgba8();
-            let size = [img.width() as usize, img.height() as usize];
-            out.push((t, egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw())));
+            out.push(Thumb { time: t, jpeg });
         }
         // Mark as recently used for the size limit.
         let _ = std::fs::File::options().append(true).open(file).and_then(|f| f.set_modified(std::time::SystemTime::now()));
         (!out.is_empty()).then_some(out)
     }
 
-    pub fn save(file: &Path, key: u64, images: &[(f64, egui::ColorImage)]) {
+    pub fn save(file: &Path, key: u64, images: &[Thumb]) {
         if images.len() < 10 {
             return;
         }
@@ -139,16 +164,10 @@ mod cache {
         data.extend_from_slice(MAGIC);
         data.extend_from_slice(&key.to_le_bytes());
         data.extend_from_slice(&(images.len() as u32).to_le_bytes());
-        for (t, img) in images {
-            let rgb: Vec<u8> = img.pixels.iter().flat_map(|c| [c.r(), c.g(), c.b()]).collect();
-            let mut jpeg = Vec::new();
-            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 75);
-            if image::ImageEncoder::write_image(enc, &rgb, img.size[0] as u32, img.size[1] as u32, image::ExtendedColorType::Rgb8).is_err() {
-                return;
-            }
-            data.extend_from_slice(&t.to_le_bytes());
-            data.extend_from_slice(&(jpeg.len() as u32).to_le_bytes());
-            data.extend_from_slice(&jpeg);
+        for th in images {
+            data.extend_from_slice(&th.time.to_le_bytes());
+            data.extend_from_slice(&(th.jpeg.len() as u32).to_le_bytes());
+            data.extend_from_slice(&th.jpeg);
         }
         let tmp = file.with_extension("tmp");
         if std::fs::File::create(&tmp).and_then(|mut f| f.write_all(&data)).is_ok() {
@@ -189,13 +208,14 @@ mod cache {
             let dir = std::env::temp_dir().join(format!("iina-rs-thumbcache-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
             let file = dir.join("x.thumbs");
-            let imgs: Vec<(f64, egui::ColorImage)> =
-                (0..12).map(|i| (i as f64, egui::ColorImage::new([32, 18], vec![egui::Color32::from_rgb(200, 30, 30); 32 * 18]))).collect();
+            let rgb: Vec<u8> = [200u8, 30, 30].repeat(32 * 18);
+            let imgs: Vec<super::Thumb> = (0..12).map(|i| super::Thumb { time: i as f64, jpeg: super::super::encode_jpeg(&rgb, 32, 18).unwrap() }).collect();
             super::save(&file, 42, &imgs);
             let back = super::load(&file, 42).expect("cache loads");
             assert_eq!(back.len(), 12);
-            assert_eq!(back[3].1.size, [32, 18]);
-            let px = back[0].1.pixels[0];
+            let img = back[3].decode().unwrap();
+            assert_eq!(img.size, [32, 18]);
+            let px = img.pixels[0];
             assert!((px.r() as i32 - 200).abs() < 12 && px.g() < 50, "{px:?}");
             assert!(super::load(&file, 43).is_none(), "stale key rejected");
             let _ = std::fs::remove_dir_all(&dir);
@@ -271,8 +291,9 @@ fn run(path: &str, shared: &Mutex<Thumbnails>, cancel: &AtomicBool, wake: &dyn F
     let mut buf = vec![0u8; stride * h as usize];
 
     let started = Instant::now();
-    for (n, i) in coarse_to_fine(COUNT).into_iter().enumerate() {
-        let t = duration * (i as f64 + 0.5) / COUNT as f64;
+    let count = ((duration / SECONDS_PER_THUMB) as usize).clamp(MIN_COUNT, MAX_COUNT);
+    for (n, i) in coarse_to_fine(count).into_iter().enumerate() {
+        let t = duration * (i as f64 + 0.5) / count as f64;
         while rx.try_recv().is_ok() {}
         mpv.command(&["seek", &format!("{t:.3}"), "absolute+keyframes"]);
         if wait_for(&mpv, cancel, Duration::from_secs(10), |e| matches!(e, Event::PlaybackRestart)).is_err() {
@@ -297,20 +318,20 @@ fn run(path: &str, shared: &Mutex<Thumbnails>, cancel: &AtomicBool, wake: &dyn F
         if !got {
             continue;
         }
-        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
         for row in buf.chunks(stride).take(h as usize) {
             for px in row[..w as usize * 4].chunks(4) {
-                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                rgb.extend_from_slice(&px[..3]);
             }
         }
         let actual = mpv.get_string("time-pos").and_then(|s| s.parse::<f64>().ok()).unwrap_or(t);
-        let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+        let Some(jpeg) = encode_jpeg(&rgb, w as u32, h as u32) else { continue };
         {
             let mut s = shared.lock().unwrap();
-            let pos = s.images.partition_point(|(ts, _)| *ts < actual);
+            let pos = s.images.partition_point(|th| th.time < actual);
             // Keyframe seeks can land on the same frame twice; skip duplicates.
-            if !s.images.get(pos).is_some_and(|(ts, _)| (*ts - actual).abs() < 1e-3) {
-                s.images.insert(pos, (actual, img));
+            if !s.images.get(pos).is_some_and(|th| (th.time - actual).abs() < 1e-3) {
+                s.images.insert(pos, Thumb { time: actual, jpeg });
             }
         }
         if n % 5 == 4 {

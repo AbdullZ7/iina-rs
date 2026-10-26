@@ -750,12 +750,16 @@ fn seek_preview(ctx: &egui::Context, st: &mut UiState, pl: &Player, thumbs: Opti
             st.thumb_tex.clear();
         }
         if let Some(i) = t.nearest(hover.value) {
-            tex = Some(
-                st.thumb_tex
-                    .entry(i)
-                    .or_insert_with(|| ctx.load_texture(format!("thumb-{i}"), t.images[i].1.clone(), egui::TextureOptions::LINEAR))
-                    .clone(),
-            );
+            if !st.thumb_tex.contains_key(&i) {
+                // Decoded on demand; keep a bounded set of textures.
+                if st.thumb_tex.len() > 120 {
+                    st.thumb_tex.clear();
+                }
+                if let Some(img) = t.images[i].decode() {
+                    st.thumb_tex.insert(i, ctx.load_texture(format!("thumb-{i}"), img, egui::TextureOptions::LINEAR));
+                }
+            }
+            tex = st.thumb_tex.get(&i).cloned();
         }
     }
 
@@ -763,7 +767,7 @@ fn seek_preview(ctx: &egui::Context, st: &mut UiState, pl: &Player, thumbs: Opti
     let (img_size, w) = match &tex {
         Some(t) => {
             let [tw, th] = t.size();
-            let width = if st.settings.thumbnail_width > 0.0 { st.settings.thumbnail_width } else { (screen.width() / 5.0).clamp(140.0, 260.0) };
+            let width = if st.settings.thumbnail_width > 0.0 { st.settings.thumbnail_width } else { (screen.width() / 4.5).clamp(160.0, 300.0) };
             let s = vec2(width, width * th as f32 / tw.max(1) as f32);
             (Some(s), s.x.max(galley.size().x) + pad * 2.0)
         }
@@ -773,12 +777,15 @@ fn seek_preview(ctx: &egui::Context, st: &mut UiState, pl: &Player, thumbs: Opti
     let x = (hover.anchor.x - w / 2.0).clamp(screen.left() + 4.0, screen.right() - w - 4.0);
     let y = if hover.below { hover.anchor.y + 8.0 } else { hover.anchor.y - h - 8.0 };
     let frame = Rect::from_min_size(pos2(x, y), vec2(w, h));
-    painter.rect_filled(frame, 6.0, Color32::from_black_alpha(215));
-    painter.rect_stroke(frame, 6.0, Stroke::new(1.0_f32, Color32::from_white_alpha(30)), egui::StrokeKind::Inside);
+    // Soft shadow, then the card.
+    painter.rect_filled(frame.translate(vec2(0.0, 3.0)).expand(2.0), 9.0, Color32::from_black_alpha(70));
+    painter.rect_filled(frame, 8.0, Color32::from_black_alpha(220));
+    painter.rect_stroke(frame, 8.0, Stroke::new(1.0_f32, Color32::from_white_alpha(30)), egui::StrokeKind::Inside);
     let mut y = frame.top() + pad;
     if let (Some(t), Some(s)) = (&tex, img_size) {
         let r = Rect::from_min_size(pos2(frame.center().x - s.x / 2.0, y), s);
-        painter.image(t.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        painter.add(egui::epaint::RectShape::filled(r, 5.0, Color32::WHITE).with_texture(t.id(), uv));
         y += s.y + pad;
     }
     painter.galley(pos2(frame.center().x - galley.size().x / 2.0, y + 2.0), galley, Color32::WHITE);
