@@ -1648,7 +1648,9 @@ fn url_dialog(ctx: &egui::Context, st: &mut UiState, mpv: &Mpv) {
         .id(egui::Id::new("win-Open URL"))
         .collapsible(false)
         .resizable(false)
-        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        // Opens centred; can be dragged away (e.g. to watch the subtitle).
+        .pivot(Align2::CENTER_CENTER)
+        .default_pos(ctx.screen_rect().center())
         .show(ctx, |ui| rtl_window(ui, 440.0, |ui| {
             if rtl_header(ui, &t("Open URL")) {
                 close = true;
@@ -1693,7 +1695,9 @@ fn jump_dialog(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv) {
         .id(egui::Id::new("win-Jump to"))
         .collapsible(false)
         .resizable(false)
-        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        // Opens centred; can be dragged away (e.g. to watch the subtitle).
+        .pivot(Align2::CENTER_CENTER)
+        .default_pos(ctx.screen_rect().center())
         .show(ctx, |ui| rtl_window(ui, 400.0, |ui| {
             if rtl_header(ui, &t("Jump to")) {
                 close = true;
@@ -1848,7 +1852,9 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
         .resizable(false)
         .min_width(600.0)
         .max_width(600.0)
-        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        // Opens centred; can be dragged away (e.g. to watch the subtitle).
+        .pivot(Align2::CENTER_CENTER)
+        .default_pos(ctx.screen_rect().center())
         .show(ctx, |ui| rtl_window(ui, 600.0, |ui| {
             if rtl_header(ui, &t("Preferences")) {
                 header_close = true;
@@ -2123,7 +2129,9 @@ fn about(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
-        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+        // Opens centred; can be dragged away (e.g. to watch the subtitle).
+        .pivot(Align2::CENTER_CENTER)
+        .default_pos(ctx.screen_rect().center())
         .show(ctx, |ui| rtl_window(ui, 380.0, |ui| {
             if rtl_header(ui, &t("About IINA-RS")) {
                 header_close = true;

@@ -1530,6 +1530,30 @@ impl App {
             let pos = egui::pos2(r.left() + r.width() * f, r.center().y);
             gfx.egui.egui_winit.egui_input_mut().events.push(egui::Event::PointerMoved(pos));
         }
+        // Debug aid: IINA_RS_DRAG="x0,y0,x1,y1" (fractions of the window)
+        // drags with the mouse after IINA_RS_DRAG_AT seconds (default 5).
+        if let Some(d) = std::env::var("IINA_RS_DRAG").ok() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static STEP: AtomicU32 = AtomicU32::new(0);
+            let at = std::env::var("IINA_RS_DRAG_AT").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(5.0);
+            let f: Vec<f32> = d.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+            let step = STEP.load(Ordering::Relaxed);
+            if f.len() == 4 && step <= 12 && self.started.elapsed().as_secs_f64() > at {
+                let r = gfx.egui.egui_ctx.screen_rect();
+                let p = |t: f32| egui::pos2(r.width() * (f[0] + (f[2] - f[0]) * t), r.height() * (f[1] + (f[3] - f[1]) * t));
+                let ev = &mut gfx.egui.egui_winit.egui_input_mut().events;
+                let pos = p((step.saturating_sub(1) as f32 / 10.0).min(1.0));
+                ev.push(egui::Event::PointerMoved(pos));
+                let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+                if step == 1 {
+                    ev.push(button(true));
+                } else if step == 12 {
+                    ev.push(button(false));
+                }
+                STEP.store(step + 1, Ordering::Relaxed);
+                window.request_redraw();
+            }
+        }
         let thumbs = self.thumbs.as_ref().map(|t| t.shared.clone());
         let guard = thumbs.as_ref().map(|t| t.lock().unwrap());
         let mut cmds = Vec::new();
