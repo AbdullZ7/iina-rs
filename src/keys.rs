@@ -26,6 +26,37 @@ const DESKTOP_EXTRAS: &str = "
 #@iina Meta+, preferences
 Meta+q quit
 #@iina F11 toggle-fullscreen
+#@iina F1 about
+#@iina F3 open-file
+#@iina F4 close-file
+#@iina F5 preferences
+#@iina F6 playlist-panel
+#@iina F7 audio-panel
+PGUP playlist-prev
+PGDWN playlist-next
+BS seek 0 absolute
+#@iina g jump-to
+l cycle sub
+a cycle audio
+c add speed 0.1
+x add speed -0.1
+> add sub-delay 0.5
+< add sub-delay -0.5
+/ set sub-delay 0
+#@iina Ctrl+e screenshot
+#@iina Ctrl+c screenshot-clipboard
+#@iina Ctrl+z toggle-mirror
+#@iina Ctrl+v toggle-flip
+j cycle-values video-aspect-override 16:9 4:3 2.35:1 -1
+w add brightness -1
+e add brightness 1
+y add saturation -1
+u add saturation 1
+[ set ab-loop-a ${time-pos}
+] set ab-loop-b ${time-pos}
+\\ ab-loop
+d frame-back-step
+#@iina Shift+N toggle-normalize
 #@iina 1 window-size 0.5
 #@iina 2 window-size 1
 #@iina 3 window-size 1.5

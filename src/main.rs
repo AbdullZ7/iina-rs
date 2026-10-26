@@ -166,6 +166,10 @@ struct App {
     blackout: Vec<Blackout>,
     /// A screenshot was requested at this time (preview / clipboard pending).
     shot_pending: Option<(Instant, std::time::SystemTime)>,
+    /// The pending screenshot goes to the clipboard whatever the setting.
+    shot_to_clipboard: bool,
+    /// Audio normalization filter currently inserted.
+    normalize_applied: bool,
     /// The PiP window moved/resized: remember its rect (in about_to_wait).
     pip_moved: bool,
     /// The window has been centred once (later resizes keep its centre).
@@ -324,6 +328,8 @@ impl App {
             minimized_state: None,
             blackout: Vec::new(),
             shot_pending: None,
+            shot_to_clipboard: false,
+            normalize_applied: false,
             pip_moved: false,
             window_centred: false,
             keep_awake: false,
@@ -531,6 +537,7 @@ impl App {
     }
 
     fn after_window_created(&mut self) {
+        self.apply_normalize();
         self.start_media_controls();
         #[cfg(windows)]
         self.start_taskbar();
@@ -724,6 +731,18 @@ impl App {
                 self.ui.key_editor = Some(ui::KeyEditor { rows: self.bindings.rows(), filter: String::new(), capture: None, dirty: false });
             }
             "keybindings-save" => self.save_key_bindings(),
+            // PotPlayer's Ctrl+C: screenshot straight to the clipboard.
+            "screenshot-clipboard" => {
+                self.take_screenshot();
+                self.shot_to_clipboard = true;
+            }
+            "toggle-normalize" => {
+                self.ui.settings.normalize_audio = !self.ui.settings.normalize_audio;
+                self.apply_normalize();
+                self.save_settings_at = Some(Instant::now() + Duration::from_secs(1));
+                let msg = if self.ui.settings.normalize_audio { "Audio normalization: On" } else { "Audio normalization: Off" };
+                self.ui.show_osd(i18n::tl(msg), None);
+            }
             "font-dialog" => {
                 if self.ui.font_dialog.is_none() {
                     let p = self.proxy.clone();
@@ -1266,7 +1285,7 @@ impl App {
         self.shot_pending = None;
         let rgba = image.to_rgba8();
         let mut copied = false;
-        if self.ui.settings.screenshot_clipboard {
+        if self.ui.settings.screenshot_clipboard || std::mem::take(&mut self.shot_to_clipboard) {
             copied = copy_rgba_to_clipboard(&rgba);
             if copied && !self.ui.settings.screenshot_preview {
                 self.ui.show_osd(i18n::tl("Screenshot copied to clipboard"), None);
@@ -1628,7 +1647,7 @@ impl App {
         // Like IINA, lift subtitles above the controller while it is shown.
         // sub-margin-y is in units of a 720px-tall frame; the bar is ~130pt high.
         // The user's bottom margin is the base; the controller lifts it further.
-        let lift = self.ui.osc_visible && !self.player.idle && !self.ui.pip;
+        let lift = self.ui.settings.subs.lift_above_controller && self.ui.osc_visible && !self.player.idle && !self.ui.pip;
         let base = self.ui.settings.subs.margin;
         let margin = if lift {
             let h_pt = size.height as f64 / window.scale_factor();
@@ -1755,11 +1774,24 @@ impl App {
         self.redraw();
     }
 
+    /// Inserts / removes the dynamic audio normalizer (boosts quiet parts).
+    fn apply_normalize(&mut self) {
+        let want = self.ui.settings.normalize_audio;
+        if want != self.normalize_applied {
+            if want {
+                self.mpv.command(&["af", "add", "@iina-norm:lavfi=[dynaudnorm=f=250:g=31:m=20:p=0.95]"]);
+            } else {
+                self.mpv.command(&["af", "remove", "@iina-norm"]);
+            }
+            self.normalize_applied = want;
+        }
+    }
+
     fn take_screenshot(&mut self) {
         let mode = if self.ui.settings.screenshot_with_subs { "subtitles" } else { "video" };
         self.mpv.command(&["screenshot", mode]);
         self.ui.show_osd(i18n::tl("Screenshot Captured"), None);
-        if self.ui.settings.screenshot_preview || self.ui.settings.screenshot_clipboard {
+        if self.ui.settings.screenshot_preview || self.ui.settings.screenshot_clipboard || self.shot_to_clipboard {
             self.shot_pending = Some((Instant::now(), std::time::SystemTime::now()));
         }
     }
@@ -2028,6 +2060,7 @@ impl App {
     }
 
     fn apply_settings(&mut self) {
+        self.apply_normalize();
         let s = self.ui.settings.clone();
         i18n::set_language(i18n::resolve(&s.language));
         for (k, v) in s.mpv_options() {

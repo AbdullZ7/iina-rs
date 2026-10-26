@@ -140,10 +140,16 @@ pub struct Settings {
     // --------------------------------------------------------------- advanced
     /// Extra mpv options, one `name=value` per line (applied last).
     pub mpv_options: String,
+    /// Boost quiet passages (dynamic normalization, PotPlayer's Shift+N).
+    pub normalize_audio: bool,
+    /// Settings format version (for one-time default updates).
+    pub version: u32,
 
     /// Last Picture-in-Picture window (x, y, width, height in physical pixels).
     pub pip_rect: Option<[i32; 4]>,
 }
+
+pub const SETTINGS_VERSION: u32 = 1;
 
 /// A saved video/audio filter (mpv `vf`/`af` syntax), toggled from the
 /// Filters window.
@@ -197,6 +203,8 @@ pub struct SubStyle {
     pub secondary_position: f64,
     /// Scale subtitles with the window size (IINA: on).
     pub scale_by_window: bool,
+    /// Lift subtitles above the controller while it is shown (IINA).
+    pub lift_above_controller: bool,
     /// Text encoding of external subtitles ("auto", "cp1256", "utf-8", …).
     pub encoding: String,
     /// mpv `sub-ass-override`: "scale" (as authored), "force" (use my style), "strip".
@@ -235,7 +243,10 @@ impl Default for SubStyle {
             margin: 22.0,
             margin_x: 25.0,
             secondary_position: 5.0,
-            scale_by_window: true,
+            // Size follows the video (PotPlayer), not the window, so it
+            // stays in proportion to the picture in any window shape.
+            scale_by_window: false,
+            lift_above_controller: false,
             encoding: "auto".into(),
             ass_override: "scale".into(),
             autoload: "fuzzy".into(),
@@ -288,7 +299,7 @@ impl Default for Settings {
             hdr_peak_nits: 0.0,
             volume: 100.0,
             remember_volume: true,
-            volume_max: 100.0,
+            volume_max: 150.0,
             audio_languages: String::new(),
             audio_device: "auto".into(),
             spdif: vec![],
@@ -314,7 +325,7 @@ impl Default for Settings {
             // IINA pauses on right click; without a menu bar, the context menu
             // is the only way to reach many commands on Windows/Linux.
             right_click: "menu".into(),
-            middle_click: "none".into(),
+            middle_click: "pause".into(),
             scroll_vertical: "volume".into(),
             scroll_horizontal: "seek".into(),
             click_to_pause: false,
@@ -335,6 +346,8 @@ impl Default for Settings {
             subs: SubStyle::default(),
 
             mpv_options: String::new(),
+            normalize_audio: false,
+            version: SETTINGS_VERSION,
             pip_rect: None,
         }
     }
@@ -351,6 +364,19 @@ impl Settings {
         if s.click_to_pause {
             s.single_click = "pause".into();
             s.click_to_pause = false;
+        }
+        // v1: new defaults, applied only where the old default is still set.
+        if s.version < 1 {
+            if s.middle_click == "none" {
+                s.middle_click = "pause".into();
+            }
+            if s.volume_max == 100.0 {
+                s.volume_max = 150.0;
+            }
+            if s.subs.scale_by_window {
+                s.subs.scale_by_window = false;
+            }
+            s.version = 1;
         }
         s
     }
@@ -461,6 +487,28 @@ pub fn parse_mpv_conf(text: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_old_defaults_only() {
+        let dir = std::env::temp_dir().join(format!("iina-rs-mig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // An old file: defaults of the time, plus one value the user chose.
+        let mut old = serde_json::to_value(Settings::default()).unwrap();
+        old["version"] = 0.into();
+        old["middle_click"] = "none".into();
+        old["volume_max"] = 100.0.into();
+        old["subs"]["scale_by_window"] = true.into();
+        std::fs::write(dir.join("settings.json"), old.to_string()).unwrap();
+        let s = Settings::load(&dir);
+        assert_eq!((s.middle_click.as_str(), s.volume_max, s.subs.scale_by_window, s.version), ("pause", 150.0, false, 1));
+        // A choice the user made is kept.
+        old["middle_click"] = "fullscreen".into();
+        old["volume_max"] = 200.0.into();
+        std::fs::write(dir.join("settings.json"), old.to_string()).unwrap();
+        let s = Settings::load(&dir);
+        assert_eq!((s.middle_click.as_str(), s.volume_max), ("fullscreen", 200.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_mpv_conf_sections() {

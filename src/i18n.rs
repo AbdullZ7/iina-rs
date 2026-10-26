@@ -460,6 +460,11 @@ const AR: &[(&str, &str)] = &[
     ("Side buttons (4 / 5)", "الزرّان الجانبيان (4 / 5)"),
     ("Side button step", "خطوة الزرّين الجانبيين"),
     ("Window size: {}%", "حجم النافذة: {}%"),
+    ("Scale subtitles with the window (not the video)", "تحجيم الترجمة مع النافذة (لا مع المرئي)"),
+    ("Lift subtitles above the controller while it is shown", "رفع الترجمة فوق المتحكم عند ظهوره"),
+    ("Normalize audio (boost quiet parts)", "تسوية الصوت (رفع المقاطع الخافتة)"),
+    ("Audio normalization: On", "تسوية الصوت: يعمل"),
+    ("Audio normalization: Off", "تسوية الصوت: مغلق"),
     // App messages
     (
         "Registered. Pick IINA-RS under “Open with”, or set it as default in Default apps.",

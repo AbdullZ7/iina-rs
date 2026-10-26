@@ -1524,7 +1524,10 @@ fn audio_tab(ui: &mut Ui, st: &mut UiState, pl: &Player, mpv: &Mpv, cmds: &mut V
         cmds.push("add-audio".into());
     }
     ui.separator();
-    labeled_slider(ui, mpv, "Volume", "volume", pl.volume, 0.0..=130.0, 100.0, "");
+    labeled_slider(ui, mpv, "Volume", "volume", pl.volume, 0.0..=st.settings.volume_max.max(100.0), 100.0, "");
+    if check(ui, &mut st.settings.normalize_audio, t("Normalize audio (boost quiet parts)")).changed() {
+        st.settings_dirty = true;
+    }
     labeled_slider(ui, mpv, "Audio delay", "audio-delay", pl.audio_delay, -5.0..=5.0, 0.0, " s");
     ui.separator();
     ui.label(RichText::new(t("Equalizer")).strong());
@@ -2399,7 +2402,8 @@ fn subtitle_prefs(ui: &mut Ui, s: &mut crate::settings::SubStyle, cmds: &mut Vec
     field(ui, "Side margin", |ui| {
         slider(ui, &mut s.margin_x, 0.0..=300.0, "", 0);
     });
-    check(ui, &mut s.scale_by_window, t("Scale subtitles with the window"));
+    check(ui, &mut s.scale_by_window, t("Scale subtitles with the window (not the video)"));
+    check(ui, &mut s.lift_above_controller, t("Lift subtitles above the controller while it is shown"));
     field(ui, "Secondary subtitle position", |ui| {
         slider(ui, &mut s.secondary_position, 0.0..=100.0, "", 0);
     });
