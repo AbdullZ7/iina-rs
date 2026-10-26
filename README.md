@@ -82,11 +82,11 @@ reuses IINA's key-binding files and icon (GPLv3), and rebuilds the IINA UI in Ru
 
 ### Linux
 ```bash
-sudo apt install ./iina-rs_0.4.0_amd64.deb
+sudo apt install ./iina-rs_0.5.0_amd64.deb
 ```
 أو من الأرشيف:
 ```bash
-tar xf IINA-RS-0.4.0-linux-x86_64.tar.gz && ./IINA-RS-0.4.0-linux-x86_64/install.sh
+tar xf IINA-RS-0.5.0-linux-x86_64.tar.gz && ./IINA-RS-0.5.0-linux-x86_64/install.sh
 ```
 يتطلب libmpv: `libmpv2` (Debian/Ubuntu)، `mpv-libs` (Fedora)، `mpv` (Arch).
 الملف التنفيذي لا يعتمد إلا على glibc ≥ 2.31؛ و libmpv و OpenGL و X11/Wayland تُحمَّل وقت التشغيل.
