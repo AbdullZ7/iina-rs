@@ -178,7 +178,7 @@ void main() {
 /// How the composited image reaches the presenter.
 pub enum Share {
     /// GL_EXT_memory_object + shared semaphores (Vulkan).
-    Vk { ext: GlExt, mem: u32, sem_gl_done: u32, sem_vk_done: u32 },
+    Vk { ext: Box<GlExt>, mem: u32, sem_gl_done: u32, sem_vk_done: u32 },
     /// WGL_NV_DX_interop2 (Direct3D 11).
     #[cfg(windows)]
     Dx(crate::dx_present::GlShare),
@@ -195,7 +195,7 @@ impl Share {
                 import_semaphore(&ext, sem, h)?;
             }
         }
-        Ok(Share::Vk { ext, mem: 0, sem_gl_done: sems[0], sem_vk_done: sems[1] })
+        Ok(Share::Vk { ext: Box::new(ext), mem: 0, sem_gl_done: sems[0], sem_vk_done: sems[1] })
     }
 }
 
@@ -207,12 +207,13 @@ pub enum Presenter {
 }
 
 impl Presenter {
-    /// False only in the Vulkan SDR test mode.
+    /// HDR10 output (false: Direct3D for RTX Video on an SDR display, or
+    /// the Vulkan SDR test mode).
     pub fn hdr(&self) -> bool {
         match self {
             Self::Vk(v) => v.hdr,
             #[cfg(windows)]
-            Self::Dx(_) => true,
+            Self::Dx(d) => d.hdr,
         }
     }
 
@@ -250,6 +251,15 @@ impl Presenter {
         }
     }
 
+    /// Presenting through Direct3D 11 on an NVIDIA GPU (RTX Video possible).
+    pub fn is_nvidia(&self) -> bool {
+        match self {
+            Self::Vk(_) => false,
+            #[cfg(windows)]
+            Self::Dx(d) => d.vendor_id == crate::dx_present::VENDOR_NVIDIA,
+        }
+    }
+
     fn read_shared_pixel(&self) -> Result<u32, String> {
         match self {
             Self::Vk(v) => v.read_shared_pixel(),
@@ -259,9 +269,30 @@ impl Presenter {
     }
 }
 
+/// RTX Video request: mpv's render size, super resolution, RTX Video HDR.
+pub type EnhancePlan = ((u32, u32), bool, bool);
+
+/// The GL ends of the RTX Video processor's textures (Direct3D 11 only):
+/// mpv renders into `in_tex`, the composite samples `out_tex`.
+#[cfg(windows)]
+struct EnhanceGl {
+    e: crate::dx_present::Enhancer,
+    plan: EnhancePlan,
+    in_tex: u32,
+    in_fbo: u32,
+    out_tex: u32,
+    in_obj: *mut c_void,
+    out_obj: *mut c_void,
+}
+
 /// Off-screen GL targets for the HDR presenter.
 pub struct GlTargets {
     share: Share,
+    #[cfg(windows)]
+    enh: Option<EnhanceGl>,
+    /// A plan the driver refused (not retried until the size changes).
+    #[cfg(windows)]
+    enh_failed: Option<EnhancePlan>,
     pub video_fbo: u32,
     pub ui_fbo: u32,
     video_tex: u32,
@@ -303,6 +334,10 @@ impl GlTargets {
 
             let mut t = Self {
                 share,
+                #[cfg(windows)]
+                enh: None,
+                #[cfg(windows)]
+                enh_failed: None,
                 video_fbo: 0,
                 ui_fbo: 0,
                 video_tex: 0,
@@ -402,6 +437,11 @@ impl GlTargets {
 
     fn delete_sized(&mut self, gl: &glow::Context) {
         use glow::HasContext;
+        #[cfg(windows)]
+        {
+            self.drop_enhance(gl);
+            self.enh_failed = None;
+        }
         unsafe {
             #[cfg(windows)]
             if let Share::Dx(s) = &mut self.share {
@@ -452,6 +492,14 @@ impl GlTargets {
     /// Composites video + UI into the shared image as PQ / BT.2020.
     pub fn composite(&mut self, gl: &glow::Context, video_hdr: bool, sdr_white_nits: f32, output_pq: bool) {
         use glow::HasContext;
+        #[allow(unused_mut)]
+        let (mut video_tex, mut video_hdr) = (self.video_tex, video_hdr);
+        #[cfg(windows)]
+        if let (Some(x), Share::Dx(s)) = (&self.enh, &self.share) {
+            s.lock_other(x.out_obj);
+            video_tex = x.out_tex;
+            video_hdr |= x.e.true_hdr;
+        }
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, std::num::NonZeroU32::new(self.shared_fbo).map(glow::NativeFramebuffer));
             gl.viewport(0, 0, self.size.0, self.size.1);
@@ -461,7 +509,7 @@ impl GlTargets {
             gl.use_program(Some(self.program));
             gl.bind_vertex_array(Some(self.vao));
             gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, std::num::NonZeroU32::new(self.video_tex).map(glow::NativeTexture));
+            gl.bind_texture(glow::TEXTURE_2D, std::num::NonZeroU32::new(video_tex).map(glow::NativeTexture));
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D, std::num::NonZeroU32::new(self.ui_tex).map(glow::NativeTexture));
             let loc = |n: &str| gl.get_uniform_location(self.program, n);
@@ -478,6 +526,138 @@ impl GlTargets {
             gl.bind_vertex_array(None);
             gl.use_program(None);
         }
+        #[cfg(windows)]
+        if let (Some(x), Share::Dx(s)) = (&self.enh, &self.share) {
+            s.unlock_other(x.out_obj);
+        }
+    }
+
+    /// Sets up (or drops) the RTX Video processor for `plan`, scaling to
+    /// this target's size. Returns true when that changed (the video must
+    /// be rendered again).
+    pub fn set_enhance(&mut self, gl: &glow::Context, p: &Presenter, plan: Option<EnhancePlan>) -> Result<bool, String> {
+        #[cfg(windows)]
+        {
+            if self.enh.as_ref().map(|x| x.plan) == plan || (plan.is_some() && plan == self.enh_failed) {
+                return Ok(false);
+            }
+            self.drop_enhance(gl);
+            let (Some(plan), Share::Dx(share), Presenter::Dx(dx)) = (plan, &self.share, p) else { return Ok(true) };
+            let out_size = (self.size.0 as u32, self.size.1 as u32);
+            let e = match dx.enhancer(plan.0, out_size, plan.1, plan.2) {
+                Ok(e) => e,
+                Err(err) => {
+                    self.enh_failed = Some(plan);
+                    return Err(err);
+                }
+            };
+            let mut x = EnhanceGl { e, plan, in_tex: 0, in_fbo: 0, out_tex: 0, in_obj: std::ptr::null_mut(), out_obj: std::ptr::null_mut() };
+            let r = unsafe { Self::import_enhance(gl, share, &mut x) };
+            match r {
+                Ok(()) => self.enh = Some(x),
+                Err(err) => {
+                    Self::free_enhance(gl, share, &x);
+                    self.enh_failed = Some(plan);
+                    return Err(err);
+                }
+            }
+            Ok(true)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (gl, p, plan);
+            Ok(false)
+        }
+    }
+
+    #[cfg(windows)]
+    unsafe fn import_enhance(gl: &glow::Context, share: &crate::dx_present::GlShare, x: &mut EnhanceGl) -> Result<(), String> {
+        use crate::dx_present::{WGL_ACCESS_READ_ONLY_NV, WGL_ACCESS_WRITE_DISCARD_NV};
+        use glow::HasContext;
+        unsafe {
+            let in_t = gl.create_texture()?;
+            x.in_tex = gl_name(in_t.0);
+            x.in_obj = share.register_other(&x.e.input, x.in_tex, WGL_ACCESS_WRITE_DISCARD_NV)?;
+            let out_t = gl.create_texture()?;
+            x.out_tex = gl_name(out_t.0);
+            x.out_obj = share.register_other(&x.e.output, x.out_tex, WGL_ACCESS_READ_ONLY_NV)?;
+            share.lock_other(x.in_obj);
+            share.lock_other(x.out_obj);
+            let fbo = gl.create_framebuffer()?;
+            x.in_fbo = gl_name(fbo.0);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(in_t), 0);
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            // Same size as the window: no filtering, and no mipmaps.
+            gl.bind_texture(glow::TEXTURE_2D, Some(out_t));
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            share.unlock_other(x.out_obj);
+            share.unlock_other(x.in_obj);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                return Err(format!("RTX Video framebuffer incomplete: 0x{status:x}"));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    fn free_enhance(gl: &glow::Context, share: &crate::dx_present::GlShare, x: &EnhanceGl) {
+        use glow::HasContext;
+        for obj in [x.in_obj, x.out_obj] {
+            if !obj.is_null() {
+                share.unregister_other(obj);
+            }
+        }
+        unsafe {
+            if let Some(n) = std::num::NonZeroU32::new(x.in_fbo) {
+                gl.delete_framebuffer(glow::NativeFramebuffer(n));
+            }
+            for tex in [x.in_tex, x.out_tex] {
+                if let Some(n) = std::num::NonZeroU32::new(tex) {
+                    gl.delete_texture(glow::NativeTexture(n));
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn drop_enhance(&mut self, gl: &glow::Context) {
+        if let (Some(x), Share::Dx(share)) = (self.enh.take(), &self.share) {
+            Self::free_enhance(gl, share, &x);
+        }
+    }
+
+    /// With RTX Video on: locks mpv's render target, returns (fbo, w, h).
+    pub fn enhance_input(&mut self) -> Option<(u32, i32, i32)> {
+        #[cfg(windows)]
+        if let (Some(x), Share::Dx(s)) = (&self.enh, &self.share) {
+            s.lock_other(x.in_obj);
+            return Some((x.in_fbo, x.e.in_size.0 as i32, x.e.in_size.1 as i32));
+        }
+        None
+    }
+
+    /// Hands mpv's frame (rendered after `enhance_input`) to RTX Video.
+    pub fn enhance_run(&mut self) -> Result<(), String> {
+        #[cfg(windows)]
+        if let (Some(x), Share::Dx(s)) = (&self.enh, &self.share) {
+            s.unlock_other(x.in_obj);
+            return x.e.process();
+        }
+        Ok(())
+    }
+
+    /// What RTX Video does now: (super resolution factor, RTX Video HDR).
+    pub fn enhance_state(&self) -> Option<(Option<f32>, bool)> {
+        #[cfg(windows)]
+        if let Some(x) = &self.enh {
+            let factor = x.e.out_size.1 as f32 / x.e.in_size.1.max(1) as f32;
+            return Some((x.e.super_resolution.then_some(factor), x.e.true_hdr));
+        }
+        None
     }
 
     /// Startup check: GL clears the shared image to a known colour and
@@ -523,7 +703,7 @@ impl GlTargets {
 
     pub fn destroy(&mut self, gl: &glow::Context) {
         use glow::HasContext;
-        self.delete_sized(gl);
+        self.delete_sized(gl);  // also drops the RTX Video textures
         match &mut self.share {
             Share::Vk { ext, sem_gl_done, sem_vk_done, .. } => unsafe { (ext.delete_semaphores)(2, [*sem_gl_done, *sem_vk_done].as_ptr()) },
             #[cfg(windows)]

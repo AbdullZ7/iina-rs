@@ -98,6 +98,25 @@ struct Gfx {
     vk: Option<VkMode>,
 }
 
+/// What NVIDIA RTX Video should do this frame: mpv's render size, super
+/// resolution, RTX Video HDR (None: mpv renders at the window size).
+fn rtx_plan(s: &settings::Settings, video_dims: Option<(f64, f64)>, vk: &VkMode, w: i32, h: i32) -> Option<vk_present::EnhancePlan> {
+    if !vk.presenter.is_nvidia() || vk.video_is_hdr {
+        return None;
+    }
+    let (dw, dh) = video_dims?;
+    // mpv renders the video at about its own size; RTX Video scales it up
+    // to 4× (barely enlarged video isn't worth it).
+    let k = (w as f64 / dw).min(h as f64 / dh);
+    let sr = s.rtx_super_resolution && k > 1.1;
+    let hdr = s.rtx_video_hdr && vk.presenter.hdr();
+    if !sr && !hdr {
+        return None;
+    }
+    let k = if sr { k.min(4.0) } else { 1.0 };
+    Some((((w as f64 / k).round().max(16.0) as u32, (h as f64 / k).round().max(16.0) as u32), sr, hdr))
+}
+
 /// HDR presentation through Direct3D 11 or Vulkan (dx_present.rs,
 /// vk_present.rs).
 struct VkMode {
@@ -106,6 +125,8 @@ struct VkMode {
     targets: vk_present::GlTargets,
     display: display_info::HdrDisplay,
     video_hdr: Option<bool>,
+    /// The video itself is HDR (PQ / HLG).
+    video_is_hdr: bool,
     /// Last mpv output target set: (HDR, SDR transfer curve).
     video_target: Option<(bool, String)>,
 }
@@ -401,6 +422,10 @@ impl App {
             .with_min_inner_size(LogicalSize::new(285.0, 120.0))
             .with_window_icon(icon)
             .with_visible(false);
+        #[cfg(windows)]
+        {
+            self.ui.rtx.nvidia = dx_present::has_nvidia_gpu();
+        }
         match self.try_create_vulkan(el, &attrs) {
             Ok(gfx) => {
                 self.gfx = Some(gfx);
@@ -453,6 +478,7 @@ impl App {
                 (gl.get_parameter_string(glow::VENDOR), gl.get_parameter_string(glow::RENDERER), gl.get_parameter_string(glow::VERSION))
             };
             self.gl_info = format!("{renderer} ({vendor}), OpenGL {version}");
+            self.ui.rtx.gpu = renderer.to_string();
             dbg_log(format!("graphics: {}", self.gl_info));
             self.ui.logs.push_back(ui::LogLine { level: "info".into(), prefix: "iina-rs".into(), text: format!("graphics: {}", self.gl_info) });
         }
@@ -503,7 +529,11 @@ impl App {
     /// rendering off-screen on a hidden helper window. Returns why it isn't
     /// used (empty when simply not applicable).
     fn try_create_vulkan(&mut self, el: &ActiveEventLoop, attrs: &WindowAttributes) -> Result<Gfx, String> {
-        if cfg!(target_os = "macos") || !self.ui.settings.hdr_output || safe_mode() || std::env::var_os("IINA_RS_NO_VULKAN").is_some() {
+        #[cfg(windows)]
+        let rtx_wanted = self.ui.settings.rtx_super_resolution && self.ui.rtx.nvidia;
+        #[cfg(not(windows))]
+        let rtx_wanted = false;
+        if cfg!(target_os = "macos") || (!self.ui.settings.hdr_output && !rtx_wanted) || safe_mode() || std::env::var_os("IINA_RS_NO_VULKAN").is_some() {
             return Err(String::new());
         }
         #[cfg_attr(not(windows), allow(unused_mut))]
@@ -514,10 +544,19 @@ impl App {
         if self.ui.settings.hdr_peak_nits > 0.0 {
             display_info.max_nits = self.ui.settings.hdr_peak_nits;
         }
+        if std::env::var_os("IINA_RS_TEST_SDR").is_some() {
+            display_info.hdr_active = false;
+        }
         dbg_log(format!("display: {display_info:?}"));
-        if cfg!(windows) && !display_info.hdr_active && std::env::var_os("IINA_RS_FORCE_VULKAN").is_none() {
+        self.ui.rtx.hdr_display = display_info.hdr_active;
+        // HDR output, or (SDR display) Direct3D only for RTX Video.
+        let hdr_ok = self.ui.settings.hdr_output && (display_info.hdr_active || !cfg!(windows) || std::env::var_os("IINA_RS_FORCE_VULKAN").is_some());
+        let rtx_sdr = !hdr_ok && rtx_wanted;
+        if !hdr_ok && !rtx_sdr {
             return Err(String::new());
         }
+        #[cfg(windows)]
+        let dx_hdr = hdr_ok && display_info.hdr_active;
 
         let helper_attrs = WindowAttributes::default().with_title("IINA-RS GL").with_inner_size(PhysicalSize::new(64, 64)).with_visible(false);
         let template = gl_template();
@@ -543,6 +582,7 @@ impl App {
             use glow::HasContext;
             let s = |p| unsafe { gl.get_parameter_string(p) };
             dbg_log(format!("graphics: {} ({}), OpenGL {}", s(glow::RENDERER), s(glow::VENDOR), s(glow::VERSION)));
+            self.ui.rtx.gpu = s(glow::RENDERER);
         }
         // Direct3D 11 first (Windows), then Vulkan. Each one checks that
         // what GL draws really reaches it: a black window otherwise (seen
@@ -551,12 +591,18 @@ impl App {
         let mut failures = Vec::new();
         let mut chosen = None;
         #[cfg(windows)]
-        if backend != "vulkan" {
-            let vendor = unsafe { glow::HasContext::get_parameter_string(&*gl, glow::VENDOR) };
+        let vendor = unsafe { glow::HasContext::get_parameter_string(&*gl, glow::VENDOR) };
+        // On an SDR display Direct3D is only for RTX Video, so only when GL
+        // runs on the NVIDIA GPU.
+        #[cfg(windows)]
+        if backend != "vulkan" && (dx_hdr || (rtx_sdr && vendor.to_ascii_lowercase().contains("nvidia"))) {
             let luid = dx_present::gl_luid(&gl, |s| display.get_proc_address(s));
             let r = (|| -> Result<(vk_present::Presenter, vk_present::GlTargets), String> {
-                let presenter = vk_present::Presenter::Dx(dx_present::DxPresenter::new(&window, luid, &vendor, display_info.max_nits)?);
+                let presenter = vk_present::Presenter::Dx(dx_present::DxPresenter::new(&window, luid, &vendor, display_info.max_nits, dx_hdr)?);
                 let vk_present::Presenter::Dx(dx) = &presenter else { unreachable!() };
+                if !dx_hdr && dx.vendor_id != dx_present::VENDOR_NVIDIA {
+                    return Err(format!("RTX Video needs the NVIDIA GPU, OpenGL runs on {}", dx.description));
+                }
                 let share = vk_present::Share::Dx(dx_present::GlShare::new(|s| display.get_proc_address(s), dx)?);
                 let mut targets = vk_present::GlTargets::new(&gl, share, &presenter)?;
                 if let Err(e) = targets.self_test(&gl, &presenter) {
@@ -575,7 +621,7 @@ impl App {
                 }
             }
         }
-        if chosen.is_none() && backend != "d3d11" {
+        if chosen.is_none() && backend != "d3d11" && hdr_ok {
             let r = (|| -> Result<(vk_present::Presenter, vk_present::GlTargets), String> {
                 let ext = vk_present::GlExt::load(|s| display.get_proc_address(s))?;
                 let vk = vk_present::VkPresenter::new(&window, ext.device_uuid(), display_info.max_nits)?;
@@ -600,8 +646,11 @@ impl App {
         dbg_log(format!("{} sharing check passed", presenter.description()));
 
         // mpv starts in SDR; switched per file in `update_hdr_target`.
-        self.mpv.set_string("target-trc", "srgb");
-        self.mpv.set_string("target-prim", "bt.709");
+        if presenter.hdr() {
+            self.mpv.set_string("target-trc", "srgb");
+            self.mpv.set_string("target-prim", "bt.709");
+        }
+        self.ui.rtx.ready = presenter.is_nvidia();
         self.ui.output_mode = format!("{} · {:.0} nits peak · UI {:.0} nits", presenter.description(), display_info.max_nits, display_info.sdr_white_nits);
         dbg_log(format!("HDR output: {}", self.ui.output_mode));
         let egui = self.setup_egui_and_mpv(el, gl, &display);
@@ -612,7 +661,7 @@ impl App {
             surface,
             context,
             egui,
-            vk: Some(VkMode { _helper: helper, presenter, targets, display: display_info, video_hdr: None, video_target: None }),
+            vk: Some(VkMode { _helper: helper, presenter, targets, display: display_info, video_hdr: None, video_is_hdr: false, video_target: None }),
         })
     }
 
@@ -621,6 +670,20 @@ impl App {
     fn update_hdr_target(&mut self) {
         let Some(vk) = self.gfx.as_mut().and_then(|g| g.vk.as_mut()) else { return };
         let gamma = self.mpv.get_string("video-params/gamma").unwrap_or_default();
+        vk.video_is_hdr = matches!(gamma.as_str(), "pq" | "hlg");
+        if !vk.presenter.hdr() {
+            // SDR display (RTX Video, or the Vulkan test mode): mpv's usual
+            // SDR output, HDR video tone-mapped by mpv.
+            let key = (false, "sdr display".to_string());
+            if vk.video_target.as_ref() != Some(&key) {
+                vk.video_target = Some(key);
+                vk.video_hdr = Some(false);
+                for p in ["target-trc", "target-prim", "target-peak"] {
+                    self.mpv.set_string(p, "auto");
+                }
+            }
+            return;
+        }
         // PQ output only on an HDR10 swapchain (not in the SDR test mode).
         let hdr = matches!(gamma.as_str(), "pq" | "hlg") && vk.presenter.hdr();
         // SDR: mpv outputs the video's own transfer curve unchanged, and the
@@ -893,6 +956,14 @@ impl App {
             "filters" => self.ui.show_filters = !self.ui.show_filters,
             "logs" => self.ui.show_logs = !self.ui.show_logs,
             "check-updates" => self.check_updates(),
+            #[cfg(windows)]
+            "rtx-use-nvidia" => match dx_present::prefer_high_performance_gpu() {
+                Ok(()) => {
+                    self.ui.rtx.switch_requested = true;
+                    dbg_log("GPU preference set to high performance".into());
+                }
+                Err(e) => dbg_log(format!("GPU preference: {e}")),
+            },
             "music-playlist" => {
                 self.ui.music_playlist = !self.ui.music_playlist;
                 if self.ui.music_mode {
@@ -1785,9 +1856,33 @@ impl App {
         let new_frame = self.video_pending;
         if let Some(vk) = gfx.vk.as_mut() {
             let (w, h) = vk.targets.size();
+            let plan = rtx_plan(&self.ui.settings, self.video_dims, vk, w, h);
+            {
+                let gl = gfx.egui.painter.gl().clone();
+                match vk.targets.set_enhance(&gl, &vk.presenter, plan) {
+                    Ok(changed) => {
+                        if changed {
+                            self.video_valid = None;
+                            dbg_log(format!("RTX Video: {plan:?} -> {:?}", vk.targets.enhance_state()));
+                        }
+                    }
+                    Err(e) => {
+                        self.video_valid = None;
+                        dbg_log(format!("RTX Video unavailable: {e}"));
+                    }
+                }
+                self.ui.rtx.active = vk.targets.enhance_state();
+            }
             vk.targets.begin_frame();
             if new_frame || self.video_valid != Some((w, h)) {
-                self.mpv.render(vk.targets.video_fbo as i32, w, h, GL_RGBA16F);
+                if let Some((fbo, iw, ih)) = vk.targets.enhance_input() {
+                    self.mpv.render(fbo as i32, iw, ih, GL_RGBA8);
+                    if let Err(e) = vk.targets.enhance_run() {
+                        dbg_log(format!("RTX Video: {e}"));
+                    }
+                } else {
+                    self.mpv.render(vk.targets.video_fbo as i32, w, h, GL_RGBA16F);
+                }
                 self.video_valid = Some((w, h));
                 self.video_pending = false;
             }

@@ -90,6 +90,8 @@ pub struct UiState {
     pub assoc_status: String,
     /// How video reaches the screen (shown in the Inspector).
     pub output_mode: String,
+    /// NVIDIA RTX Video availability (Preferences > Video).
+    pub rtx: RtxStatus,
     /// Installed font families (scanned on demand for the font picker).
     pub fonts: crate::fonts::Shared,
     /// Preferences tab: 0 = general, 1 = subtitles.
@@ -150,6 +152,7 @@ impl UiState {
             osd: None,
             volume_bar_rect: None,
             output_mode: String::new(),
+            rtx: RtxStatus::default(),
             fonts: Default::default(),
             prefs_tab: 0,
             logs: Default::default(),
@@ -1880,6 +1883,24 @@ fn text_field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
 
 const PREF_TABS: [&str; 6] = ["General", "Video & Audio", "Subtitles", "Network", "Controls", "Advanced"];
 
+/// What Preferences says about NVIDIA RTX Video.
+#[derive(Clone, Default)]
+pub struct RtxStatus {
+    /// The computer has an NVIDIA GPU.
+    pub nvidia: bool,
+    /// Video goes through Direct3D 11 on the NVIDIA GPU.
+    pub ready: bool,
+    /// The GPU IINA-RS runs on.
+    pub gpu: String,
+    /// Now: (super resolution factor, RTX Video HDR).
+    pub active: Option<(Option<f32>, bool)>,
+    /// "Use the NVIDIA graphics card" was chosen (applies at the next start).
+    pub switch_requested: bool,
+    /// The display was in HDR mode at startup.
+    pub hdr_display: bool,
+}
+
+
 fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Vec<String>) {
     if !st.show_prefs {
         return;
@@ -1887,6 +1908,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
     let mut open = true;
     let before = st.settings.clone();
     let assoc_status = st.assoc_status.clone();
+    let rtx = st.rtx.clone();
     let mut prefs_tab = st.prefs_tab;
     let mut header_close = false;
     egui::Window::new(t("Preferences"))
@@ -2026,6 +2048,41 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                                 ui.add(egui::DragValue::new(&mut s.hdr_peak_nits).range(0.0..=10000.0).speed(10.0).max_decimals(0));
                                 ui.label(RichText::new(t("nits (0 = automatic)")).size(11.0).color(FG_DIM));
                             });
+                        }
+                    }
+                    if cfg!(windows) && rtx.nvidia {
+                        section(ui, "NVIDIA RTX Video");
+                        check(ui, &mut s.rtx_super_resolution, t("Super resolution: sharpens and cleans up enlarged video"));
+                        check(ui, &mut s.rtx_video_hdr, t("RTX Video HDR: shows SDR video in HDR"));
+                        let dim = |ui: &mut Ui, text: String| {
+                            ui.label(RichText::new(text).size(11.0).color(FG_DIM));
+                        };
+                        if s.rtx_super_resolution || s.rtx_video_hdr {
+                            let on_nvidia = rtx.gpu.to_ascii_lowercase().contains("nvidia");
+                            if rtx.ready {
+                                let factor = rtx.active.and_then(|a| a.0);
+                                let hdr = rtx.active.is_some_and(|a| a.1);
+                                if let Some(f) = factor {
+                                    dim(ui, tf("Super resolution is active now: ×{}", &[&format!("{f:.1}")]));
+                                } else if s.rtx_super_resolution {
+                                    dim(ui, t("Super resolution isn't active now: the video isn't enlarged"));
+                                }
+                                if hdr {
+                                    dim(ui, t("RTX Video HDR is active now"));
+                                }
+                            } else if rtx.switch_requested || on_nvidia {
+                                dim(ui, t("Takes effect after a restart"));
+                            } else {
+                                dim(ui, tf("IINA-RS is running on: {}", &[&rtx.gpu]));
+                                dim(ui, t("RTX Video needs the NVIDIA graphics card"));
+                                if ui.button(t("Use the NVIDIA graphics card")).clicked() {
+                                    cmds.push("rtx-use-nvidia".into());
+                                }
+                            }
+                            if s.rtx_video_hdr && !rtx.hdr_display {
+                                dim(ui, t("RTX Video HDR needs an HDR display"));
+                            }
+                            dim(ui, t("If the picture doesn't change, turn on RTX Video Enhancement in the NVIDIA Control Panel"));
                         }
                     }
                     section(ui, "Audio");

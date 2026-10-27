@@ -68,6 +68,10 @@ pub struct Settings {
     pub hdr_output: bool,
     /// Display peak luminance for HDR output (0 = as reported by the OS).
     pub hdr_peak_nits: f32,
+    /// NVIDIA RTX Video Super Resolution when the video is enlarged (Windows).
+    pub rtx_super_resolution: bool,
+    /// NVIDIA RTX Video HDR: SDR video shown as HDR on HDR displays (Windows).
+    pub rtx_video_hdr: bool,
     /// Volume used at startup; updated with the last volume when `remember_volume`.
     pub volume: f64,
     pub remember_volume: bool,
@@ -300,6 +304,8 @@ impl Default for Settings {
             hwdec_mode: "auto-safe".into(),
             hdr_output: true,
             hdr_peak_nits: 0.0,
+            rtx_super_resolution: true,
+            rtx_video_hdr: false,
             volume: 100.0,
             remember_volume: true,
             volume_max: 150.0,
