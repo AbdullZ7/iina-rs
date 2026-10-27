@@ -1,4 +1,5 @@
-//! HDR output through Vulkan.
+//! HDR output through Vulkan (and the GL side shared with the Direct3D 11
+//! presenter in dx_present.rs).
 //!
 //! libmpv only renders through OpenGL, and an OpenGL window can only present
 //! SDR. For HDR displays the window is instead a Vulkan swapchain in the HDR10
@@ -174,18 +175,99 @@ void main() {
 }
 "#;
 
-/// Off-screen GL targets for the Vulkan presenter.
+/// How the composited image reaches the presenter.
+pub enum Share {
+    /// GL_EXT_memory_object + shared semaphores (Vulkan).
+    Vk { ext: GlExt, mem: u32, sem_gl_done: u32, sem_vk_done: u32 },
+    /// WGL_NV_DX_interop2 (Direct3D 11).
+    #[cfg(windows)]
+    Dx(crate::dx_present::GlShare),
+}
+
+impl Share {
+    /// Imports the presenter's semaphores; they live as long as it does.
+    pub fn vulkan(ext: GlExt, vk: &VkPresenter) -> Result<Self, String> {
+        let (gl_done_handle, vk_done_handle) = vk.semaphore_handles()?;
+        let mut sems = [0u32; 2];
+        unsafe {
+            (ext.gen_semaphores)(2, sems.as_mut_ptr());
+            for (sem, h) in [(sems[0], gl_done_handle), (sems[1], vk_done_handle)] {
+                import_semaphore(&ext, sem, h)?;
+            }
+        }
+        Ok(Share::Vk { ext, mem: 0, sem_gl_done: sems[0], sem_vk_done: sems[1] })
+    }
+}
+
+/// Where HDR frames are presented: Direct3D 11 (Windows) or Vulkan.
+pub enum Presenter {
+    Vk(VkPresenter),
+    #[cfg(windows)]
+    Dx(crate::dx_present::DxPresenter),
+}
+
+impl Presenter {
+    /// False only in the Vulkan SDR test mode.
+    pub fn hdr(&self) -> bool {
+        match self {
+            Self::Vk(v) => v.hdr,
+            #[cfg(windows)]
+            Self::Dx(_) => true,
+        }
+    }
+
+    pub fn description(&self) -> &str {
+        match self {
+            Self::Vk(v) => &v.description,
+            #[cfg(windows)]
+            Self::Dx(d) => &d.description,
+        }
+    }
+
+    fn extent(&self) -> (u32, u32) {
+        match self {
+            Self::Vk(v) => (v.extent.width, v.extent.height),
+            #[cfg(windows)]
+            Self::Dx(d) => d.extent,
+        }
+    }
+
+    /// Returns false when the swapchain is out of date (caller resizes).
+    pub fn present(&mut self) -> Result<bool, String> {
+        match self {
+            Self::Vk(v) => v.present(),
+            #[cfg(windows)]
+            Self::Dx(d) => d.present(),
+        }
+    }
+
+    /// The GL side must re-import afterwards (`GlTargets::recreate`).
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+        match self {
+            Self::Vk(v) => v.resize(width, height),
+            #[cfg(windows)]
+            Self::Dx(d) => d.resize(width, height),
+        }
+    }
+
+    fn read_shared_pixel(&self) -> Result<u32, String> {
+        match self {
+            Self::Vk(v) => v.read_shared_pixel(),
+            #[cfg(windows)]
+            Self::Dx(d) => d.read_shared_pixel(),
+        }
+    }
+}
+
+/// Off-screen GL targets for the HDR presenter.
 pub struct GlTargets {
-    ext: GlExt,
+    share: Share,
     pub video_fbo: u32,
     pub ui_fbo: u32,
     video_tex: u32,
     ui_tex: u32,
-    shared_mem: u32,
     shared_tex: u32,
     pub shared_fbo: u32,
-    sem_gl_done: u32,
-    sem_vk_done: u32,
     program: glow::Program,
     vao: glow::VertexArray,
     size: (i32, i32),
@@ -200,7 +282,7 @@ where
 }
 
 impl GlTargets {
-    pub fn new(gl: &glow::Context, ext: GlExt, vk: &VkPresenter) -> Result<Self, String> {
+    pub fn new(gl: &glow::Context, share: Share, p: &Presenter) -> Result<Self, String> {
         use glow::HasContext;
         unsafe {
             let program = gl.create_program()?;
@@ -219,41 +301,31 @@ impl GlTargets {
             }
             let vao = gl.create_vertex_array()?;
 
-            // Semaphores are created once and live as long as the presenter.
-            let (gl_done_handle, vk_done_handle) = vk.semaphore_handles()?;
-            let mut sems = [0u32; 2];
-            (ext.gen_semaphores)(2, sems.as_mut_ptr());
-            for (sem, h) in [(sems[0], gl_done_handle), (sems[1], vk_done_handle)] {
-                import_semaphore(&ext, sem, h)?;
-            }
-
             let mut t = Self {
-                ext,
+                share,
                 video_fbo: 0,
                 ui_fbo: 0,
                 video_tex: 0,
                 ui_tex: 0,
-                shared_mem: 0,
                 shared_tex: 0,
                 shared_fbo: 0,
-                sem_gl_done: sems[0],
-                sem_vk_done: sems[1],
                 program,
                 vao,
                 size: (0, 0),
                 frames: 0,
             };
-            t.recreate(gl, vk)?;
+            t.recreate(gl, p)?;
             Ok(t)
         }
     }
 
-    /// (Re)creates the size-dependent textures; call after `VkPresenter::resize`.
-    pub fn recreate(&mut self, gl: &glow::Context, vk: &VkPresenter) -> Result<(), String> {
+    /// (Re)creates the size-dependent textures; call after `Presenter::resize`.
+    pub fn recreate(&mut self, gl: &glow::Context, p: &Presenter) -> Result<(), String> {
         use glow::HasContext;
         unsafe {
             self.delete_sized(gl);
-            let (w, h) = (vk.extent.width as i32, vk.extent.height as i32);
+            let (w, h) = p.extent();
+            let (w, h) = (w as i32, h as i32);
             self.size = (w, h);
 
             let make = |internal: u32, format: u32, ty: u32| -> Result<(u32, u32), String> {
@@ -270,35 +342,52 @@ impl GlTargets {
             (self.video_tex, self.video_fbo) = make(GL_RGBA16F, glow::RGBA, glow::HALF_FLOAT)?;
             (self.ui_tex, self.ui_fbo) = make(glow::RGBA8, glow::RGBA, glow::UNSIGNED_BYTE)?;
 
-            // Shared image: memory allocated by Vulkan, used as a GL texture.
-            let (handle, mem_size) = vk.shared_memory_handle()?;
-            let mut mem = 0u32;
-            (self.ext.create_memory_objects)(1, &mut mem);
-            let dedicated = 1i32;
-            (self.ext.memory_object_parameteriv)(mem, GL_DEDICATED_MEMORY_OBJECT_EXT, &dedicated);
-            match handle {
-                ExternalHandle::Win32(h) => {
-                    let f = self.ext.import_memory_win32.ok_or("glImportMemoryWin32HandleEXT missing")?;
-                    f(mem, mem_size, GL_HANDLE_TYPE_OPAQUE_WIN32_EXT, h);
-                    close_handle(h);
-                }
-                ExternalHandle::Fd(fd) => {
-                    let f = self.ext.import_memory_fd.ok_or("glImportMemoryFdEXT missing")?;
-                    f(mem, mem_size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd);
-                }
-            }
-            self.shared_mem = mem;
+            // Shared image: memory owned by the presenter, used as a GL texture.
             let tex = gl.create_texture()?;
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            gl.tex_parameter_i32(glow::TEXTURE_2D, GL_TEXTURE_TILING_EXT, GL_OPTIMAL_TILING_EXT);
-            (self.ext.tex_storage_mem_2d)(GL_TEXTURE_2D, 1, GL_RGB10_A2, w, h, mem, 0);
+            self.shared_tex = gl_name(tex.0);
+            match (&mut self.share, p) {
+                (Share::Vk { ext, mem: shared_mem, .. }, Presenter::Vk(vk)) => {
+                    let (handle, mem_size) = vk.shared_memory_handle()?;
+                    let mut mem = 0u32;
+                    (ext.create_memory_objects)(1, &mut mem);
+                    let dedicated = 1i32;
+                    (ext.memory_object_parameteriv)(mem, GL_DEDICATED_MEMORY_OBJECT_EXT, &dedicated);
+                    match handle {
+                        ExternalHandle::Win32(h) => {
+                            let f = ext.import_memory_win32.ok_or("glImportMemoryWin32HandleEXT missing")?;
+                            f(mem, mem_size, GL_HANDLE_TYPE_OPAQUE_WIN32_EXT, h);
+                            close_handle(h);
+                        }
+                        ExternalHandle::Fd(fd) => {
+                            let f = ext.import_memory_fd.ok_or("glImportMemoryFdEXT missing")?;
+                            f(mem, mem_size, GL_HANDLE_TYPE_OPAQUE_FD_EXT, fd);
+                        }
+                    }
+                    *shared_mem = mem;
+                    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, GL_TEXTURE_TILING_EXT, GL_OPTIMAL_TILING_EXT);
+                    (ext.tex_storage_mem_2d)(GL_TEXTURE_2D, 1, GL_RGB10_A2, w, h, mem, 0);
+                }
+                #[cfg(windows)]
+                (Share::Dx(s), Presenter::Dx(dx)) => s.register(self.shared_tex, dx)?,
+                #[allow(unreachable_patterns)]
+                _ => return Err("presenter and GL sharing don't match".into()),
+            }
+            // The interop texture may only be touched while locked.
+            #[cfg(windows)]
+            if let Share::Dx(s) = &mut self.share {
+                s.lock();
+            }
             let fbo = gl.create_framebuffer()?;
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
             let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             gl.bind_texture(glow::TEXTURE_2D, None);
-            self.shared_tex = gl_name(tex.0);
+            #[cfg(windows)]
+            if let Share::Dx(s) = &mut self.share {
+                s.unlock();
+            }
             self.shared_fbo = gl_name(fbo.0);
             if status != glow::FRAMEBUFFER_COMPLETE {
                 return Err(format!("shared framebuffer incomplete: 0x{status:x}"));
@@ -314,6 +403,10 @@ impl GlTargets {
     fn delete_sized(&mut self, gl: &glow::Context) {
         use glow::HasContext;
         unsafe {
+            #[cfg(windows)]
+            if let Share::Dx(s) = &mut self.share {
+                s.unregister();
+            }
             for fbo in [self.video_fbo, self.ui_fbo, self.shared_fbo] {
                 if let Some(n) = std::num::NonZeroU32::new(fbo) {
                     gl.delete_framebuffer(glow::NativeFramebuffer(n));
@@ -324,11 +417,15 @@ impl GlTargets {
                     gl.delete_texture(glow::NativeTexture(n));
                 }
             }
-            if self.shared_mem != 0 {
-                (self.ext.delete_memory_objects)(1, &self.shared_mem);
+            #[allow(irrefutable_let_patterns)] // only Vulkan off Windows
+            if let Share::Vk { ext, mem, .. } = &mut self.share {
+                if *mem != 0 {
+                    (ext.delete_memory_objects)(1, mem);
+                }
+                *mem = 0;
             }
             (self.video_fbo, self.ui_fbo, self.shared_fbo) = (0, 0, 0);
-            (self.video_tex, self.ui_tex, self.shared_tex, self.shared_mem) = (0, 0, 0, 0);
+            (self.video_tex, self.ui_tex, self.shared_tex) = (0, 0, 0);
         }
     }
 
@@ -336,11 +433,19 @@ impl GlTargets {
         self.size
     }
 
-    /// Waits until Vulkan has finished reading the shared image.
+    /// Waits until the presenter has finished reading the shared image.
     pub fn begin_frame(&mut self) {
-        if self.frames > 0 {
-            let layout = GL_LAYOUT_TRANSFER_SRC_EXT;
-            unsafe { (self.ext.wait_semaphore)(self.sem_vk_done, 0, std::ptr::null(), 1, &self.shared_tex, &layout) };
+        match &mut self.share {
+            Share::Vk { ext, sem_vk_done, .. } => {
+                if self.frames > 0 {
+                    let layout = GL_LAYOUT_TRANSFER_SRC_EXT;
+                    unsafe { (ext.wait_semaphore)(*sem_vk_done, 0, std::ptr::null(), 1, &self.shared_tex, &layout) };
+                }
+            }
+            #[cfg(windows)]
+            Share::Dx(s) => {
+                s.lock();
+            }
         }
     }
 
@@ -378,8 +483,9 @@ impl GlTargets {
     /// Startup check: GL clears the shared image to a known colour and
     /// Vulkan reads a pixel of it back. Some drivers accept the import yet
     /// Vulkan sees other memory, and the window would stay black.
-    pub fn self_test(&mut self, gl: &glow::Context, vk: &VkPresenter) -> Result<(), String> {
+    pub fn self_test(&mut self, gl: &glow::Context, p: &Presenter) -> Result<(), String> {
         use glow::HasContext;
+        self.begin_frame();
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, std::num::NonZeroU32::new(self.shared_fbo).map(glow::NativeFramebuffer));
             gl.viewport(0, 0, self.size.0, self.size.1);
@@ -390,32 +496,40 @@ impl GlTargets {
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
         }
         self.end_frame(gl);
-        let px = vk.read_shared_pixel()?;
+        let px = p.read_shared_pixel()?;
         let rgb = [px & 0x3ff, (px >> 10) & 0x3ff, (px >> 20) & 0x3ff];
         let want = [1023u32, 512, 256];
         if rgb.iter().zip(want).all(|(&v, w)| v.abs_diff(w) <= 3) && std::env::var_os("IINA_RS_TEST_SHARE_FAIL").is_none() {
             Ok(())
         } else {
-            Err(format!("Vulkan reads {rgb:?} from the shared image, OpenGL wrote {want:?}"))
+            Err(format!("the presenter reads {rgb:?} from the shared image, OpenGL wrote {want:?}"))
         }
     }
 
-    /// Hands the shared image to Vulkan.
+    /// Hands the shared image to the presenter.
     pub fn end_frame(&mut self, gl: &glow::Context) {
         use glow::HasContext;
-        let layout = GL_LAYOUT_TRANSFER_SRC_EXT;
-        unsafe {
-            (self.ext.signal_semaphore)(self.sem_gl_done, 0, std::ptr::null(), 1, &self.shared_tex, &layout);
-            gl.flush();
+        match &mut self.share {
+            Share::Vk { ext, sem_gl_done, .. } => {
+                let layout = GL_LAYOUT_TRANSFER_SRC_EXT;
+                unsafe { (ext.signal_semaphore)(*sem_gl_done, 0, std::ptr::null(), 1, &self.shared_tex, &layout) };
+            }
+            #[cfg(windows)]
+            Share::Dx(s) => s.unlock(),
         }
+        unsafe { gl.flush() };
         self.frames += 1;
     }
 
     pub fn destroy(&mut self, gl: &glow::Context) {
         use glow::HasContext;
         self.delete_sized(gl);
+        match &mut self.share {
+            Share::Vk { ext, sem_gl_done, sem_vk_done, .. } => unsafe { (ext.delete_semaphores)(2, [*sem_gl_done, *sem_vk_done].as_ptr()) },
+            #[cfg(windows)]
+            Share::Dx(s) => s.close(),
+        }
         unsafe {
-            (self.ext.delete_semaphores)(2, [self.sem_gl_done, self.sem_vk_done].as_ptr());
             gl.delete_program(self.program);
             gl.delete_vertex_array(self.vao);
         }

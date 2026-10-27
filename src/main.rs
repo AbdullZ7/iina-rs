@@ -24,6 +24,8 @@ mod thumbs;
 mod update;
 mod ui;
 mod vk_present;
+#[cfg(windows)]
+mod dx_present;
 
 use glutin::context::{NotCurrentGlContext, PossiblyCurrentContext};
 use glutin::display::{GetGlDisplay, GlDisplay};
@@ -96,10 +98,11 @@ struct Gfx {
     vk: Option<VkMode>,
 }
 
-/// HDR presentation through Vulkan (see vk_present.rs).
+/// HDR presentation through Direct3D 11 or Vulkan (dx_present.rs,
+/// vk_present.rs).
 struct VkMode {
     _helper: Window,
-    presenter: vk_present::VkPresenter,
+    presenter: vk_present::Presenter,
     targets: vk_present::GlTargets,
     display: display_info::HdrDisplay,
     video_hdr: Option<bool>,
@@ -503,7 +506,8 @@ impl App {
         if cfg!(target_os = "macos") || !self.ui.settings.hdr_output || safe_mode() || std::env::var_os("IINA_RS_NO_VULKAN").is_some() {
             return Err(String::new());
         }
-        let window = el.create_window(attrs.clone()).map_err(|e| e.to_string())?;
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut window = el.create_window(attrs.clone()).map_err(|e| e.to_string())?;
         let mut display_info = display_info::query(&window);
         // The OS-reported peak can vary or exceed the panel's real ability;
         // a user value takes precedence.
@@ -535,19 +539,71 @@ impl App {
         let context = not_current.make_current(&surface).map_err(|e| format!("make current: {e}"))?;
         let gl = Arc::new(unsafe { glow::Context::from_loader_function_cstr(|s| display.get_proc_address(s)) });
 
-        let ext = vk_present::GlExt::load(|s| display.get_proc_address(s))?;
-        let uuid = ext.device_uuid();
-        let presenter = vk_present::VkPresenter::new(&window, uuid, display_info.max_nits)?;
-        let mut targets = vk_present::GlTargets::new(&gl, ext, &presenter)?;
-        // Black window otherwise (seen with some hybrid-GPU laptops).
-        targets.self_test(&gl, &presenter).map_err(|e| format!("GPU sharing check failed: {e}"))?;
-        dbg_log("Vulkan/OpenGL sharing check passed".into());
+        {
+            use glow::HasContext;
+            let s = |p| unsafe { gl.get_parameter_string(p) };
+            dbg_log(format!("graphics: {} ({}), OpenGL {}", s(glow::RENDERER), s(glow::VENDOR), s(glow::VERSION)));
+        }
+        // Direct3D 11 first (Windows), then Vulkan. Each one checks that
+        // what GL draws really reaches it: a black window otherwise (seen
+        // with some hybrid-GPU laptops).
+        let backend = std::env::var("IINA_RS_HDR_BACKEND").unwrap_or_default();
+        let mut failures = Vec::new();
+        let mut chosen = None;
+        #[cfg(windows)]
+        if backend != "vulkan" {
+            let vendor = unsafe { glow::HasContext::get_parameter_string(&*gl, glow::VENDOR) };
+            let luid = dx_present::gl_luid(&gl, |s| display.get_proc_address(s));
+            let r = (|| -> Result<(vk_present::Presenter, vk_present::GlTargets), String> {
+                let presenter = vk_present::Presenter::Dx(dx_present::DxPresenter::new(&window, luid, &vendor, display_info.max_nits)?);
+                let vk_present::Presenter::Dx(dx) = &presenter else { unreachable!() };
+                let share = vk_present::Share::Dx(dx_present::GlShare::new(|s| display.get_proc_address(s), dx)?);
+                let mut targets = vk_present::GlTargets::new(&gl, share, &presenter)?;
+                if let Err(e) = targets.self_test(&gl, &presenter) {
+                    targets.destroy(&gl);
+                    return Err(format!("sharing check failed: {e}"));
+                }
+                Ok((presenter, targets))
+            })();
+            match r {
+                Ok(t) => chosen = Some(t),
+                Err(e) => {
+                    dbg_log(format!("Direct3D 11 output unavailable: {e}"));
+                    failures.push(format!("Direct3D 11: {e}"));
+                    // A window that had a DXGI swapchain is left to the OpenGL fallback.
+                    window = el.create_window(attrs.clone()).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        if chosen.is_none() && backend != "d3d11" {
+            let r = (|| -> Result<(vk_present::Presenter, vk_present::GlTargets), String> {
+                let ext = vk_present::GlExt::load(|s| display.get_proc_address(s))?;
+                let vk = vk_present::VkPresenter::new(&window, ext.device_uuid(), display_info.max_nits)?;
+                let share = vk_present::Share::vulkan(ext, &vk)?;
+                let presenter = vk_present::Presenter::Vk(vk);
+                let mut targets = vk_present::GlTargets::new(&gl, share, &presenter)?;
+                if let Err(e) = targets.self_test(&gl, &presenter) {
+                    targets.destroy(&gl);
+                    return Err(format!("sharing check failed: {e}"));
+                }
+                Ok((presenter, targets))
+            })();
+            match r {
+                Ok(t) => chosen = Some(t),
+                Err(e) => {
+                    dbg_log(format!("Vulkan output unavailable: {e}"));
+                    failures.push(format!("Vulkan: {e}"));
+                }
+            }
+        }
+        let Some((presenter, targets)) = chosen else { return Err(failures.join("; ")) };
+        dbg_log(format!("{} sharing check passed", presenter.description()));
 
         // mpv starts in SDR; switched per file in `update_hdr_target`.
         self.mpv.set_string("target-trc", "srgb");
         self.mpv.set_string("target-prim", "bt.709");
-        self.ui.output_mode = format!("{} · {:.0} nits peak · UI {:.0} nits", presenter.description, display_info.max_nits, display_info.sdr_white_nits);
-        dbg_log(format!("Vulkan output: {}", self.ui.output_mode));
+        self.ui.output_mode = format!("{} · {:.0} nits peak · UI {:.0} nits", presenter.description(), display_info.max_nits, display_info.sdr_white_nits);
+        dbg_log(format!("HDR output: {}", self.ui.output_mode));
         let egui = self.setup_egui_and_mpv(el, gl, &display);
         let window = Arc::new(window);
         window.set_visible(true);
@@ -566,7 +622,7 @@ impl App {
         let Some(vk) = self.gfx.as_mut().and_then(|g| g.vk.as_mut()) else { return };
         let gamma = self.mpv.get_string("video-params/gamma").unwrap_or_default();
         // PQ output only on an HDR10 swapchain (not in the SDR test mode).
-        let hdr = matches!(gamma.as_str(), "pq" | "hlg") && vk.presenter.hdr;
+        let hdr = matches!(gamma.as_str(), "pq" | "hlg") && vk.presenter.hdr();
         // SDR: mpv outputs the video's own transfer curve unchanged, and the
         // composite reads it as sRGB, which is how Windows (and players
         // like PotPlayer) show SDR in HDR mode. Converting BT.1886 (gamma
@@ -1856,7 +1912,7 @@ impl App {
         if let Some(vk) = gfx.vk.as_mut() {
             let video_hdr = vk.video_hdr.unwrap_or(false);
             let gl = gfx.egui.painter.gl().clone();
-            vk.targets.composite(&gl, video_hdr, vk.display.sdr_white_nits, vk.presenter.hdr);
+            vk.targets.composite(&gl, video_hdr, vk.display.sdr_white_nits, vk.presenter.hdr());
         }
         let snapshot_due = self.snapshot.is_some() && self.started.elapsed() > Duration::from_secs(snap_after);
         if let Some(path) = self.snapshot.as_ref().filter(|_| snapshot_due) {
@@ -1886,10 +1942,10 @@ impl App {
                 Ok(false) => {
                     let s = gfx.window.inner_size();
                     if let Err(e) = vk.presenter.resize(s.width, s.height).and_then(|_| vk.targets.recreate(&gl, &vk.presenter)).inspect(|_| self.video_valid = None) {
-                        eprintln!("Vulkan resize: {e}");
+                        dbg_log(format!("HDR output resize: {e}"));
                     }
                 }
-                Err(e) => eprintln!("Vulkan present: {e}"),
+                Err(e) => dbg_log(format!("HDR output present: {e}")),
             }
         } else {
             let _ = gfx.surface.swap_buffers(&gfx.context);
@@ -2866,7 +2922,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if size.width > 0 && size.height > 0 {
                         let gl = gfx.egui.painter.gl().clone();
                         if let Err(e) = vk.presenter.resize(size.width, size.height).and_then(|_| vk.targets.recreate(&gl, &vk.presenter)).inspect(|_| self.video_valid = None) {
-                            eprintln!("Vulkan resize: {e}");
+                            dbg_log(format!("HDR output resize: {e}"));
                         }
                     }
                 } else if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
