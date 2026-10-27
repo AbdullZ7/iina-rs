@@ -25,6 +25,33 @@ jobs:
           curl -sL -o mpv-dev.7z "$url"
           7z x mpv-dev.7z -ompv-dev -y > /dev/null
       - run: python scripts/package.py windows target/release/iina-rs.exe mpv-dev/libmpv-2.dll dist
+      - name: Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc /? | Select-Object -First 1
+          New-Item -ItemType Directory -Force pkg | Out-Null
+          Copy-Item target/release/iina-rs.exe, mpv-dev/libmpv-2.dll pkg/
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & $iscc /Q "/DAppVersion=$ver" "/DSrcDir=$PWD\pkg" "/DOutDir=$PWD\dist" scripts\installer.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Test the installer (silent install, Open with, uninstall)
+        shell: pwsh
+        run: |
+          $setup = (Get-Item dist\*-setup.exe).FullName
+          $dir = "$env:RUNNER_TEMP\iina-rs-test"
+          Start-Process $setup -Wait -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/CURRENTUSER", "/DIR=$dir", "/TASKS=assoc"
+          foreach ($f in "iina-rs.exe", "libmpv-2.dll", "unins000.exe") { if (-not (Test-Path "$dir\$f")) { throw "missing $f" } }
+          $cmd = (Get-ItemProperty "HKCU:\Software\Classes\Applications\iina-rs.exe\shell\open\command").'(default)'
+          if ($cmd -notlike "*$dir*") { throw "Open with not registered: $cmd" }
+          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\IINA-RS.lnk")) { throw "no Start menu shortcut" }
+          Start-Process "$dir\unins000.exe" -Wait -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES"
+          Start-Sleep 5
+          if (Test-Path "$dir\iina-rs.exe") { throw "not uninstalled" }
+          if (Test-Path "HKCU:\Software\Classes\Applications\iina-rs.exe") { throw "Open with left behind" }
+          if (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\IINA-RS.lnk") { throw "shortcut left behind" }
+          "installer OK"
       - uses: actions/upload-artifact@v4
         with:
           name: windows
