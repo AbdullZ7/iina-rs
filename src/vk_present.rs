@@ -375,6 +375,31 @@ impl GlTargets {
         }
     }
 
+    /// Startup check: GL clears the shared image to a known colour and
+    /// Vulkan reads a pixel of it back. Some drivers accept the import yet
+    /// Vulkan sees other memory, and the window would stay black.
+    pub fn self_test(&mut self, gl: &glow::Context, vk: &VkPresenter) -> Result<(), String> {
+        use glow::HasContext;
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, std::num::NonZeroU32::new(self.shared_fbo).map(glow::NativeFramebuffer));
+            gl.viewport(0, 0, self.size.0, self.size.1);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.clear_color(1.0, 0.5, 0.25, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+        self.end_frame(gl);
+        let px = vk.read_shared_pixel()?;
+        let rgb = [px & 0x3ff, (px >> 10) & 0x3ff, (px >> 20) & 0x3ff];
+        let want = [1023u32, 512, 256];
+        if rgb.iter().zip(want).all(|(&v, w)| v.abs_diff(w) <= 3) && std::env::var_os("IINA_RS_TEST_SHARE_FAIL").is_none() {
+            Ok(())
+        } else {
+            Err(format!("Vulkan reads {rgb:?} from the shared image, OpenGL wrote {want:?}"))
+        }
+    }
+
     /// Hands the shared image to Vulkan.
     pub fn end_frame(&mut self, gl: &glow::Context) {
         use glow::HasContext;
@@ -782,6 +807,100 @@ impl VkPresenter {
         self.device.bind_image_memory(image, memory, 0).map_err(vkerr("bind shared memory"))?;
         self.shared = Some(SharedImage { image, memory, size: req.size });
         Ok(())
+    }
+
+    /// Reads the centre pixel of the shared image once GL has signalled
+    /// `gl_done` (raw A2B10G10R10), and signals `vk_done` like `present`.
+    pub fn read_shared_pixel(&self) -> Result<u32, String> {
+        unsafe {
+            let d = &self.device;
+            let shared = self.shared.as_ref().ok_or("no shared image")?;
+            let buffer = d
+                .create_buffer(&vk::BufferCreateInfo::default().size(4).usage(vk::BufferUsageFlags::TRANSFER_DST), None)
+                .map_err(vkerr("readback buffer"))?;
+            let req = d.get_buffer_memory_requirements(buffer);
+            let props = self.instance.get_physical_device_memory_properties(self.pdev);
+            let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let Some(type_index) =
+                (0..props.memory_type_count).find(|&i| req.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(want))
+            else {
+                d.destroy_buffer(buffer, None);
+                return Err("no host-visible memory type".into());
+            };
+            let memory = match d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(type_index), None) {
+                Ok(m) => m,
+                Err(e) => {
+                    d.destroy_buffer(buffer, None);
+                    return Err(format!("readback memory: {e:?}"));
+                }
+            };
+            let result = (|| -> Result<u32, String> {
+                d.bind_buffer_memory(buffer, memory, 0).map_err(vkerr("bind readback memory"))?;
+                d.wait_for_fences(&[self.fence], true, u64::MAX).map_err(vkerr("wait fence"))?;
+                d.reset_fences(&[self.fence]).map_err(vkerr("reset fence"))?;
+                d.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty()).map_err(vkerr("reset cmd"))?;
+                d.begin_command_buffer(self.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
+                    .map_err(vkerr("begin cmd"))?;
+                let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
+                let acquire = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+                    .dst_queue_family_index(self.qfi)
+                    .image(shared.image)
+                    .subresource_range(range);
+                d.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[acquire],
+                );
+                let copy = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+                    .image_offset(vk::Offset3D { x: (self.extent.width / 2) as i32, y: (self.extent.height / 2) as i32, z: 0 })
+                    .image_extent(vk::Extent3D { width: 1, height: 1, depth: 1 });
+                d.cmd_copy_image_to_buffer(self.cmd, shared.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[copy]);
+                let release = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_queue_family_index(self.qfi)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
+                    .image(shared.image)
+                    .subresource_range(range);
+                let to_host = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
+                d.cmd_pipeline_barrier(
+                    self.cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[to_host],
+                    &[],
+                    &[release],
+                );
+                d.end_command_buffer(self.cmd).map_err(vkerr("end cmd"))?;
+                let wait = [self.gl_done];
+                let stages = [vk::PipelineStageFlags::TRANSFER];
+                let signal = [self.vk_done];
+                let cmds = [self.cmd];
+                let submit = vk::SubmitInfo::default().wait_semaphores(&wait).wait_dst_stage_mask(&stages).command_buffers(&cmds).signal_semaphores(&signal);
+                d.queue_submit(self.queue, &[submit], self.fence).map_err(vkerr("submit"))?;
+                d.wait_for_fences(&[self.fence], true, u64::MAX).map_err(vkerr("wait fence"))?;
+                let ptr = d.map_memory(memory, 0, 4, vk::MemoryMapFlags::empty()).map_err(vkerr("map readback"))?;
+                let px = std::ptr::read_unaligned(ptr as *const u32);
+                d.unmap_memory(memory);
+                Ok(px)
+            })();
+            d.destroy_buffer(buffer, None);
+            d.free_memory(memory, None);
+            result
+        }
     }
 
     /// Copies the shared image (rendered by GL, signalled with `gl_done`) to

@@ -69,6 +69,7 @@ Source: "{#SrcDir}\yt-dlp.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsou
 
 [Icons]
 Name: "{autoprograms}\IINA-RS"; Filename: "{app}\iina-rs.exe"
+Name: "{autoprograms}\IINA-RS (safe mode)"; Filename: "{app}\iina-rs.exe"; Parameters: "--safe-mode"; Comment: "OpenGL without HDR, for black-screen problems"
 Name: "{autodesktop}\IINA-RS"; Filename: "{app}\iina-rs.exe"; Tasks: desktopicon
 
 [Run]

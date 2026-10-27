@@ -450,6 +450,7 @@ impl App {
                 (gl.get_parameter_string(glow::VENDOR), gl.get_parameter_string(glow::RENDERER), gl.get_parameter_string(glow::VERSION))
             };
             self.gl_info = format!("{renderer} ({vendor}), OpenGL {version}");
+            dbg_log(format!("graphics: {}", self.gl_info));
             self.ui.logs.push_back(ui::LogLine { level: "info".into(), prefix: "iina-rs".into(), text: format!("graphics: {}", self.gl_info) });
         }
         if std::env::var_os("IINA_RS_DEBUG").is_some() {
@@ -485,7 +486,7 @@ impl App {
                 let _ = p.send_event(UserEvent::MpvRender);
             },
         ) {
-            eprintln!("mpv render context: {e}");
+            dbg_log(format!("mpv render context FAILED: {e}"));
             self.ui.render_error = Some(format!("{e}"));
             self.ui.logs.push_back(ui::LogLine { level: "error".into(), prefix: "iina-rs".into(), text: format!("video output failed: {e} ({})", self.gl_info) });
         }
@@ -499,7 +500,7 @@ impl App {
     /// rendering off-screen on a hidden helper window. Returns why it isn't
     /// used (empty when simply not applicable).
     fn try_create_vulkan(&mut self, el: &ActiveEventLoop, attrs: &WindowAttributes) -> Result<Gfx, String> {
-        if cfg!(target_os = "macos") || !self.ui.settings.hdr_output || std::env::var_os("IINA_RS_NO_VULKAN").is_some() {
+        if cfg!(target_os = "macos") || !self.ui.settings.hdr_output || safe_mode() || std::env::var_os("IINA_RS_NO_VULKAN").is_some() {
             return Err(String::new());
         }
         let window = el.create_window(attrs.clone()).map_err(|e| e.to_string())?;
@@ -537,7 +538,10 @@ impl App {
         let ext = vk_present::GlExt::load(|s| display.get_proc_address(s))?;
         let uuid = ext.device_uuid();
         let presenter = vk_present::VkPresenter::new(&window, uuid, display_info.max_nits)?;
-        let targets = vk_present::GlTargets::new(&gl, ext, &presenter)?;
+        let mut targets = vk_present::GlTargets::new(&gl, ext, &presenter)?;
+        // Black window otherwise (seen with some hybrid-GPU laptops).
+        targets.self_test(&gl, &presenter).map_err(|e| format!("GPU sharing check failed: {e}"))?;
+        dbg_log("Vulkan/OpenGL sharing check passed".into());
 
         // mpv starts in SDR; switched per file in `update_hdr_target`.
         self.mpv.set_string("target-trc", "srgb");
@@ -1521,6 +1525,9 @@ impl App {
                     }
                 }
                 Event::Log(prefix, level, text) => {
+                    if matches!(level.as_str(), "fatal" | "error" | "warn") {
+                        file_log(&format!("mpv [{level}] {prefix}: {text}"));
+                    }
                     if self.ui.logs.len() >= ui::LOG_LIMIT {
                         self.ui.logs.pop_front();
                     }
@@ -1741,7 +1748,7 @@ impl App {
         } else {
             let (w, h) = (size.width as i32, size.height as i32);
             let gl = gfx.egui.painter.gl().clone();
-            let cache = if self.gl_video_ok { gl_video_cache(&gl, &mut self.gl_video, w, h) } else { None };
+            let cache = if self.gl_video_ok && !safe_mode() { gl_video_cache(&gl, &mut self.gl_video, w, h) } else { None };
             if cache.is_none() && self.gl_video_ok {
                 // Couldn't create it (e.g. multisampled window): draw directly.
                 self.gl_video_ok = false;
@@ -2453,10 +2460,47 @@ const MEDIA_EXTS: &[&str] = &[
     "flac", "m4a", "aac", "ogg", "opus", "wav", "wma", "alac", "ape", "m3u", "m3u8", "pls", "iso",
 ];
 
+static LOG_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<(std::fs::File, u32)>> = std::sync::OnceLock::new();
+/// Safe mode (--safe-mode): plain OpenGL, no HDR, no offscreen copy.
+static SAFE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn safe_mode() -> bool {
+    SAFE_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `<config>/iina-rs.log`, rewritten at each start: what the program did
+/// with the display, GPU and mpv, for when the window shows nothing.
+fn open_log_file(dir: &Path) {
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(f) = std::fs::File::create(dir.join("iina-rs.log")) {
+        let _ = LOG_FILE.set(std::sync::Mutex::new((f, 0)));
+    }
+    std::panic::set_hook(Box::new(|info| {
+        file_log(&format!("PANIC: {info}"));
+        eprintln!("{info}");
+    }));
+}
+
+fn file_log(msg: &str) {
+    use std::io::Write;
+    if let Some(m) = LOG_FILE.get() {
+        if let Ok(mut g) = m.lock() {
+            // Bounded: the first lines tell what matters.
+            if g.1 < 3000 {
+                g.1 += 1;
+                let t = LOG_START.get_or_init(Instant::now).elapsed().as_secs_f64();
+                let _ = writeln!(g.0, "[{t:7.3}] {msg}");
+                let _ = g.0.flush();
+            }
+        }
+    }
+}
+
 fn dbg_log(msg: String) {
+    file_log(&msg);
     if std::env::var_os("IINA_RS_DEBUG").is_some() {
-        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-        let t = START.get_or_init(Instant::now).elapsed().as_secs_f64();
+        let t = LOG_START.get_or_init(Instant::now).elapsed().as_secs_f64();
         eprintln!("[{t:7.3}] {msg}");
     }
 }
@@ -2495,7 +2539,8 @@ fn pick_gl_config(it: Box<dyn Iterator<Item = glutin::config::Config> + '_>) -> 
     let score = |c: &glutin::config::Config| {
         let rgb8 = matches!(c.color_buffer_type(), Some(glutin::config::ColorBufferType::Rgb { r_size: 8, g_size: 8, b_size: 8 }));
         let samples_ok = if want_msaa { c.num_samples() > 0 } else { c.num_samples() == 0 };
-        (samples_ok as u32) * 1000 + (c.hardware_accelerated() as u32) * 100 + (rgb8 as u32) * 10 + (c.alpha_size() == 8) as u32
+        let alpha_ok = if safe_mode() { c.alpha_size() == 0 } else { c.alpha_size() == 8 };
+        (samples_ok as u32) * 1000 + (c.hardware_accelerated() as u32) * 100 + (rgb8 as u32) * 10 + alpha_ok as u32
     };
     let best = it.reduce(|a, b| if score(&b) > score(&a) { b } else { a }).expect("no OpenGL config");
     dbg_log(format!("GL config: samples {}, accelerated {}, {:?}, alpha {}", best.num_samples(), best.hardware_accelerated(), best.color_buffer_type(), best.alpha_size()));
@@ -3041,6 +3086,10 @@ fn main() {
     let mut args = Vec::new();
     let mut mpv_opts = Vec::new();
     for a in std::env::args().skip(1) {
+        if a == "--safe-mode" {
+            SAFE_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         if let Some(opt) = a.strip_prefix("--") {
             match opt.split_once('=') {
                 Some((k, v)) => mpv_opts.push((k.to_string(), v.to_string())),
@@ -3072,6 +3121,10 @@ fn main() {
             return;
         }
     }
+    // This copy runs the player (a second launch handed its files over
+    // above and exited): start its log file.
+    open_log_file(&config_dir());
+    file_log(&format!("IINA-RS {} on {} {}, args {:?}{}", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH, std::env::args().skip(1).collect::<Vec<_>>(), if safe_mode() { " - SAFE MODE (OpenGL, no HDR, no offscreen copy)" } else { "" }));
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
     let proxy = event_loop.create_proxy();
     let mut app = match App::new(proxy, args, mpv_opts) {
