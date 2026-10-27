@@ -66,15 +66,15 @@
 
 ### التثبيت
 
-**ويندوز:** فكّ ضغط `IINA-RS-x.y.z-windows-x64.zip` وشغّل `iina-rs.exe` (معه `libmpv-2.dll`). لروابط يوتيوب ضع `yt-dlp.exe` في المجلد نفسه أو في PATH.
+**ويندوز:** شغّل المثبّت `IINA-RS-x.y.z-windows-x64-setup.exe`: يثبّت البرنامج لحسابك دون صلاحيات المدير (أو لكل المستخدمين)، ويضيف اختصاراً في قائمة ابدأ، ويعرض إضافته إلى «فتح باستخدام»، ويُزال من إعدادات ويندوز. أو استعمل النسخة المحمولة: فكّ ضغط `IINA-RS-x.y.z-windows-x64.zip` وشغّل `iina-rs.exe` (معه `libmpv-2.dll`). لروابط يوتيوب ضع `yt-dlp.exe` بجانب البرنامج أو في PATH.
 
 **لينكس:**
 ```bash
-sudo apt install ./iina-rs_0.5.0_amd64.deb
+sudo apt install ./iina-rs_0.5.1_amd64.deb
 ```
 أو من الأرشيف:
 ```bash
-tar xf IINA-RS-0.5.0-linux-x86_64.tar.gz && ./IINA-RS-0.5.0-linux-x86_64/install.sh
+tar xf IINA-RS-0.5.1-linux-x86_64.tar.gz && ./IINA-RS-0.5.1-linux-x86_64/install.sh
 ```
 يتطلب libmpv: `libmpv2` (Debian/Ubuntu) أو `mpv-libs` (Fedora) أو `mpv` (Arch). الملف التنفيذي لا يحتاج إلا glibc ≥ 2.31، وتُحمَّل libmpv وOpenGL وX11/Wayland وقت التشغيل.
 
@@ -182,15 +182,15 @@ The binaries are Mach-O and the UI is AppKit, so they can't run on Windows or Li
 
 ### Install
 
-**Windows**: unzip `IINA-RS-x.y.z-windows-x64.zip` and run `iina-rs.exe` (`libmpv-2.dll` is included). For YouTube links, put `yt-dlp.exe` next to it or on your PATH.
+**Windows**: run the installer `IINA-RS-x.y.z-windows-x64-setup.exe`. It installs for your account without admin rights (or for all users), adds a Start menu shortcut, offers to add IINA-RS to "Open with", and uninstalls from Windows Settings. Or use the portable build: unzip `IINA-RS-x.y.z-windows-x64.zip` and run `iina-rs.exe` (`libmpv-2.dll` is included). For YouTube links, put `yt-dlp.exe` next to it or on your PATH.
 
 **Linux**:
 ```bash
-sudo apt install ./iina-rs_0.5.0_amd64.deb
+sudo apt install ./iina-rs_0.5.1_amd64.deb
 ```
 or from the archive:
 ```bash
-tar xf IINA-RS-0.5.0-linux-x86_64.tar.gz && ./IINA-RS-0.5.0-linux-x86_64/install.sh
+tar xf IINA-RS-0.5.1-linux-x86_64.tar.gz && ./IINA-RS-0.5.1-linux-x86_64/install.sh
 ```
 Requires libmpv: `libmpv2` (Debian/Ubuntu), `mpv-libs` (Fedora) or `mpv` (Arch). The binary needs only glibc ≥ 2.31; libmpv, OpenGL and X11 / Wayland are loaded at run time.
 

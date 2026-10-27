@@ -30,7 +30,8 @@ jobs:
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
-          & $iscc /? | Select-Object -First 1
+          "Inno Setup " + (Get-Item $iscc).VersionInfo.ProductVersion
+          if (-not (Test-Path (Join-Path (Split-Path $iscc) "Languages\Arabic.isl"))) { throw "Inno Setup has no Arabic.isl (needs 6.4+)" }
           New-Item -ItemType Directory -Force pkg | Out-Null
           Copy-Item target/release/iina-rs.exe, mpv-dev/libmpv-2.dll pkg/
           $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
