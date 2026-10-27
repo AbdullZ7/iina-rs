@@ -468,6 +468,10 @@ const AR: &[(&str, &str)] = &[
     ("Touchpad: follow the fingers (two fingers up = louder)", "لوحة اللمس: اتباع الأصابع (إصبعان للأعلى = صوت أعلى)"),
     ("Window size: Minimum", "حجم النافذة: الأصغر"),
     ("Window size: Maximum", "حجم النافذة: الأكبر"),
+    ("Video can't be shown on this device", "تعذّر عرض المرئيات على هذا الجهاز"),
+    ("The graphics card's driver doesn't provide OpenGL 3.0 or newer, which mpv needs.", "تعريف بطاقة الرسوميات لا يوفّر OpenGL 3.0 أو أحدث، ويحتاجه mpv."),
+    ("Update the graphics card driver from its maker's site (Intel, AMD or NVIDIA),", "حدّث تعريف بطاقة الرسوميات من موقع الشركة المصنّعة (Intel أو AMD أو NVIDIA)،"),
+    ("then open IINA-RS again.", "ثم افتح IINA-RS من جديد."),
     // App messages
     (
         "Registered. Pick IINA-RS under “Open with”, or set it as default in Default apps.",

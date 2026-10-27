@@ -10,4 +10,14 @@ fn main() {
             println!("cargo:warning=could not embed Windows icon: {e}");
         }
     }
+    // Test builds only: IINA_RS_DGPU_TEST=1 exports NvOptimusEnablement /
+    // AmdPowerXpressRequestHighPerformance so hybrid laptops run it on the
+    // discrete GPU (to test drivers other than the integrated one).
+    println!("cargo:rerun-if-env-changed=IINA_RS_DGPU_TEST");
+    if std::env::var_os("IINA_RS_DGPU_TEST").is_some() && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-cfg=dgpu_test");
+        println!("cargo:rustc-link-arg-bins=/EXPORT:NvOptimusEnablement");
+        println!("cargo:rustc-link-arg-bins=/EXPORT:AmdPowerXpressRequestHighPerformance");
+    }
+    println!("cargo:rustc-check-cfg=cfg(dgpu_test)");
 }

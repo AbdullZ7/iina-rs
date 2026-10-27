@@ -141,6 +141,10 @@ struct App {
     video_pending: bool,
     /// OpenGL mode: offscreen copy of the video frame (fbo, texture, size).
     gl_video: Option<(u32, u32, i32, i32)>,
+    /// The offscreen copy works on this GPU / window (else draw directly).
+    gl_video_ok: bool,
+    /// GPU and OpenGL version (Logs window, error messages).
+    gl_info: String,
     /// Subtitle margin while gliding above / back from the controller.
     sub_margin_cur: Option<f64>,
     /// Displayed video size (dwidth, dheight), from VideoReconfig.
@@ -332,6 +336,8 @@ impl App {
             video_valid: None,
             video_pending: false,
             gl_video: None,
+            gl_video_ok: true,
+            gl_info: String::new(),
             sub_margin_cur: None,
             video_dims: None,
             repaint_at: None,
@@ -403,11 +409,11 @@ impl App {
                 self.ui.output_mode = if reason.is_empty() { "SDR · OpenGL".into() } else { format!("SDR · OpenGL ({reason})") };
             }
         }
-        let template = glutin::config::ConfigTemplateBuilder::new().with_depth_size(0).with_stencil_size(0);
+        let template = gl_template();
         let (window, config) = glutin_winit::DisplayBuilder::new()
             .with_preference(glutin_winit::ApiPreference::FallbackEgl)
             .with_window_attributes(Some(attrs.clone()))
-            .build(el, template, |mut it| it.next().expect("no OpenGL config"))
+            .build(el, template, pick_gl_config)
             .expect("failed to create OpenGL display");
         let window = window.unwrap_or_else(|| glutin_winit::finalize_window(el, attrs, &config).expect("window"));
         let raw = window.window_handle().expect("window handle").as_raw();
@@ -437,6 +443,15 @@ impl App {
 
         let window = Arc::new(window);
         window.set_visible(true);
+        {
+            use glow::HasContext;
+            let gl = egui.painter.gl();
+            let (vendor, renderer, version) = unsafe {
+                (gl.get_parameter_string(glow::VENDOR), gl.get_parameter_string(glow::RENDERER), gl.get_parameter_string(glow::VERSION))
+            };
+            self.gl_info = format!("{renderer} ({vendor}), OpenGL {version}");
+            self.ui.logs.push_back(ui::LogLine { level: "info".into(), prefix: "iina-rs".into(), text: format!("graphics: {}", self.gl_info) });
+        }
         if std::env::var_os("IINA_RS_DEBUG").is_some() {
             use glow::HasContext;
             let gl = egui.painter.gl();
@@ -471,6 +486,11 @@ impl App {
             },
         ) {
             eprintln!("mpv render context: {e}");
+            self.ui.render_error = Some(format!("{e}"));
+            self.ui.logs.push_back(ui::LogLine { level: "error".into(), prefix: "iina-rs".into(), text: format!("video output failed: {e} ({})", self.gl_info) });
+        }
+        if std::env::var_os("IINA_RS_TEST_RENDER_ERROR").is_some() {
+            self.ui.render_error = Some("test".into());
         }
         egui
     }
@@ -495,10 +515,10 @@ impl App {
         }
 
         let helper_attrs = WindowAttributes::default().with_title("IINA-RS GL").with_inner_size(PhysicalSize::new(64, 64)).with_visible(false);
-        let template = glutin::config::ConfigTemplateBuilder::new().with_depth_size(0).with_stencil_size(0);
+        let template = gl_template();
         let (helper, config) = glutin_winit::DisplayBuilder::new()
             .with_window_attributes(Some(helper_attrs.clone()))
-            .build(el, template, |mut it| it.next().expect("no OpenGL config"))
+            .build(el, template, pick_gl_config)
             .map_err(|e| format!("GL display: {e}"))?;
         let helper = match helper {
             Some(h) => h,
@@ -1721,7 +1741,12 @@ impl App {
         } else {
             let (w, h) = (size.width as i32, size.height as i32);
             let gl = gfx.egui.painter.gl().clone();
-            let cache = gl_video_cache(&gl, &mut self.gl_video, w, h);
+            let cache = if self.gl_video_ok { gl_video_cache(&gl, &mut self.gl_video, w, h) } else { None };
+            if cache.is_none() && self.gl_video_ok {
+                // Couldn't create it (e.g. multisampled window): draw directly.
+                self.gl_video_ok = false;
+                self.video_valid = None;
+            }
             if new_frame || self.video_valid != Some((w, h)) {
                 match cache {
                     Some(fbo) => self.mpv.render(fbo as i32, w, h, GL_RGBA8),
@@ -1732,12 +1757,22 @@ impl App {
             }
             if let Some(fbo) = cache {
                 use glow::HasContext;
-                unsafe {
+                let failed = unsafe {
+                    while gl.get_error() != glow::NO_ERROR {}
                     gl.disable(glow::SCISSOR_TEST);
                     gl.bind_framebuffer(glow::READ_FRAMEBUFFER, NonZeroU32::new(fbo).map(glow::NativeFramebuffer));
                     gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
                     gl.blit_framebuffer(0, 0, w, h, 0, 0, w, h, glow::COLOR_BUFFER_BIT, glow::NEAREST);
                     gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    gl.get_error() != glow::NO_ERROR
+                };
+                if failed && std::env::var_os("IINA_RS_TEST_NO_GUARD").is_none() {
+                    // Some drivers can't copy into the window: draw straight
+                    // into it from now on (as before the offscreen copy).
+                    dbg_log("offscreen video copy failed; drawing directly".into());
+                    self.gl_video_ok = false;
+                    self.mpv.render(0, w, h, 0);
+                    self.video_valid = Some((w, h));
                 }
             }
         }
@@ -2434,10 +2469,51 @@ fn trim_num(v: f64) -> String {
 
 const GL_RGBA8: i32 = 0x8058;
 
+#[cfg(dgpu_test)]
+#[unsafe(no_mangle)]
+#[used]
+pub static NvOptimusEnablement: u32 = 1;
+#[cfg(dgpu_test)]
+#[unsafe(no_mangle)]
+#[used]
+pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
+
+fn gl_template() -> glutin::config::ConfigTemplateBuilder {
+    let t = glutin::config::ConfigTemplateBuilder::new().with_depth_size(0).with_stencil_size(0);
+    // Debug aid: IINA_RS_TEST_MSAA=4 asks for a multisampled window.
+    match std::env::var("IINA_RS_TEST_MSAA").ok().and_then(|v| v.parse::<u8>().ok()) {
+        Some(n) => t.with_multisampling(n),
+        None => t,
+    }
+}
+
+/// The driver's first config can be multisampled or unaccelerated: prefer
+/// a hardware, non-multisampled, 8-bit RGB(A) one.
+fn pick_gl_config(it: Box<dyn Iterator<Item = glutin::config::Config> + '_>) -> glutin::config::Config {
+    use glutin::config::GlConfig;
+    let want_msaa = std::env::var_os("IINA_RS_TEST_MSAA").is_some();
+    let score = |c: &glutin::config::Config| {
+        let rgb8 = matches!(c.color_buffer_type(), Some(glutin::config::ColorBufferType::Rgb { r_size: 8, g_size: 8, b_size: 8 }));
+        let samples_ok = if want_msaa { c.num_samples() > 0 } else { c.num_samples() == 0 };
+        (samples_ok as u32) * 1000 + (c.hardware_accelerated() as u32) * 100 + (rgb8 as u32) * 10 + (c.alpha_size() == 8) as u32
+    };
+    let best = it.reduce(|a, b| if score(&b) > score(&a) { b } else { a }).expect("no OpenGL config");
+    dbg_log(format!("GL config: samples {}, accelerated {}, {:?}, alpha {}", best.num_samples(), best.hardware_accelerated(), best.color_buffer_type(), best.alpha_size()));
+    best
+}
+
 /// The offscreen framebuffer holding the video frame (OpenGL mode), created
 /// or resized as needed. Returns its GL name, or None if unavailable.
 fn gl_video_cache(gl: &glow::Context, cache: &mut Option<(u32, u32, i32, i32)>, w: i32, h: i32) -> Option<u32> {
     use glow::HasContext;
+    // Copying into a multisampled window isn't allowed (it was black).
+    if cache.is_none() && std::env::var_os("IINA_RS_TEST_NO_GUARD").is_none() && unsafe {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.get_parameter_i32(glow::SAMPLES)
+    } > 0
+    {
+        return None;
+    }
     if let Some((fbo, _, cw, ch)) = *cache {
         if (cw, ch) == (w, h) {
             return Some(fbo);
@@ -2951,6 +3027,17 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
+    // Used by the Windows installer / uninstaller.
+    match std::env::args().nth(1).as_deref() {
+        Some("--register-file-types") => std::process::exit(assoc::register(VIDEO_AUDIO_EXTS).is_err() as i32),
+        Some("--unregister-file-types") => {
+            if assoc::registered_to_this_exe() {
+                let _ = assoc::unregister(VIDEO_AUDIO_EXTS);
+            }
+            std::process::exit(0);
+        }
+        _ => {}
+    }
     let mut args = Vec::new();
     let mut mpv_opts = Vec::new();
     for a in std::env::args().skip(1) {

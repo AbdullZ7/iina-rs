@@ -113,6 +113,8 @@ pub struct UiState {
     pub update: crate::update::Shared,
     /// Music mode shows the playlist under the controls.
     pub music_playlist: bool,
+    /// mpv couldn't start its video output (shown instead of a black window).
+    pub render_error: Option<String>,
     pub font_dialog: Option<FontDialog>,
     thumb_path: String,
     thumb_tex: HashMap<usize, egui::TextureHandle>,
@@ -162,6 +164,7 @@ impl UiState {
             shot_preview: None,
             update: crate::update::shared(),
             music_playlist: false,
+            render_error: None,
             font_dialog: None,
             thumb_path: String::new(),
             thumb_tex: HashMap::new(),
@@ -836,6 +839,9 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
     preferences(ctx, ui_state, pl, &mut cmds);
     history_window(ctx, ui_state, hist, &mut cmds);
     subtitle_search(ctx, ui_state, &mut cmds);
+    if let Some(e) = ui_state.render_error.clone() {
+        render_error(ctx, &e, &mut cmds);
+    }
     tools::key_bindings(ctx, ui_state, &mut cmds);
     tools::font_dialog(ctx, ui_state, &mut cmds);
     tools::filters(ctx, ui_state, pl, mpv);
@@ -999,6 +1005,35 @@ fn music_panel(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, cm
                 scroll_v(ui, "music-list", Some(MUSIC_LIST_H - 16.0), true, |ui| playlist_tab(ui, pl, mpv, cmds));
             }
         });
+}
+
+/// Shown when mpv can't render video (old / missing graphics driver,
+/// virtual machine without 3D, ...): better than a silent black window.
+fn render_error(ctx: &egui::Context, detail: &str, cmds: &mut Vec<String>) {
+    egui::Area::new(egui::Id::new("render-error")).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+        egui::Frame::new().fill(Color32::from_rgb(60, 28, 28)).corner_radius(10).inner_margin(egui::Margin::same(18)).show(ui, |ui| {
+            ui.set_max_width(620.0_f32.min(ctx.screen_rect().width() - 40.0));
+            rtl_body(ui, |ui| {
+                ui.label(RichText::new(t("Video can't be shown on this device")).size(17.0).strong().color(FG));
+                ui.add_space(6.0);
+                // One short line each: wrapped Arabic paragraphs come out
+                // with their lines in reverse order.
+                for line in [
+                    "The graphics card's driver doesn't provide OpenGL 3.0 or newer, which mpv needs.",
+                    "Update the graphics card driver from its maker's site (Intel, AMD or NVIDIA),",
+                    "then open IINA-RS again.",
+                ] {
+                    ui.add(egui::Label::new(RichText::new(t(line)).color(FG)).extend());
+                }
+                ui.add_space(6.0);
+                ui.add(egui::Label::new(RichText::new(detail).monospace().size(11.0).color(FG_DIM)).wrap());
+                ui.add_space(6.0);
+                if ui.button(t("Logs")).clicked() {
+                    cmds.push("logs".into());
+                }
+            });
+        });
+    });
 }
 
 fn title_bar(ctx: &egui::Context, pl: &Player, alpha: f32) {

@@ -44,6 +44,16 @@ mod imp {
         Ok(())
     }
 
+    /// True if "Open with" currently points at this executable (so an
+    /// uninstaller doesn't remove a registration made by another copy).
+    pub fn registered_to_this_exe() -> bool {
+        let Ok(exe) = exe() else { return false };
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey("Software\\Classes\\Applications\\iina-rs.exe\\shell\\open\\command")
+            .and_then(|k| k.get_value::<String, _>(""))
+            .is_ok_and(|cmd| cmd.to_lowercase().contains(&exe.to_lowercase()))
+    }
+
     pub fn unregister(exts: &[&str]) -> Result<(), String> {
         let classes = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags("Software\\Classes", winreg::enums::KEY_ALL_ACCESS).map_err(|e| e.to_string())?;
         let _ = classes.delete_subkey_all(PROG_ID);
@@ -69,6 +79,9 @@ mod imp {
     }
     pub fn unregister(_: &[&str]) -> Result<(), String> {
         Ok(())
+    }
+    pub fn registered_to_this_exe() -> bool {
+        false
     }
     pub fn open_default_apps_settings() {}
 }
