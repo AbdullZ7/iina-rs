@@ -2014,7 +2014,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                             }
                         }
                     });
-                    choice(ui, "shot-fmt", "Format", &mut s.screenshot_format, &[("png", "PNG"), ("jpg", "JPEG"), ("webp", "WebP"), ("jxl", "JPEG XL"), ("avif", "AVIF")]);
+                    choice(ui, "shot-fmt", "Format", &mut s.screenshot_format, &[("png", "PNG"), ("jpg", "JPEG"), ("webp", "WebP"), ("jxl", "JPEG XL")]);
                     text_field(ui, "File name template", &mut s.screenshot_template, "%F-%n");
                     check(ui, &mut s.screenshot_with_subs, t("Include subtitles"));
                     check(ui, &mut s.screenshot_clipboard, t("Copy to the clipboard"));

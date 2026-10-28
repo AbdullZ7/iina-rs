@@ -1,0 +1,129 @@
+name: libmpv (slim)
+
+# Builds libmpv-2.dll for Windows with shinchiro/mpv-winbuild-cmake (the
+# build IINA-RS used so far), minus what a player doesn't use: see
+# scripts/slim_libmpv.py. The result is the artifact "libmpv-slim", which the
+# Windows job of build.yml downloads. Monthly, for newer mpv and FFmpeg (and
+# so the artifact never expires).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 1 * *'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  libmpv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    container:
+      image: docker://ghcr.io/shinchiro/archlinux:latest
+    env:
+      # mpv-winbuild-cmake revision whose recipes slim_libmpv.py edits.
+      WINBUILD_REF: 1f8d2e76255abc48f0456d9be99b4cab9c6566e6
+      BIT: x86_64
+    steps:
+      - name: Git config
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory '*'
+
+      - uses: actions/checkout@v4
+        with:
+          path: iina-rs
+
+      - uses: actions/checkout@v4
+        with:
+          repository: shinchiro/mpv-winbuild-cmake
+          ref: ${{ env.WINBUILD_REF }}
+          path: winbuild
+
+      - name: Restore toolchain cache
+        uses: actions/cache/restore@v4
+        with:
+          path: winbuild/build_x86_64
+          key: winbuild-${{ env.WINBUILD_REF }}-toolchain-${{ github.run_id }}
+          restore-keys: winbuild-${{ env.WINBUILD_REF }}-toolchain
+
+      - name: Restore sources cache
+        uses: actions/cache/restore@v4
+        with:
+          path: winbuild/src_packages
+          key: winbuild-sources-${{ github.run_id }}
+          restore-keys: winbuild-sources
+
+      - name: Slim down the recipes
+        run: python3 iina-rs/scripts/slim_libmpv.py winbuild
+
+      - name: Configure and download sources
+        working-directory: winbuild
+        run: |
+          cmake -DTARGET_ARCH=x86_64-w64-mingw32 -DSINGLE_SOURCE_LOCATION=$PWD/src_packages \
+            -DRUSTUP_LOCATION=$PWD/clang_root/install_rustup -DENABLE_CCACHE=ON \
+            --fresh -G Ninja -B build_$BIT -S $PWD
+          ninja -C build_$BIT download || true
+
+      - name: Build the toolchain
+        working-directory: winbuild
+        run: |
+          if [[ ! -f "build_$BIT/install/bin/cross-gcc" ]]; then
+            ninja -C build_$BIT gcc && rm -rf build_$BIT/toolchain
+          fi
+
+      - name: Save toolchain cache
+        uses: actions/cache/save@v4
+        with:
+          path: winbuild/build_x86_64
+          key: winbuild-${{ env.WINBUILD_REF }}-toolchain-${{ github.run_id }}
+
+      - name: Build mpv
+        working-directory: winbuild
+        run: |
+          ninja -C build_$BIT update
+          ninja -C build_$BIT mpv
+
+      - name: Save sources cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: winbuild/src_packages
+          key: winbuild-sources-${{ github.run_id }}
+
+      - name: Collect libmpv
+        working-directory: winbuild
+        run: |
+          dll=$(find build_$BIT -name libmpv-2.dll -path '*mpv-dev*' | head -1)
+          test -n "$dll"
+          mkdir -p ../out
+          cp "$dll" ../out/
+          git -C src_packages/mpv describe --always --tags > ../out/mpv-version.txt || true
+          git -C src_packages/ffmpeg describe --always --tags > ../out/ffmpeg-version.txt || true
+          ls -l ../out
+          # The encoders must really be gone.
+          if strings ../out/libmpv-2.dll | grep -q -e 'x265 (build' -e 'x264 - core' -e 'SVT-AV1 Encoder'; then
+            echo "encoder found in the slim libmpv"; exit 1
+          fi
+          echo "libmpv-2.dll: $(( $(stat -c %s ../out/libmpv-2.dll) / 1048576 )) MB"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-slim
+          path: out/
+          retention-days: 90
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p logs
+          cp -r $(find winbuild/build_$BIT -type f -iname "*-*.log" -or -wholename "*/ffbuild/config.log") logs/ || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: libmpv-slim-logs
+          path: logs/
+          retention-days: 7

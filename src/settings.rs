@@ -94,7 +94,8 @@ pub struct Settings {
 
     // ------------------------------------------------------------- screenshot
     pub screenshot_dir: String,
-    /// "png", "jpg", "webp", "jxl", "avif".
+    /// "png", "jpg", "webp", "jxl" ("avif" before 0.5.1: the slim libmpv
+    /// has no AV1 encoder, such settings save PNG).
     pub screenshot_format: String,
     pub screenshot_template: String,
     pub screenshot_with_subs: bool,
@@ -433,7 +434,7 @@ impl Settings {
             ("replaygain", self.replaygain.clone()),
             ("gapless-audio", self.gapless.clone()),
             ("screenshot-dir", self.screenshot_dir.clone()),
-            ("screenshot-format", self.screenshot_format.clone()),
+            ("screenshot-format", if self.screenshot_format == "avif" { "png".into() } else { self.screenshot_format.clone() }),
             ("screenshot-template", self.screenshot_template.clone()),
             ("cache", yn(self.cache)),
             ("demuxer-max-bytes", format!("{:.0}MiB", self.cache_mib.max(1.0))),
