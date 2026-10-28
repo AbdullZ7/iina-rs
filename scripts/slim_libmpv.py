@@ -5,7 +5,7 @@
 Removed from FFmpeg: the video encoders x264, x265, libaom and SVT-AV1
 (mpv only needs them for its --o recording mode; AV1 is decoded by dav1d)
 and VapourSynth. Removed from mpv: the JavaScript engine (mujs), VapourSynth,
-SDL gamepad input and Sixel terminal output. From curl: HTTP/3. Lua,
+SDL gamepad input and Sixel terminal output. From curl: HTTP/3 and ECH. Lua,
 libarchive, Blu-ray/DVD, curl (HTTPS, HTTP/2), rubberband, Vulkan/libplacebo
 and the decoders stay.
 
@@ -54,8 +54,9 @@ edit(
     {},
 )
 
-# HTTP/3 (ngtcp2 + nghttp3): no use for a player, and ngtcp2 no longer
-# builds against the pinned OpenSSL 4.1 (no QUIC API). HTTPS / HTTP/2 stay.
+# HTTP/3 (ngtcp2 + nghttp3) and TLS Encrypted Client Hello: no use for a
+# player, and neither builds against the pinned OpenSSL 4.1 (no QUIC API, no
+# SSL_set1_ech_config_list). HTTPS / HTTP/2 stay.
 edit(
     "curl.cmake",
     ["ngtcp2", "nghttp3"],
@@ -63,6 +64,7 @@ edit(
         "-DUSE_NGHTTP3=ON": "-DUSE_NGHTTP3=OFF",
         "-DUSE_NGTCP2=ON": "-DUSE_NGTCP2=OFF",
         "-DUSE_PROXY_HTTP3=ON": "-DUSE_PROXY_HTTP3=OFF",
+        "-DUSE_ECH=ON": "-DUSE_ECH=OFF",
     },
 )
 
