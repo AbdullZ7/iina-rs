@@ -459,7 +459,7 @@ const AR: &[(&str, &str)] = &[
     ("Copy to the clipboard", "النسخ إلى الحافظة"),
     ("Show a preview after taking a screenshot", "إظهار معاينة بعد التقاط لقطة شاشة"),
     ("Updates", "التحديثات"),
-    ("Check for updates automatically (once a day, GitHub)", "فحص التحديثات آليًا (مرة يوميًا، من GitHub)"),
+    ("Check for updates automatically (once a week, GitHub)", "فحص التحديثات آليًا (مرة أسبوعيًا، من GitHub)"),
     ("Screenshot copied to clipboard", "نُسخت لقطة الشاشة إلى الحافظة"),
     ("Key bindings saved", "حُفظت ارتباطات المفاتيح"),
     ("Paused", "توقف مؤقت"),

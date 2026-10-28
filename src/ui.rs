@@ -816,12 +816,12 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
         welcome(ctx, ui_state, &mut cmds);
     } else {
         let recently_active = now.duration_since(ui_state.last_activity) < hide_after;
-        let want_osc = !ui_state.settings.osc_autohide
-            || recently_active
+        let held_open = !ui_state.settings.osc_autohide
             || ui_state.pointer_over_ui
             || ui_state.music_mode
             || ui_state.seek_preview.is_some()
             || ui_state.context_menu.is_some();
+        let want_osc = recently_active || held_open;
         ui_state.osc_visible = want_osc;
         let alpha = ctx.animate_bool_with_time(egui::Id::new("osc-alpha"), want_osc, 0.18);
         if ui_state.music_mode {
@@ -832,7 +832,9 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
             }
             osc(ctx, ui_state, pl, mpv, thumbs, alpha, &mut cmds);
         }
-        if want_osc && !pl.pause {
+        // Wake up when the controller is due to hide; not while something
+        // holds it open (that repainted every 30 ms, e.g. in music mode).
+        if recently_active && !held_open && !pl.pause {
             ctx.request_repaint_after(hide_after.saturating_sub(now.duration_since(ui_state.last_activity)) + Duration::from_millis(30));
         }
     }
@@ -2015,7 +2017,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     check(ui, &mut s.screenshot_clipboard, t("Copy to the clipboard"));
                     check(ui, &mut s.screenshot_preview, t("Show a preview after taking a screenshot"));
                     section(ui, "Updates");
-                    check(ui, &mut s.check_updates, t("Check for updates automatically (once a day, GitHub)"));
+                    check(ui, &mut s.check_updates, t("Check for updates automatically (once a week, GitHub)"));
                     section(ui, "System");
                     row_wrapped(ui, |ui| {
                         if cfg!(windows) {

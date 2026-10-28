@@ -28,7 +28,7 @@ pub struct Settings {
     pub blackout_monitors: bool,
     /// Switch to music mode for audio files (IINA: on).
     pub auto_music_mode: bool,
-    /// Check GitHub for a newer release once a day.
+    /// Check GitHub for a newer release once a week.
     pub check_updates: bool,
     /// Unix time of the last update check.
     pub last_update_check: u64,

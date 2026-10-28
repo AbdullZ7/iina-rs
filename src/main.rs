@@ -191,6 +191,10 @@ struct App {
     output_trial: Option<Instant>,
     /// The single-instance lock was handed to a restarted copy.
     instance_handed_over: bool,
+    /// Playback position when it last caused a redraw.
+    pos_drawn: f64,
+    /// Test aid (IINA_RS_IDLE_TEST): frame count when idle measuring began.
+    idle_mark: Option<u32>,
     last_stats: Instant,
     fs_toggles: u32,
     /// Window geometry (and maximized flag) to restore when leaving fullscreen.
@@ -383,6 +387,8 @@ impl App {
             render_mem: None,
             output_trial: None,
             instance_handed_over: false,
+            pos_drawn: 0.0,
+            idle_mark: None,
             last_stats: Instant::now(),
             fs_toggles: 0,
             fs_saved: None,
@@ -749,7 +755,7 @@ impl App {
         #[cfg(windows)]
         self.start_taskbar();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        if self.ui.settings.check_updates && now.saturating_sub(self.ui.settings.last_update_check) > 24 * 3600 && std::env::var_os("IINA_RS_SNAPSHOT").is_none() {
+        if self.ui.settings.check_updates && now.saturating_sub(self.ui.settings.last_update_check) > 7 * 24 * 3600 && std::env::var_os("IINA_RS_SNAPSHOT").is_none() {
             self.check_updates();
         }
         if self.player.fullscreen {
@@ -1678,7 +1684,24 @@ impl App {
     // ------------------------------------------------------- mpv events ---
 
     fn handle_mpv_events(&mut self, el: &ActiveEventLoop) {
+        let mut redraw = false;
         for ev in self.mpv.poll_events() {
+            // time-pos changes dozens of times a second with audio: redraw
+            // only when the shown second or the seek bar visibly changes
+            // (video frames redraw anyway).
+            redraw |= match &ev {
+                Event::Property(name, mpv::PropValue::Double(t)) if name == "time-pos" => {
+                    let (shown, dur) = (self.pos_drawn, self.player.duration.max(1.0));
+                    let visible = t.floor() != shown.floor() || (t - shown).abs() / dur >= 0.005;
+                    if visible {
+                        self.pos_drawn = *t;
+                    }
+                    visible
+                }
+                Event::Log(..) => false,
+                _ => true,
+            };
+
             if std::env::var_os("IINA_RS_DEBUG").is_some() { eprintln!("mpv event: {ev:?}"); }
             match ev {
                 Event::Shutdown => {
@@ -1814,7 +1837,9 @@ impl App {
                 _ => {}
             }
         }
-        self.redraw();
+        if redraw {
+            self.redraw();
+        }
     }
 
     fn apply_fullscreen(&mut self) {
@@ -2972,6 +2997,27 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.check_output_trial();
+        // Test aid: IINA_RS_IDLE_TEST=1 counts the frames drawn from 6 s to
+        // 11 s after start (play paused, mouse away: should be none), quits.
+        let idle_wake = std::env::var_os("IINA_RS_IDLE_TEST").map(|_| {
+            let e = self.started.elapsed();
+            if e >= Duration::from_secs(11) {
+                dbg_log(format!(
+                    "idle test: {} frames drawn in 5 s (time-pos {:.1}, pause {}, music mode {})",
+                    self.frames.wrapping_sub(self.idle_mark.unwrap_or(self.frames)),
+                    self.player.time_pos,
+                    self.player.pause,
+                    self.ui.music_mode
+                ));
+                self.mpv.command(&["quit"]);
+                self.started + Duration::from_secs(3600)
+            } else if e >= Duration::from_secs(6) {
+                self.idle_mark.get_or_insert(self.frames);
+                self.started + Duration::from_secs(11)
+            } else {
+                self.started + Duration::from_secs(6)
+            }
+        });
         // Debug aid: IINA_RS_CMD_DELAY=secs runs IINA_RS_CMD after a delay.
         if let Some(d) = std::env::var("IINA_RS_CMD_DELAY").ok().and_then(|v| v.parse::<f64>().ok()) {
             if !self.debug_cmds_done {
@@ -3064,8 +3110,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.redraw();
                 el.set_control_flow(ControlFlow::Wait);
             }
-            Some(t) => el.set_control_flow(ControlFlow::WaitUntil(t)),
-            None => el.set_control_flow(ControlFlow::Wait),
+            Some(t) => el.set_control_flow(ControlFlow::WaitUntil(idle_wake.map_or(t, |w| w.min(t)))),
+            None => el.set_control_flow(idle_wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil)),
         }
     }
 
@@ -3083,7 +3129,10 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         let resp = gfx.egui.on_window_event(&gfx.window, &event);
-        if resp.repaint {
+        // egui answers "repaint" to RedrawRequested itself: requesting
+        // another one drew ~240 frames/s with nothing changing. egui asks
+        // for the repaints it needs through the repaint callback.
+        if resp.repaint && !matches!(event, WindowEvent::RedrawRequested) {
             gfx.window.request_redraw();
         }
         let egui_ctx = gfx.egui.egui_ctx.clone();
