@@ -283,6 +283,8 @@ const AR: &[(&str, &str)] = &[
     ("Super resolution isn't active now: the video isn't enlarged", "الميز الفائق لا يعمل الآن: المرئيات غير مكبَّرة"),
     ("RTX Video HDR is active now", "يعمل RTX Video HDR الآن"),
     ("Takes effect after a restart", "يسري بعد إعادة التشغيل"),
+    ("Show advanced options", "إظهار الخيارات المتقدمة"),
+    ("Enhance video quality (NVIDIA)", "تحسين جودة المرئيات (NVIDIA)"),
     ("Black picture? Press Ctrl+F12", "الصورة سوداء؟ اضغط Ctrl+F12"),
     ("The safe output is already in use", "العرض الآمن مستعمل أصلاً"),
     ("The safe output is in use on this computer (Ctrl+F12)", "العرض الآمن مستعمل على هذا الحاسوب (Ctrl+F12)"),

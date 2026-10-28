@@ -1936,25 +1936,28 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                 header_close = true;
             }
             let s = &mut st.settings;
+            // Without the advanced options: General (its basic page) and
+            // Subtitles only.
+            let shown: &[usize] = if s.prefs_advanced { &[0, 1, 2, 3, 4, 5] } else { &[0, 2] };
+            if !shown.contains(&(prefs_tab as usize)) {
+                prefs_tab = 0;
+            }
             row_wrapped(ui, |ui| {
-                for (i, name) in PREF_TABS.iter().enumerate() {
-                    if ui.selectable_label(prefs_tab as usize == i, RichText::new(t(name)).size(14.0)).clicked() {
+                for &i in shown {
+                    if ui.selectable_label(prefs_tab as usize == i, RichText::new(t(PREF_TABS[i])).size(14.0)).clicked() {
                         prefs_tab = i as u8;
                     }
                 }
             });
+            check(ui, &mut s.prefs_advanced, t("Show advanced options"));
             ui.separator();
             let body_h = (ctx.screen_rect().height() - 200.0).clamp(160.0, 620.0);
+            let basic = !s.prefs_advanced;
             scroll_v(ui, "prefs-body", Some(body_h), false, |ui| match prefs_tab {
+                0 if basic => basic_prefs(ui, s, &rtx, (output_skipped, output_retry), &assoc_status, cmds),
                 // ------------------------------------------------------ General
                 0 => {
-                    field(ui, "Language", |ui| {
-                        for (code, name) in [("auto", t("Automatic")), ("en", "English".to_string()), ("ar", v("العربية"))] {
-                            if ui.selectable_label(s.language == code, name).clicked() {
-                                s.language = code.to_string();
-                            }
-                        }
-                    });
+                    language_field(ui, s);
                     section(ui, "Playback");
                     check(ui, &mut s.resume_playback, t("Resume last playback position"));
                     check(ui, &mut s.auto_add_folder, t("Add files in the same folder to the playlist"));
@@ -2052,18 +2055,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     }
                     if !cfg!(target_os = "macos") {
                         check(ui, &mut s.hdr_output, t("HDR output on HDR displays (restart required)"));
-                        if let Some(skip) = output_skipped {
-                            let why = match skip {
-                                crate::render_memory::Skip::Chosen => t("The safe output is in use on this computer (Ctrl+F12)"),
-                                crate::render_memory::Skip::Failed => t("The safe output is in use: the enhanced output didn't work on this computer"),
-                            };
-                            ui.label(RichText::new(why).size(11.0).color(FG_DIM));
-                            if output_retry {
-                                ui.label(RichText::new(t("Takes effect after a restart")).size(11.0).color(FG_DIM));
-                            } else if ui.button(t("Try the enhanced output again")).clicked() {
-                                cmds.push("retry-enhanced-output".into());
-                            }
-                        }
+                        safe_output_note(ui, output_skipped, output_retry, cmds);
                         if s.hdr_output {
                             field(ui, "HDR peak brightness", |ui| {
                                 ui.add(egui::DragValue::new(&mut s.hdr_peak_nits).range(0.0..=10000.0).speed(10.0).max_decimals(0));
@@ -2071,44 +2063,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                             });
                         }
                     }
-                    if cfg!(windows) && rtx.nvidia {
-                        section(ui, "NVIDIA RTX Video");
-                        let mut sr = s.rtx_super_resolution.unwrap_or(rtx.hdr_display);
-                        if check(ui, &mut sr, t("Super resolution: sharpens and cleans up enlarged video")).changed() {
-                            s.rtx_super_resolution = Some(sr);
-                        }
-                        check(ui, &mut s.rtx_video_hdr, t("RTX Video HDR: shows SDR video in HDR"));
-                        let dim = |ui: &mut Ui, text: String| {
-                            ui.label(RichText::new(text).size(11.0).color(FG_DIM));
-                        };
-                        if sr || s.rtx_video_hdr {
-                            let on_nvidia = rtx.gpu.to_ascii_lowercase().contains("nvidia");
-                            if rtx.ready {
-                                let factor = rtx.active.and_then(|a| a.0);
-                                let hdr = rtx.active.is_some_and(|a| a.1);
-                                if let Some(f) = factor {
-                                    dim(ui, tf("Super resolution is active now: ×{}", &[&format!("{f:.1}")]));
-                                } else if sr {
-                                    dim(ui, t("Super resolution isn't active now: the video isn't enlarged"));
-                                }
-                                if hdr {
-                                    dim(ui, t("RTX Video HDR is active now"));
-                                }
-                            } else if rtx.switch_requested || on_nvidia {
-                                dim(ui, t("Takes effect after a restart"));
-                            } else {
-                                dim(ui, tf("IINA-RS is running on: {}", &[&rtx.gpu]));
-                                dim(ui, t("RTX Video needs the NVIDIA graphics card"));
-                                if ui.button(t("Use the NVIDIA graphics card")).clicked() {
-                                    cmds.push("rtx-use-nvidia".into());
-                                }
-                            }
-                            if s.rtx_video_hdr && !rtx.hdr_display {
-                                dim(ui, t("RTX Video HDR needs an HDR display"));
-                            }
-                            dim(ui, t("If the picture doesn't change, turn on RTX Video Enhancement in the NVIDIA Control Panel"));
-                        }
-                    }
+                    rtx_prefs(ui, s, &rtx, cmds, false);
                     section(ui, "Audio");
                     text_field(ui, "Preferred audio languages", &mut s.audio_languages, "ar,ara,en");
                     field(ui, "Output device", |ui| {
@@ -2245,6 +2200,104 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
         st.settings_dirty = true;
     }
     st.show_prefs = open;
+}
+
+/// Preferences: the interface language.
+fn language_field(ui: &mut Ui, s: &mut Settings) {
+    field(ui, "Language", |ui| {
+        for (code, name) in [("auto", t("Automatic")), ("en", "English".to_string()), ("ar", v("العربية"))] {
+            if ui.selectable_label(s.language == code, name).clicked() {
+                s.language = code.to_string();
+            }
+        }
+    });
+}
+
+/// Preferences: when the safe output replaced the enhanced one (render_memory.rs).
+fn safe_output_note(ui: &mut Ui, output_skipped: Option<crate::render_memory::Skip>, output_retry: bool, cmds: &mut Vec<String>) {
+    if let Some(skip) = output_skipped {
+        let why = match skip {
+            crate::render_memory::Skip::Chosen => t("The safe output is in use on this computer (Ctrl+F12)"),
+            crate::render_memory::Skip::Failed => t("The safe output is in use: the enhanced output didn't work on this computer"),
+        };
+        ui.label(RichText::new(why).size(11.0).color(FG_DIM));
+        if output_retry {
+            ui.label(RichText::new(t("Takes effect after a restart")).size(11.0).color(FG_DIM));
+        } else if ui.button(t("Try the enhanced output again")).clicked() {
+            cmds.push("retry-enhanced-output".into());
+        }
+    }
+}
+
+/// Preferences: NVIDIA RTX Video. `basic`: one plain-worded option.
+fn rtx_prefs(ui: &mut Ui, s: &mut Settings, rtx: &RtxStatus, cmds: &mut Vec<String>, basic: bool) {
+    if !cfg!(windows) || !rtx.nvidia {
+        return;
+    }
+    section(ui, if basic { "Video" } else { "NVIDIA RTX Video" });
+    let mut sr = s.rtx_super_resolution.unwrap_or(rtx.hdr_display);
+    let label = if basic { t("Enhance video quality (NVIDIA)") } else { t("Super resolution: sharpens and cleans up enlarged video") };
+    if check(ui, &mut sr, label).changed() {
+        s.rtx_super_resolution = Some(sr);
+    }
+    if !basic {
+        check(ui, &mut s.rtx_video_hdr, t("RTX Video HDR: shows SDR video in HDR"));
+    }
+    let dim = |ui: &mut Ui, text: String| {
+        ui.label(RichText::new(text).size(11.0).color(FG_DIM));
+    };
+    if sr || s.rtx_video_hdr {
+        let on_nvidia = rtx.gpu.to_ascii_lowercase().contains("nvidia");
+        if rtx.ready {
+            let factor = rtx.active.and_then(|a| a.0);
+            let hdr = rtx.active.is_some_and(|a| a.1);
+            if let Some(f) = factor {
+                dim(ui, tf("Super resolution is active now: ×{}", &[&format!("{f:.1}")]));
+            } else if sr {
+                dim(ui, t("Super resolution isn't active now: the video isn't enlarged"));
+            }
+            if hdr {
+                dim(ui, t("RTX Video HDR is active now"));
+            }
+        } else if rtx.switch_requested || on_nvidia {
+            dim(ui, t("Takes effect after a restart"));
+        } else {
+            dim(ui, tf("IINA-RS is running on: {}", &[&rtx.gpu]));
+            dim(ui, t("RTX Video needs the NVIDIA graphics card"));
+            if ui.button(t("Use the NVIDIA graphics card")).clicked() {
+                cmds.push("rtx-use-nvidia".into());
+            }
+        }
+        if s.rtx_video_hdr && !rtx.hdr_display {
+            dim(ui, t("RTX Video HDR needs an HDR display"));
+        }
+        dim(ui, t("If the picture doesn't change, turn on RTX Video Enhancement in the NVIDIA Control Panel"));
+    }
+}
+
+/// Preferences without the advanced options: what most people change.
+fn basic_prefs(ui: &mut Ui, s: &mut Settings, rtx: &RtxStatus, output: (Option<crate::render_memory::Skip>, bool), assoc_status: &str, cmds: &mut Vec<String>) {
+    language_field(ui, s);
+    section(ui, "Playback");
+    check(ui, &mut s.resume_playback, t("Resume last playback position"));
+    check(ui, &mut s.prevent_sleep, t("Keep the display awake during playback"));
+    section(ui, "Audio");
+    check(ui, &mut s.remember_volume, t("Remember the last volume"));
+    field(ui, "Maximum volume", |ui| {
+        slider(ui, &mut s.volume_max, 100.0..=200.0, "%", 0);
+    });
+    rtx_prefs(ui, s, rtx, cmds, true);
+    safe_output_note(ui, output.0, output.1, cmds);
+    section(ui, "System");
+    row_wrapped(ui, |ui| {
+        if cfg!(windows) && ui.button(t("Add to “Open with”")).on_hover_text(t("Registers IINA-RS for video/audio files for your user account")).clicked() {
+            cmds.push("assoc-register".into());
+        }
+    });
+    if !assoc_status.is_empty() {
+        ui.label(RichText::new(v(assoc_status)).size(11.0).color(FG_DIM));
+    }
+    check(ui, &mut s.check_updates, t("Check for updates automatically (once a week, GitHub)"));
 }
 
 fn about(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {

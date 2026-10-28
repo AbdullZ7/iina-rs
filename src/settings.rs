@@ -68,6 +68,8 @@ pub struct Settings {
     pub hdr_output: bool,
     /// Display peak luminance for HDR output (0 = as reported by the OS).
     pub hdr_peak_nits: f32,
+    /// Preferences shows every tab (else General's basic page and Subtitles).
+    pub prefs_advanced: bool,
     /// NVIDIA RTX Video Super Resolution when the video is enlarged
     /// (Windows). None: on with HDR displays (the Direct3D 11 output is used
     /// anyway), off on SDR displays (it would switch them from OpenGL).
@@ -307,6 +309,7 @@ impl Default for Settings {
             hdr_output: true,
             hdr_peak_nits: 0.0,
             rtx_super_resolution: None,
+            prefs_advanced: false,
             rtx_video_hdr: false,
             volume: 100.0,
             remember_volume: true,
