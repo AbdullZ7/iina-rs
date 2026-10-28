@@ -5,9 +5,10 @@
 Removed from FFmpeg: the video encoders x264, x265, libaom and SVT-AV1
 (mpv only needs them for its --o recording mode; AV1 is decoded by dav1d)
 and VapourSynth. Removed from mpv: the JavaScript engine (mujs), VapourSynth,
-SDL gamepad input and Sixel terminal output. From curl: HTTP/3 and ECH. Lua,
-libarchive, Blu-ray/DVD, curl (HTTPS, HTTP/2), rubberband, Vulkan/libplacebo
-and the decoders stay.
+SDL gamepad input, Sixel terminal output and subrandr (YouTube SRV3
+subtitles; the only Rust package, and Rust isn't in the build image). From
+curl: HTTP/3 and ECH. Lua, libarchive, Blu-ray/DVD, curl (HTTPS, HTTP/2),
+rubberband, Vulkan/libplacebo and the decoders stay.
 
 Each edit must match exactly: if the recipes change upstream, this fails
 instead of silently building the full library.
@@ -70,11 +71,12 @@ edit(
 
 edit(
     "mpv.cmake",
-    ["mujs", "vapoursynth", "libsdl2", "libsixel"],
+    ["mujs", "vapoursynth", "libsdl2", "libsixel", "subrandr"],
     {
         "-Djavascript=enabled": "-Djavascript=disabled",
         "-Dvapoursynth=enabled": "-Dvapoursynth=disabled",
         "-Dsdl2-gamepad=enabled": "-Dsdl2-gamepad=disabled",
         "-Dsixel=enabled": "-Dsixel=disabled",
+        "-Dsubrandr=enabled": "-Dsubrandr=disabled",
     },
 )
