@@ -52,6 +52,8 @@ edit(
         "--enable-libaom",
         "--enable-libsvtav1",
         "--enable-vapoursynth",
+        # FFmpeg removed its OpenGL output device (and the option).
+        "--enable-opengl",
     ],
     # TLS through Windows (Schannel): see curl below.
     {"--enable-openssl": "--enable-schannel"},
