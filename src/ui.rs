@@ -92,6 +92,10 @@ pub struct UiState {
     pub output_mode: String,
     /// NVIDIA RTX Video availability (Preferences > Video).
     pub rtx: RtxStatus,
+    /// The enhanced output was skipped on this GPU/driver/display.
+    pub output_skipped: Option<crate::render_memory::Skip>,
+    /// "Try again" was chosen (applies at the next start).
+    pub output_retry: bool,
     /// Installed font families (scanned on demand for the font picker).
     pub fonts: crate::fonts::Shared,
     /// Preferences tab: 0 = general, 1 = subtitles.
@@ -153,6 +157,8 @@ impl UiState {
             volume_bar_rect: None,
             output_mode: String::new(),
             rtx: RtxStatus::default(),
+            output_skipped: None,
+            output_retry: false,
             fonts: Default::default(),
             prefs_tab: 0,
             logs: Default::default(),
@@ -1909,6 +1915,7 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
     let before = st.settings.clone();
     let assoc_status = st.assoc_status.clone();
     let rtx = st.rtx.clone();
+    let (output_skipped, output_retry) = (st.output_skipped, st.output_retry);
     let mut prefs_tab = st.prefs_tab;
     let mut header_close = false;
     egui::Window::new(t("Preferences"))
@@ -2043,6 +2050,18 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     }
                     if !cfg!(target_os = "macos") {
                         check(ui, &mut s.hdr_output, t("HDR output on HDR displays (restart required)"));
+                        if let Some(skip) = output_skipped {
+                            let why = match skip {
+                                crate::render_memory::Skip::Chosen => t("The safe output is in use on this computer (Ctrl+F12)"),
+                                crate::render_memory::Skip::Failed => t("The safe output is in use: the enhanced output didn't work on this computer"),
+                            };
+                            ui.label(RichText::new(why).size(11.0).color(FG_DIM));
+                            if output_retry {
+                                ui.label(RichText::new(t("Takes effect after a restart")).size(11.0).color(FG_DIM));
+                            } else if ui.button(t("Try the enhanced output again")).clicked() {
+                                cmds.push("retry-enhanced-output".into());
+                            }
+                        }
                         if s.hdr_output {
                             field(ui, "HDR peak brightness", |ui| {
                                 ui.add(egui::DragValue::new(&mut s.hdr_peak_nits).range(0.0..=10000.0).speed(10.0).max_decimals(0));
@@ -2052,19 +2071,22 @@ fn preferences(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut Ve
                     }
                     if cfg!(windows) && rtx.nvidia {
                         section(ui, "NVIDIA RTX Video");
-                        check(ui, &mut s.rtx_super_resolution, t("Super resolution: sharpens and cleans up enlarged video"));
+                        let mut sr = s.rtx_super_resolution.unwrap_or(rtx.hdr_display);
+                        if check(ui, &mut sr, t("Super resolution: sharpens and cleans up enlarged video")).changed() {
+                            s.rtx_super_resolution = Some(sr);
+                        }
                         check(ui, &mut s.rtx_video_hdr, t("RTX Video HDR: shows SDR video in HDR"));
                         let dim = |ui: &mut Ui, text: String| {
                             ui.label(RichText::new(text).size(11.0).color(FG_DIM));
                         };
-                        if s.rtx_super_resolution || s.rtx_video_hdr {
+                        if sr || s.rtx_video_hdr {
                             let on_nvidia = rtx.gpu.to_ascii_lowercase().contains("nvidia");
                             if rtx.ready {
                                 let factor = rtx.active.and_then(|a| a.0);
                                 let hdr = rtx.active.is_some_and(|a| a.1);
                                 if let Some(f) = factor {
                                     dim(ui, tf("Super resolution is active now: ×{}", &[&format!("{f:.1}")]));
-                                } else if s.rtx_super_resolution {
+                                } else if sr {
                                     dim(ui, t("Super resolution isn't active now: the video isn't enlarged"));
                                 }
                                 if hdr {

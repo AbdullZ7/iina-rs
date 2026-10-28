@@ -11,6 +11,7 @@ pub const IINA_DEFAULT: &str = include_str!("../assets/iina-default-input.conf")
 
 /// Extra bindings for actions that live in the macOS menu bar in IINA.
 const DESKTOP_EXTRAS: &str = "
+#@iina Ctrl+F12 safe-output
 #@iina Meta+o open-file
 #@iina Meta+u open-url
 #@iina Meta+w close-file

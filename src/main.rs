@@ -24,6 +24,7 @@ mod thumbs;
 mod update;
 mod ui;
 mod vk_present;
+mod render_memory;
 #[cfg(windows)]
 mod dx_present;
 
@@ -98,6 +99,11 @@ struct Gfx {
     vk: Option<VkMode>,
 }
 
+/// How long the title says how to leave a black window.
+const TRIAL_HINT: Duration = Duration::from_secs(20);
+/// Running this long confirms the enhanced output for this GPU/driver.
+const TRIAL_CONFIRM: Duration = Duration::from_secs(60);
+
 /// What NVIDIA RTX Video should do this frame: mpv's render size, super
 /// resolution, RTX Video HDR (None: mpv renders at the window size).
 fn rtx_plan(s: &settings::Settings, video_dims: Option<(f64, f64)>, vk: &VkMode, w: i32, h: i32) -> Option<vk_present::EnhancePlan> {
@@ -108,7 +114,7 @@ fn rtx_plan(s: &settings::Settings, video_dims: Option<(f64, f64)>, vk: &VkMode,
     // mpv renders the video at about its own size; RTX Video scales it up
     // to 4× (barely enlarged video isn't worth it).
     let k = (w as f64 / dw).min(h as f64 / dh);
-    let sr = s.rtx_super_resolution && k > 1.1;
+    let sr = s.rtx_super_resolution.unwrap_or(vk.presenter.hdr()) && k > 1.1;
     let hdr = s.rtx_video_hdr && vk.presenter.hdr();
     if !sr && !hdr {
         return None;
@@ -178,6 +184,13 @@ struct App {
     /// a few seconds and quits (desktop capture tools often miss GL windows).
     snapshot: Option<String>,
     started: Instant,
+    /// Enhanced output (HDR / RTX Video) for this GPU and display state:
+    /// remembered across starts (render_memory.rs).
+    render_mem: Option<render_memory::RenderMemory>,
+    /// When the enhanced output started, while it is on trial.
+    output_trial: Option<Instant>,
+    /// The single-instance lock was handed to a restarted copy.
+    instance_handed_over: bool,
     last_stats: Instant,
     fs_toggles: u32,
     /// Window geometry (and maximized flag) to restore when leaving fullscreen.
@@ -367,6 +380,9 @@ impl App {
             repaint_at: None,
             snapshot: std::env::var("IINA_RS_SNAPSHOT").ok(),
             started: Instant::now(),
+            render_mem: None,
+            output_trial: None,
+            instance_handed_over: false,
             last_stats: Instant::now(),
             fs_toggles: 0,
             fs_saved: None,
@@ -530,7 +546,7 @@ impl App {
     /// used (empty when simply not applicable).
     fn try_create_vulkan(&mut self, el: &ActiveEventLoop, attrs: &WindowAttributes) -> Result<Gfx, String> {
         #[cfg(windows)]
-        let rtx_wanted = self.ui.settings.rtx_super_resolution && self.ui.rtx.nvidia;
+        let rtx_wanted = self.ui.settings.rtx_super_resolution == Some(true) && self.ui.rtx.nvidia;
         #[cfg(not(windows))]
         let rtx_wanted = false;
         if cfg!(target_os = "macos") || (!self.ui.settings.hdr_output && !rtx_wanted) || safe_mode() || std::env::var_os("IINA_RS_NO_VULKAN").is_some() {
@@ -554,6 +570,18 @@ impl App {
         let rtx_sdr = !hdr_ok && rtx_wanted;
         if !hdr_ok && !rtx_sdr {
             return Err(String::new());
+        }
+        #[cfg(windows)]
+        let gpus = dx_present::gpu_fingerprint();
+        #[cfg(not(windows))]
+        let gpus = String::from("default");
+        let mem = render_memory::RenderMemory::load(&self.config_dir, &format!("{gpus} | HDR {}", display_info.hdr_active));
+        let skip = mem.skip();
+        self.ui.output_skipped = skip;
+        self.render_mem = Some(mem);
+        if let Some(skip) = skip {
+            dbg_log(format!("enhanced output skipped on this GPU/driver/display ({skip:?}): {gpus}"));
+            return Err(format!("safe output ({skip:?})"));
         }
         #[cfg(windows)]
         let dx_hdr = hdr_ok && display_info.hdr_active;
@@ -651,6 +679,12 @@ impl App {
             self.mpv.set_string("target-prim", "bt.709");
         }
         self.ui.rtx.ready = presenter.is_nvidia();
+        if self.render_mem.as_mut().is_some_and(|m| m.starting()) {
+            // On trial: the title bar (drawn by Windows, so visible even if
+            // the video area stays black) says how to get out.
+            self.output_trial = Some(Instant::now());
+            dbg_log("enhanced output on trial for this GPU/driver/display".into());
+        }
         self.ui.output_mode = format!("{} · {:.0} nits peak · UI {:.0} nits", presenter.description(), display_info.max_nits, display_info.sdr_white_nits);
         dbg_log(format!("HDR output: {}", self.ui.output_mode));
         let egui = self.setup_egui_and_mpv(el, gl, &display);
@@ -956,6 +990,13 @@ impl App {
             "filters" => self.ui.show_filters = !self.ui.show_filters,
             "logs" => self.ui.show_logs = !self.ui.show_logs,
             "check-updates" => self.check_updates(),
+            "safe-output" => self.restart_with_safe_output(),
+            "retry-enhanced-output" => {
+                if let Some(m) = self.render_mem.as_mut() {
+                    m.reset();
+                }
+                self.ui.output_retry = true;
+            }
             #[cfg(windows)]
             "rtx-use-nvidia" => match dx_present::prefer_high_performance_gpu() {
                 Ok(()) => {
@@ -1827,11 +1868,62 @@ impl App {
 
     fn update_title(&self) {
         if let Some(w) = self.window() {
-            if self.player.idle || self.player.title.is_empty() {
-                w.set_title("IINA-RS");
+            let mut title = if self.player.idle || self.player.title.is_empty() {
+                "IINA-RS".to_string()
             } else {
-                w.set_title(&format!("{} — IINA-RS", self.player.title));
+                format!("{} — IINA-RS", self.player.title)
+            };
+            if self.output_trial.is_some_and(|t| t.elapsed() < TRIAL_HINT) {
+                title = format!("{title} — {}", i18n::tl("Black picture? Press Ctrl+F12"));
             }
+            w.set_title(&title);
+        }
+    }
+
+    /// Confirms the enhanced output after a minute, and drops the title hint.
+    fn check_output_trial(&mut self) {
+        let Some(t) = self.output_trial else { return };
+        if t.elapsed() >= TRIAL_HINT && t.elapsed() < TRIAL_HINT + Duration::from_secs(1) {
+            self.update_title();
+        }
+        if t.elapsed() >= TRIAL_CONFIRM {
+            if let Some(m) = self.render_mem.as_mut() {
+                m.confirm();
+            }
+            self.output_trial = None;
+            self.update_title();
+            dbg_log("enhanced output confirmed for this GPU/driver/display".into());
+        }
+    }
+
+    /// Ctrl+F12: remember the safe output for this GPU/driver/display and
+    /// restart with it at the same place.
+    fn restart_with_safe_output(&mut self) {
+        if self.gfx.as_ref().is_none_or(|g| g.vk.is_none()) {
+            self.ui.show_osd(i18n::t("The safe output is already in use"), None);
+            return;
+        }
+        if let Some(m) = self.render_mem.as_mut() {
+            m.choose_safe();
+        }
+        self.output_trial = None;
+        self.flush_history();
+        let mut args = Vec::new();
+        if !self.player.idle && !self.player.path.is_empty() {
+            if let Some(pos) = self.mpv.get_string("time-pos").and_then(|s| s.parse::<f64>().ok()) {
+                args.push(format!("--start={pos:.3}"));
+            }
+            args.push(self.player.path.clone());
+        }
+        // The new copy becomes the single instance.
+        instance::release(&self.config_dir);
+        self.instance_handed_over = true;
+        match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(&args).spawn()) {
+            Ok(_) => {
+                dbg_log("restarting with the safe output".into());
+                self.mpv.command(&["quit"]);
+            }
+            Err(e) => dbg_log(format!("restart failed: {e}")),
         }
     }
 
@@ -2879,6 +2971,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        self.check_output_trial();
         // Debug aid: IINA_RS_CMD_DELAY=secs runs IINA_RS_CMD after a delay.
         if let Some(d) = std::env::var("IINA_RS_CMD_DELAY").ok().and_then(|v| v.parse::<f64>().ok()) {
             if !self.debug_cmds_done {
@@ -3202,12 +3295,18 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
         self.flush_history();
+        // Closed after 10-60 s on trial: neither a success nor a failure.
+        if let (Some(t), Some(m)) = (self.output_trial, self.render_mem.as_mut()) {
+            if t.elapsed() >= Duration::from_secs(10) {
+                m.neutral_exit();
+            }
+        }
         if self.save_settings_at.take().is_some() {
             self.ui.settings.save(&self.config_dir);
         }
         self.ui.settings.prevent_sleep = false;
         self.update_keep_awake();
-        if self.ui.settings.single_instance {
+        if self.ui.settings.single_instance && !self.instance_handed_over {
             instance::release(&self.config_dir);
         }
         // The render context must be freed while the GL context is current.

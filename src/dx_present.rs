@@ -46,6 +46,36 @@ pub struct DxPresenter {
 
 pub const VENDOR_NVIDIA: u32 = 0x10de;
 
+/// The GPUs and their driver versions, as a key for `render_memory`.
+pub fn gpu_fingerprint() -> String {
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else { return "unknown".into() };
+        (0..)
+            .map_while(|i| factory.EnumAdapters1(i).ok())
+            .filter_map(|a| {
+                let d = a.GetDesc1().ok()?;
+                if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+                    return None;
+                }
+                let driver = a.CheckInterfaceSupport(&IDXGIDevice::IID).unwrap_or(0) as u64;
+                let name = String::from_utf16_lossy(&d.Description).trim_end_matches('\0').to_string();
+                Some(format!(
+                    "{name} {:04x}:{:04x} {}.{}.{}.{}",
+                    d.VendorId,
+                    d.DeviceId,
+                    driver >> 48,
+                    (driver >> 32) & 0xffff,
+                    (driver >> 16) & 0xffff,
+                    driver & 0xffff
+                ))
+            })
+            .collect::<std::collections::BTreeSet<_>>() // an adapter can be listed twice
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(" + ")
+    }
+}
+
 /// Whether the computer has an NVIDIA GPU (RTX Video is worth trying).
 pub fn has_nvidia_gpu() -> bool {
     unsafe {
