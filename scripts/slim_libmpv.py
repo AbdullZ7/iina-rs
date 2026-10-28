@@ -7,8 +7,9 @@ Removed from FFmpeg: the video encoders x264, x265, libaom and SVT-AV1
 and VapourSynth. Removed from mpv: the JavaScript engine (mujs), VapourSynth,
 SDL gamepad input, Sixel terminal output and subrandr (YouTube SRV3
 subtitles; the only Rust package, and Rust isn't in the build image). From
-curl: HTTP/3 and ECH. Lua, libarchive, Blu-ray/DVD, curl (HTTPS, HTTP/2),
-rubberband, Vulkan/libplacebo and the decoders stay.
+curl: HTTP/3 and ECH; curl and FFmpeg use Schannel for TLS instead of
+OpenSSL. Lua, libarchive, Blu-ray/DVD, curl (HTTPS, HTTP/2), rubberband,
+Vulkan/libplacebo and the decoders stay.
 
 Each edit must match exactly: if the recipes change upstream, this fails
 instead of silently building the full library.
@@ -52,20 +53,25 @@ edit(
         "--enable-libsvtav1",
         "--enable-vapoursynth",
     ],
-    {},
+    # TLS through Windows (Schannel): see curl below.
+    {"--enable-openssl": "--enable-schannel"},
 )
 
-# HTTP/3 (ngtcp2 + nghttp3) and TLS Encrypted Client Hello: no use for a
-# player, and neither builds against the pinned OpenSSL 4.1 (no QUIC API, no
-# SSL_set1_ech_config_list). HTTPS / HTTP/2 stay.
+# The OpenSSL the recipes pin is a 4.1 development snapshot that current
+# curl doesn't build against (no QUIC API, no SSL_set1_ech_config_list, no
+# ASN1_STRING_get_length). curl and FFmpeg use Windows' own TLS (Schannel,
+# the system certificate store) instead; libssh and libsrt keep OpenSSL.
+# HTTP/3 and Encrypted Client Hello go too: no use for a player.
 edit(
     "curl.cmake",
     ["ngtcp2", "nghttp3"],
     {
+        "-DCURL_USE_OPENSSL=ON": "-DCURL_USE_OPENSSL=OFF\n        -DCURL_USE_SCHANNEL=ON",
         "-DUSE_NGHTTP3=ON": "-DUSE_NGHTTP3=OFF",
         "-DUSE_NGTCP2=ON": "-DUSE_NGTCP2=OFF",
         "-DUSE_PROXY_HTTP3=ON": "-DUSE_PROXY_HTTP3=OFF",
         "-DUSE_ECH=ON": "-DUSE_ECH=OFF",
+        "-DUSE_SSLS_EXPORT=ON": "-DUSE_SSLS_EXPORT=OFF",
     },
 )
 
