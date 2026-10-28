@@ -49,21 +49,15 @@ jobs:
           key: winbuild-${{ env.WINBUILD_REF }}-toolchain-${{ github.run_id }}
           restore-keys: winbuild-${{ env.WINBUILD_REF }}-toolchain
 
-      - name: Restore sources cache
-        uses: actions/cache/restore@v4
-        with:
-          path: winbuild/src_packages
-          key: winbuild-sources-v2-${{ github.run_id }}
-          restore-keys: winbuild-sources-v2
-
       - name: Slim down the recipes
         run: python3 iina-rs/scripts/slim_libmpv.py winbuild
 
       - name: Configure and download sources
         working-directory: winbuild
         run: |
-          # The toolchain cache also holds the packages' "downloaded" stamps,
-          # which needn't match the sources cache: keep only the toolchain.
+          # Sources are cloned fresh (about a minute; cached ones were already
+          # patched, and the patches then failed). The toolchain cache also
+          # holds the packages' stamps: keep only the toolchain.
           rm -rf build_$BIT/packages
           cmake -DTARGET_ARCH=x86_64-w64-mingw32 -DSINGLE_SOURCE_LOCATION=$PWD/src_packages \
             -DRUSTUP_LOCATION=$PWD/clang_root/install_rustup -DENABLE_CCACHE=ON \
@@ -89,13 +83,6 @@ jobs:
       - name: Build mpv
         working-directory: winbuild
         run: ninja -C build_$BIT mpv
-
-      - name: Save sources cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: winbuild/src_packages
-          key: winbuild-sources-v2-${{ github.run_id }}
 
       - name: Collect libmpv
         working-directory: winbuild
