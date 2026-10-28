@@ -53,8 +53,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: winbuild/src_packages
-          key: winbuild-sources-${{ github.run_id }}
-          restore-keys: winbuild-sources
+          key: winbuild-sources-v2-${{ github.run_id }}
+          restore-keys: winbuild-sources-v2
 
       - name: Slim down the recipes
         run: python3 iina-rs/scripts/slim_libmpv.py winbuild
@@ -80,18 +80,19 @@ jobs:
           path: winbuild/build_x86_64
           key: winbuild-${{ env.WINBUILD_REF }}-toolchain-${{ github.run_id }}
 
+      # No "ninja update": it moves every package to its latest commit,
+      # past the revisions the recipes pin (OpenSSL 4.1 broke ngtcp2 in
+      # October 2026, as in upstream's own daily builds).
       - name: Build mpv
         working-directory: winbuild
-        run: |
-          ninja -C build_$BIT update
-          ninja -C build_$BIT mpv
+        run: ninja -C build_$BIT mpv
 
       - name: Save sources cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: winbuild/src_packages
-          key: winbuild-sources-${{ github.run_id }}
+          key: winbuild-sources-v2-${{ github.run_id }}
 
       - name: Collect libmpv
         working-directory: winbuild
