@@ -15,15 +15,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --release
       - run: cargo build --release
-      - name: Fetch libmpv (shinchiro mpv-winbuild-cmake)
+      - name: Fetch libmpv (slim build from libmpv.yml, else shinchiro's full one)
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          url=$(gh api repos/shinchiro/mpv-winbuild-cmake/releases/latest \
-            --jq '.assets[] | select(.name|test("^mpv-dev-x86_64-[0-9]")) | .browser_download_url' | head -1)
-          curl -sL -o mpv-dev.7z "$url"
-          7z x mpv-dev.7z -ompv-dev -y > /dev/null
+          run=$(gh run list -R "$GITHUB_REPOSITORY" --workflow libmpv.yml --status success --limit 1 \
+            --json databaseId --jq '.[0].databaseId // empty')
+          if [ -n "$run" ] && gh run download "$run" -R "$GITHUB_REPOSITORY" -n libmpv-slim -D mpv-dev; then
+            echo "libmpv: slim build from run $run, mpv $(cat mpv-dev/mpv-version.txt)"
+          else
+            echo "::warning::slim libmpv unavailable, using shinchiro's full build"
+            url=$(gh api repos/shinchiro/mpv-winbuild-cmake/releases/latest \
+              --jq '.assets[] | select(.name|test("^mpv-dev-x86_64-[0-9]")) | .browser_download_url' | head -1)
+            curl -sL -o mpv-dev.7z "$url"
+            7z x mpv-dev.7z -ompv-dev -y > /dev/null
+          fi
+          ls -l mpv-dev/libmpv-2.dll
       - run: python scripts/package.py windows target/release/iina-rs.exe mpv-dev/libmpv-2.dll dist
       - name: Installer (Inno Setup)
         shell: pwsh
