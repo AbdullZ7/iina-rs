@@ -122,6 +122,13 @@ pub struct UiState {
     /// mpv couldn't start its video output (shown instead of a black window).
     pub render_error: Option<String>,
     pub font_dialog: Option<FontDialog>,
+    /// Blurred video can be shown under the HUD panels (blur.rs).
+    pub blur_ok: bool,
+    /// The panels to show it under this frame: rect (points), corner radius, opacity.
+    pub glass: Vec<(Rect, f32, f32)>,
+    /// The window has no system frame: IINA-RS draws the title bar.
+    pub custom_frame: bool,
+    pub maximized: bool,
     thumb_path: String,
     thumb_tex: HashMap<usize, egui::TextureHandle>,
 }
@@ -175,6 +182,10 @@ impl UiState {
             music_playlist: false,
             render_error: None,
             font_dialog: None,
+            blur_ok: false,
+            glass: Vec::new(),
+            custom_frame: false,
+            maximized: false,
             thumb_path: String::new(),
             thumb_tex: HashMap::new(),
         }
@@ -208,6 +219,29 @@ impl UiState {
 }
 
 const HUD_BG: Color32 = Color32::from_rgba_premultiplied(24, 24, 26, 225);
+/// Over blurred video (IINA's dark HUD material): a lighter tint.
+const HUD_GLASS: Color32 = Color32::from_rgba_premultiplied(22, 22, 24, 115);
+/// Height of IINA-RS's own title bar (windows without the system frame).
+pub const WINDOW_BAR_H: f32 = 32.0;
+
+impl UiState {
+    /// The fill of a HUD panel: tinted glass over blurred video, else opaque.
+    fn hud_fill(&self) -> Color32 {
+        if self.blur_ok { HUD_GLASS } else { HUD_BG }
+    }
+
+    /// Shows blurred video under `rect` this frame.
+    fn glass(&mut self, rect: Rect, radius: f32, alpha: f32) {
+        if self.blur_ok && alpha > 0.0 {
+            self.glass.push((rect, radius, alpha));
+        }
+    }
+
+    /// IINA-RS's title bar is shown (windowed, without the system frame).
+    pub fn window_bar(&self) -> bool {
+        self.custom_frame && !self.fullscreen && !self.pip
+    }
+}
 const FG: Color32 = Color32::from_gray(235);
 const FG_DIM: Color32 = Color32::from_gray(150);
 const TRACK_BG: Color32 = Color32::from_rgba_premultiplied(110, 110, 110, 160);
@@ -811,9 +845,13 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
     let mut cmds = Vec::new();
     let now = Instant::now();
     let hide_after = Duration::from_secs_f32(ui_state.settings.osc_hide_secs.max(0.5));
+    ui_state.glass.clear();
 
     if pl.idle && !ui_state.pip {
         welcome(ctx, ui_state, &mut cmds);
+        if ui_state.window_bar() {
+            window_bar(ctx, ui_state, pl, 1.0, &mut cmds);
+        }
     } else {
         let recently_active = now.duration_since(ui_state.last_activity) < hide_after;
         let held_open = !ui_state.settings.osc_autohide
@@ -828,9 +866,16 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
             music_panel(ctx, ui_state, pl, mpv, &mut cmds);
         } else if alpha > 0.0 {
             if ui_state.fullscreen && ui_state.settings.osc_position != "top" {
-                title_bar(ctx, pl, alpha);
+                title_bar(ctx, ui_state, pl, alpha);
             }
             osc(ctx, ui_state, pl, mpv, thumbs, alpha, &mut cmds);
+        }
+        // The title bar fades with the controller (IINA).
+        if ui_state.window_bar() {
+            let a = if ui_state.music_mode { 1.0 } else { alpha };
+            if a > 0.0 {
+                window_bar(ctx, ui_state, pl, a, &mut cmds);
+            }
         }
         // Wake up when the controller is due to hide; not while something
         // holds it open (that repainted every 30 ms, e.g. in music mode).
@@ -887,6 +932,9 @@ fn osd(ctx: &egui::Context, st: &mut UiState, pl: &Player) {
     let size = st.settings.osd_text_size.clamp(10.0, 60.0);
     let time_text = format!("{} / {}", fmt_time(pl.time_pos), fmt_time(pl.duration));
     let mut top: f32 = if st.fullscreen || st.music_mode { 58.0 } else { 18.0 };
+    if st.window_bar() {
+        top += WINDOW_BAR_H;
+    }
     // Keep clear of a controller bar at the top.
     if st.settings.osc_position == "top" && st.osc_visible && !st.music_mode && !st.pip {
         if let Some(r) = ctx.memory(|m| m.area_rect(egui::Id::new("osc"))) {
@@ -894,14 +942,15 @@ fn osd(ctx: &egui::Context, st: &mut UiState, pl: &Player) {
         }
     }
     let (align, offset) = if is_rtl() { (Align2::RIGHT_TOP, vec2(-20.0, top)) } else { (Align2::LEFT_TOP, vec2(20.0, top)) };
-    egui::Area::new(egui::Id::new("osd"))
+    let fill = st.hud_fill();
+    let r = egui::Area::new(egui::Id::new("osd"))
         .anchor(align, offset)
         .order(egui::Order::Foreground)
         .interactable(false)
         .show(ctx, |ui| {
             ui.multiply_opacity(alpha);
             egui::Frame::new()
-                .fill(HUD_BG)
+                .fill(fill)
                 .corner_radius(10)
                 .inner_margin(egui::Margin::symmetric(16, 10))
                 .show(ui, |ui| {
@@ -943,8 +992,11 @@ fn osd(ctx: &egui::Context, st: &mut UiState, pl: &Player) {
                             ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width() * p, r.height())), 3.0, FG);
                         }
                     }
-                });
+                })
+                .response
+                .rect
         });
+    st.glass(r.inner, 10.0, alpha);
 }
 
 /// IINA's music mode: cover art on top (mpv draws it above the margin),
@@ -1047,23 +1099,113 @@ fn render_error(ctx: &egui::Context, detail: &str, cmds: &mut Vec<String>) {
     });
 }
 
-fn title_bar(ctx: &egui::Context, pl: &Player, alpha: f32) {
+fn title_bar(ctx: &egui::Context, st: &mut UiState, pl: &Player, alpha: f32) {
     let max_w = ctx.screen_rect().width() - 80.0;
-    egui::Area::new(egui::Id::new("title"))
+    let fill = st.hud_fill();
+    let r = egui::Area::new(egui::Id::new("title"))
         .anchor(Align2::CENTER_TOP, vec2(0.0, 10.0))
         .default_width(max_w)
         .interactable(false)
         .show(ctx, |ui| {
             ui.multiply_opacity(alpha);
             egui::Frame::new()
-                .fill(HUD_BG)
+                .fill(fill)
                 .corner_radius(8)
                 .inner_margin(egui::Margin::symmetric(14, 6))
                 .show(ui, |ui| {
                     ui.set_max_width(max_w);
                     ui.add(egui::Label::new(RichText::new(v(&pl.title)).color(FG).size(14.0)).wrap_mode(egui::TextWrapMode::Truncate));
-                });
+                })
+                .response
+                .rect
         });
+    st.glass(r.inner, 8.0, alpha);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum WinButton {
+    Close,
+    Maximize,
+    Minimize,
+}
+
+/// IINA-RS's own title bar for windows without the system frame: drag to
+/// move, double-click to maximize, and the window buttons (on the left in
+/// Arabic, as Windows mirrors them). It fades with the controller.
+fn window_bar(ctx: &egui::Context, st: &mut UiState, pl: &Player, alpha: f32, cmds: &mut Vec<String>) {
+    let screen = ctx.screen_rect();
+    let rect = Rect::from_min_size(screen.min, vec2(screen.width(), WINDOW_BAR_H));
+    let fill = st.hud_fill();
+    let maximized = st.maximized;
+    let rtl = is_rtl();
+    let title = if pl.idle { "IINA-RS".to_string() } else { v(&pl.title) };
+    egui::Area::new(egui::Id::new("window-bar"))
+        .fixed_pos(rect.min)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            ui.multiply_opacity(alpha);
+            let bar = ui.allocate_rect(rect, Sense::click_and_drag());
+            ui.painter().rect_filled(rect, 0.0, fill);
+            ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0_f32, Color32::from_white_alpha(14)));
+            const BW: f32 = 46.0;
+            for (i, kind) in [WinButton::Close, WinButton::Maximize, WinButton::Minimize].into_iter().enumerate() {
+                let x = if rtl { rect.left() + i as f32 * BW } else { rect.right() - (i + 1) as f32 * BW };
+                let r = Rect::from_min_size(pos2(x, rect.top()), vec2(BW, WINDOW_BAR_H));
+                let b = ui.interact(r, egui::Id::new(("window-button", i)), Sense::click());
+                let p = ui.painter();
+                if b.hovered() {
+                    let bg = if kind == WinButton::Close { Color32::from_rgb(196, 43, 28) } else { Color32::from_white_alpha(28) };
+                    p.rect_filled(r, 0.0, bg);
+                }
+                let c = r.center();
+                let stroke = Stroke::new(1.0_f32, FG);
+                match kind {
+                    WinButton::Close => {
+                        p.line_segment([c + vec2(-5.0, -5.0), c + vec2(5.0, 5.0)], stroke);
+                        p.line_segment([c + vec2(5.0, -5.0), c + vec2(-5.0, 5.0)], stroke);
+                    }
+                    WinButton::Maximize if maximized => {
+                        p.rect_stroke(Rect::from_center_size(c + vec2(-1.5, 1.5), vec2(8.0, 8.0)), 1.0, stroke, egui::StrokeKind::Middle);
+                        p.line_segment([c + vec2(-2.5, -4.5), c + vec2(4.5, -4.5)], stroke);
+                        p.line_segment([c + vec2(4.5, -4.5), c + vec2(4.5, 2.5)], stroke);
+                    }
+                    WinButton::Maximize => {
+                        p.rect_stroke(Rect::from_center_size(c, vec2(10.0, 10.0)), 1.0, stroke, egui::StrokeKind::Middle);
+                    }
+                    WinButton::Minimize => {
+                        p.line_segment([c + vec2(-5.0, 0.0), c + vec2(5.0, 0.0)], stroke);
+                    }
+                }
+                let tip = match kind {
+                    WinButton::Close => t("Close"),
+                    WinButton::Maximize if maximized => t("Restore"),
+                    WinButton::Maximize => t("Maximize"),
+                    WinButton::Minimize => t("Minimize"),
+                };
+                if b.on_hover_text(tip).clicked() {
+                    cmds.push(
+                        match kind {
+                            WinButton::Close => "window-close",
+                            WinButton::Maximize => "window-maximize",
+                            WinButton::Minimize => "minimize",
+                        }
+                        .into(),
+                    );
+                }
+            }
+            // The title, centered between the buttons.
+            let title_w = rect.width() - 2.0 * 3.0 * BW - 16.0;
+            if title_w > 20.0 {
+                let r = Rect::from_center_size(rect.center(), vec2(title_w, WINDOW_BAR_H));
+                ui.put(r, egui::Label::new(RichText::new(title).color(FG).size(13.0)).selectable(false).truncate());
+            }
+            if bar.drag_started_by(egui::PointerButton::Primary) {
+                cmds.push("window-drag".into());
+            } else if bar.double_clicked() {
+                cmds.push("window-maximize".into());
+            }
+        });
+    st.glass(rect, 0.0, alpha);
 }
 
 fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Option<&Thumbnails>, alpha: f32, cmds: &mut Vec<String>) {
@@ -1082,18 +1224,20 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
 
     let x_off = if is_rtl() { sidebar_w / 2.0 } else { -sidebar_w / 2.0 };
     let (align, y_off) = if at_top {
-        (Align2::CENTER_TOP, 0.0)
+        (Align2::CENTER_TOP, if st.window_bar() { WINDOW_BAR_H } else { 0.0 })
     } else if is_bar {
         (Align2::CENTER_BOTTOM, 0.0)
     } else {
         (Align2::CENTER_BOTTOM, if compact { -6.0 } else { -22.0 })
     };
+    let fill = st.hud_fill();
+    let mut frame_rect = Rect::NOTHING;
     let area = egui::Area::new(egui::Id::new("osc"))
         .anchor(align, vec2(x_off, y_off))
         .show(ctx, |ui| {
             ui.multiply_opacity(alpha);
-            egui::Frame::new()
-                .fill(HUD_BG)
+            frame_rect = egui::Frame::new()
+                .fill(fill)
                 .corner_radius(if is_bar { 0 } else { 12 })
                 .stroke(if is_bar { Stroke::NONE } else { Stroke::new(1.0_f32, Color32::from_white_alpha(18)) })
                 .inner_margin(egui::Margin::symmetric(14, 8))
@@ -1212,8 +1356,11 @@ fn osc(ctx: &egui::Context, st: &mut UiState, pl: &Player, mpv: &Mpv, thumbs: Op
                             }
                         });
                     });
-                });
+                })
+                .response
+                .rect;
         });
+    st.glass(frame_rect, if is_bar { 0.0 } else { 12.0 }, alpha);
     cmds.extend(ctl_cmds);
     st.volume_bar_rect = vol_rect.get();
     if let Some(mut h) = hover {
@@ -1251,7 +1398,9 @@ fn welcome(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
                         }
                     });
                     ui.separator();
-                    rtl_body(ui, |ui| {
+                    // A column in both directions (in English, rtl_body
+                    // kept the row layout and the list ran sideways).
+                    ui.with_layout(Layout::top_down(if is_rtl() { Align::Max } else { Align::Min }), |ui| {
                         ui.label(RichText::new(t("Recent")).strong().color(FG));
                         ui.add_space(4.0);
                         if st.recent.is_empty() {
@@ -1363,7 +1512,7 @@ fn sidebar(ctx: &egui::Context, st: &mut UiState, tab: Tab, pl: &Player, mpv: &M
     panel
         .exact_width(340.0)
         .resizable(false)
-        .frame(egui::Frame::new().fill(Color32::from_rgba_premultiplied(26, 26, 28, 245)).inner_margin(egui::Margin::same(12)))
+        .frame(egui::Frame::new().fill(Color32::from_rgba_premultiplied(26, 26, 28, 245)).inner_margin(egui::Margin { top: if st.window_bar() { 12 + WINDOW_BAR_H as i8 } else { 12 }, ..egui::Margin::same(12) }))
         .show(ctx, |ui| rtl_body(ui, |ui| {
             row(ui, |ui| {
                 let tabs: &[(Tab, &str)] = if matches!(tab, Tab::Playlist | Tab::Chapters) {

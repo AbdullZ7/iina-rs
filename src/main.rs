@@ -5,6 +5,7 @@
 //! framebuffer; the egui overlay (controller, sidebar, menus) is drawn on top.
 
 mod assoc;
+mod blur;
 mod display_info;
 mod fonts;
 mod history;
@@ -97,6 +98,16 @@ struct Gfx {
     context: PossiblyCurrentContext,
     egui: egui_glow::EguiGlow,
     vk: Option<VkMode>,
+    /// Frosted glass under the HUD panels (None if its shaders failed).
+    blur: Option<blur::Blur>,
+}
+
+/// Windows and Linux: no system title bar; IINA-RS draws its own, which
+/// fades with the controller (IINA). macOS keeps the system one.
+const CUSTOM_FRAME: bool = cfg!(not(target_os = "macos"));
+
+fn new_blur(gl: &glow::Context) -> Option<blur::Blur> {
+    blur::Blur::new(gl).inspect_err(|e| dbg_log(format!("blur unavailable: {e}"))).ok()
 }
 
 /// How long the title says how to leave a black window.
@@ -171,6 +182,8 @@ struct App {
     video_pending: bool,
     /// OpenGL mode: offscreen copy of the video frame (fbo, texture, size).
     gl_video: Option<(u32, u32, i32, i32)>,
+    /// A new video frame since the HUD's blurred copy was made.
+    blur_stale: bool,
     /// The offscreen copy works on this GPU / window (else draw directly).
     gl_video_ok: bool,
     /// GPU and OpenGL version (Logs window, error messages).
@@ -377,6 +390,7 @@ impl App {
             video_valid: None,
             video_pending: false,
             gl_video: None,
+            blur_stale: true,
             gl_video_ok: true,
             gl_info: String::new(),
             sub_margin_cur: None,
@@ -443,7 +457,15 @@ impl App {
             .with_inner_size(LogicalSize::new(640.0, 360.0))
             .with_min_inner_size(LogicalSize::new(285.0, 120.0))
             .with_window_icon(icon)
+            .with_decorations(!CUSTOM_FRAME)
             .with_visible(false);
+        // The system shadow (and rounded corners on Windows 11) stay.
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_undecorated_shadow(true)
+        };
+        self.ui.custom_frame = CUSTOM_FRAME;
         #[cfg(windows)]
         {
             self.ui.rtx.nvidia = dx_present::has_nvidia_gpu();
@@ -516,7 +538,8 @@ impl App {
                 eprintln!("[gl] {}: {}", f.to_string_lossy(), !display.get_proc_address(f).is_null());
             }
         }
-        self.gfx = Some(Gfx { window, surface, context, egui, vk: None });
+        let blur = new_blur(egui.painter.gl());
+        self.gfx = Some(Gfx { window, surface, context, egui, vk: None, blur });
         self.after_window_created();
     }
 
@@ -696,11 +719,13 @@ impl App {
         let egui = self.setup_egui_and_mpv(el, gl, &display);
         let window = Arc::new(window);
         window.set_visible(true);
+        let blur = new_blur(egui.painter.gl());
         Ok(Gfx {
             window,
             surface,
             context,
             egui,
+            blur,
             vk: Some(VkMode { _helper: helper, presenter, targets, display: display_info, video_hdr: None, video_is_hdr: false, video_target: None }),
         })
     }
@@ -961,6 +986,26 @@ impl App {
             "minimize" => {
                 if let Some(w) = self.window() {
                     w.set_minimized(true);
+                }
+            }
+            // IINA-RS's own title bar (ui::window_bar).
+            "window-maximize" => {
+                if let Some(w) = self.window() {
+                    w.set_maximized(!w.is_maximized());
+                }
+            }
+            "window-close" => self.mpv.command(&["quit"]),
+            "window-drag" => {
+                if let Some(g) = self.gfx.as_mut() {
+                    let _ = g.window.drag_window();
+                    // The system's move loop swallows the button release.
+                    let pos = g.egui.egui_ctx.pointer_latest_pos().unwrap_or_default();
+                    g.egui.egui_winit.egui_input_mut().events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Default::default(),
+                    });
                 }
             }
             "copy-image" => {
@@ -1269,7 +1314,7 @@ impl App {
     fn restore_geometry(&mut self) {
         let saved = self.saved_geometry.take();
         if let (Some(w), Some(g)) = (self.window(), saved) {
-            w.set_decorations(true);
+            w.set_decorations(!CUSTOM_FRAME);
             w.set_window_level(if self.player.ontop { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal });
             let _ = w.request_inner_size(g.size);
             if let Some(p) = g.pos {
@@ -1299,11 +1344,11 @@ impl App {
         }
     }
 
-    /// The PiP window edge under the cursor (borderless windows have no
-    /// system resize frame, so the edges are handled here).
+    /// The window edge under the cursor: windows without the system frame
+    /// (PiP, IINA-RS's own title bar) are resized from here.
     fn pip_edge(&self) -> Option<ResizeDirection> {
         let g = self.gfx.as_ref()?;
-        pip_edge_at(self.ui.pip, &g.window, self.cursor)
+        pip_edge_at(borderless_edges(self.ui.pip, self.player.fullscreen, &g.window), &g.window, self.cursor)
     }
 
     /// After a PiP resize: match the video's shape, keeping the side the
@@ -1406,7 +1451,7 @@ impl App {
         if self.ui.pip {
             self.ui.pip = false;
             if let Some(w) = self.window() {
-                w.set_decorations(true);
+                w.set_decorations(!CUSTOM_FRAME);
             }
         } else if windowed.is_some() {
             self.saved_geometry = windowed;
@@ -1880,7 +1925,7 @@ impl App {
             let size = mon.size();
             let _ = w.request_inner_size(PhysicalSize::new(size.width, size.height + 1));
         } else if let Some((g, maximized)) = self.fs_saved.take() {
-            w.set_decorations(true);
+            w.set_decorations(!CUSTOM_FRAME);
             let _ = w.request_inner_size(g.size);
             if let Some(p) = g.pos {
                 w.set_outer_position(p);
@@ -2002,6 +2047,7 @@ impl App {
                 }
                 self.video_valid = Some((w, h));
                 self.video_pending = false;
+                self.blur_stale = true;
             }
             // The UI goes into its own (transparent) texture.
             use glow::HasContext;
@@ -2029,6 +2075,7 @@ impl App {
                 }
                 self.video_valid = Some((w, h));
                 self.video_pending = false;
+                self.blur_stale = true;
             }
             if let Some(fbo) = cache {
                 use glow::HasContext;
@@ -2057,6 +2104,10 @@ impl App {
         }
 
         let window = gfx.window.clone();
+        // Blurred video under the HUD needs a copy of the frame: the HDR
+        // targets, or the offscreen video of the OpenGL output.
+        let sdr_video = self.gl_video.filter(|_| self.gl_video_ok && gfx.vk.is_none());
+        self.ui.blur_ok = gfx.blur.is_some() && !self.player.idle && (gfx.vk.is_some() || sdr_video.is_some()) && !safe_mode();
         let (player, ui_state, mpv, history) = (&self.player, &mut self.ui, &self.mpv, &self.history);
         // Debug aid: IINA_RS_HOVER=0.4 hovers the seek bar at 40% (for
         // snapshots); IINA_RS_HOVER=sweep moves along it every frame.
@@ -2100,6 +2151,25 @@ impl App {
             cmds = ui::draw(ctx, ui_state, player, mpv, guard.as_deref(), history);
         });
         drop(guard);
+        let ppp = gfx.egui.egui_ctx.pixels_per_point();
+        let glass: Vec<blur::BlurRect> = self
+            .ui
+            .glass
+            .iter()
+            .map(|(r, radius, alpha)| blur::BlurRect { min: [r.min.x * ppp, r.min.y * ppp], max: [r.max.x * ppp, r.max.y * ppp], radius: radius * ppp, alpha: *alpha })
+            .collect();
+        if let (Some(b), Some((_, tex, w, h)), false) = (gfx.blur.as_mut(), sdr_video, glass.is_empty()) {
+            let gl = gfx.egui.painter.gl();
+            if self.blur_stale || !b.valid {
+                if let Some(t) = NonZeroU32::new(tex).map(glow::NativeTexture) {
+                    if let Err(e) = b.update(gl, t, w, h) {
+                        dbg_log(format!("blur: {e}"));
+                    }
+                }
+                self.blur_stale = false;
+            }
+            b.draw(gl, &glass, size.width as i32, size.height as i32);
+        }
         gfx.egui.paint(&window);
         if std::env::var_os("IINA_RS_DEBUG").is_some() && self.last_stats.elapsed() > Duration::from_secs(2) {
             self.last_stats = Instant::now();
@@ -2124,7 +2194,11 @@ impl App {
         if let Some(vk) = gfx.vk.as_mut() {
             let video_hdr = vk.video_hdr.unwrap_or(false);
             let gl = gfx.egui.painter.gl().clone();
-            vk.targets.composite(&gl, video_hdr, vk.display.sdr_white_nits, vk.presenter.hdr());
+            let blur = gfx.blur.as_mut().map(|b| (b, glass.as_slice(), self.blur_stale));
+            vk.targets.composite(&gl, video_hdr, vk.display.sdr_white_nits, vk.presenter.hdr(), blur);
+            if !glass.is_empty() {
+                self.blur_stale = false;
+            }
         }
         let snapshot_due = self.snapshot.is_some() && self.started.elapsed() > Duration::from_secs(snap_after);
         if let Some(path) = self.snapshot.as_ref().filter(|_| snapshot_due) {
@@ -3148,6 +3222,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.minimized_state = Some(gfx.window.is_minimized() == Some(true));
             }
             WindowEvent::Resized(size) => {
+                self.ui.maximized = gfx.window.is_maximized();
                 if self.ui.pip {
                     self.pip_moved = true;
                     self.pip_resized_at = Some(Instant::now());
@@ -3226,9 +3301,10 @@ impl ApplicationHandler<UserEvent> for App {
                         let _ = gfx.window.drag_window();
                     }
                 }
-                if self.ui.pip {
-                    // Resize cursor on the borderless PiP window's edges.
-                    let icon = match pip_edge_at(true, &gfx.window, self.cursor) {
+                let edges = borderless_edges(self.ui.pip, self.player.fullscreen, &gfx.window);
+                if edges || self.pip_cursor_set {
+                    // Resize cursor on the edges of a window without the system frame.
+                    let icon = match pip_edge_at(edges, &gfx.window, self.cursor) {
                         Some(ResizeDirection::East | ResizeDirection::West) => Some(CursorIcon::EwResize),
                         Some(ResizeDirection::North | ResizeDirection::South) => Some(CursorIcon::NsResize),
                         Some(ResizeDirection::NorthWest | ResizeDirection::SouthEast) => Some(CursorIcon::NwseResize),
@@ -3459,12 +3535,17 @@ fn aspect_name(raw: &str) -> String {
 
 /// The PiP window edge under `cursor` (borderless windows have no system
 /// resize frame, so the edges are handled by hand).
-fn pip_edge_at(pip: bool, window: &Window, cursor: PhysicalPosition<f64>) -> Option<ResizeDirection> {
-    if !pip {
+/// The window is resized from its edges by IINA-RS (no system frame).
+fn borderless_edges(pip: bool, fullscreen: bool, w: &Window) -> bool {
+    pip || (CUSTOM_FRAME && !fullscreen && w.fullscreen().is_none() && !w.is_maximized())
+}
+
+fn pip_edge_at(enabled: bool, window: &Window, cursor: PhysicalPosition<f64>) -> Option<ResizeDirection> {
+    if !enabled {
         return None;
     }
     let size = window.inner_size();
-    let m = 8.0 * window.scale_factor();
+    let m = 6.0 * window.scale_factor();
     let (x, y) = (cursor.x, cursor.y);
     let (w, h) = (size.width as f64, size.height as f64);
     let (l, r, t, b) = (x < m, x > w - m, y < m, y > h - m);

@@ -123,9 +123,16 @@ void main() {
 
 /// Video + UI → PQ / BT.2020. Rows are flipped because GL's bottom-left
 /// origin becomes Vulkan's top-left in the shared image.
+fn composite_fs() -> String {
+    COMPOSITE_FS.replace("// MASK_GLSL", crate::blur::MASK_GLSL)
+}
+
 const COMPOSITE_FS: &str = r#"#version 330 core
 uniform sampler2D u_video;
 uniform sampler2D u_ui;
+uniform sampler2D u_blur;
+uniform int u_has_blur;
+// MASK_GLSL
 uniform vec2 u_size;
 uniform int u_video_hdr;
 uniform float u_sdr_white; // nits
@@ -159,6 +166,12 @@ const mat3 to2020 = mat3(
 void main() {
     vec2 uv = vec2(gl_FragCoord.x / u_size.x, 1.0 - gl_FragCoord.y / u_size.y);
     vec3 v = texture(u_video, uv).rgb;
+    // Frosted glass under the HUD panels (blur.rs). Rows here are the
+    // window's, top first.
+    if (u_has_blur == 1) {
+        float m = blur_mask(gl_FragCoord.xy);
+        if (m > 0.0) v = mix(v, texture(u_blur, uv).rgb, m);
+    }
     if (u_output_pq == 0) {
         vec4 u = texture(u_ui, uv);
         vec3 c = u.a > 0.0 ? mix(v, u.rgb / u.a, clamp(u.a, 0.0, 1.0)) : v;
@@ -317,7 +330,7 @@ impl GlTargets {
         use glow::HasContext;
         unsafe {
             let program = gl.create_program()?;
-            for (kind, src) in [(glow::VERTEX_SHADER, COMPOSITE_VS), (glow::FRAGMENT_SHADER, COMPOSITE_FS)] {
+            for (kind, src) in [(glow::VERTEX_SHADER, COMPOSITE_VS), (glow::FRAGMENT_SHADER, composite_fs().as_str())] {
                 let sh = gl.create_shader(kind)?;
                 gl.shader_source(sh, src);
                 gl.compile_shader(sh);
@@ -490,7 +503,9 @@ impl GlTargets {
     }
 
     /// Composites video + UI into the shared image as PQ / BT.2020.
-    pub fn composite(&mut self, gl: &glow::Context, video_hdr: bool, sdr_white_nits: f32, output_pq: bool) {
+    /// `blur`: frosted glass under these panels, blurred again from the
+    /// video first when `refresh`.
+    pub fn composite(&mut self, gl: &glow::Context, video_hdr: bool, sdr_white_nits: f32, output_pq: bool, blur: Option<(&mut crate::blur::Blur, &[crate::blur::BlurRect], bool)>) {
         use glow::HasContext;
         #[allow(unused_mut)]
         let (mut video_tex, mut video_hdr) = (self.video_tex, video_hdr);
@@ -499,6 +514,21 @@ impl GlTargets {
             s.lock_other(x.out_obj);
             video_tex = x.out_tex;
             video_hdr |= x.e.true_hdr;
+        }
+        let mut blur_tex = None;
+        let mut rects: &[crate::blur::BlurRect] = &[];
+        if let Some((b, r, refresh)) = blur {
+            if !r.is_empty() {
+                if refresh || !b.valid {
+                    if let Some(t) = std::num::NonZeroU32::new(video_tex).map(glow::NativeTexture) {
+                        if let Err(e) = b.update(gl, t, self.size.0, self.size.1) {
+                            crate::dbg_log(format!("blur: {e}"));
+                        }
+                    }
+                }
+                blur_tex = b.texture();
+                rects = r;
+            }
         }
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, std::num::NonZeroU32::new(self.shared_fbo).map(glow::NativeFramebuffer));
@@ -519,7 +549,14 @@ impl GlTargets {
             gl.uniform_1_i32(loc("u_video_hdr").as_ref(), video_hdr as i32);
             gl.uniform_1_f32(loc("u_sdr_white").as_ref(), sdr_white_nits);
             gl.uniform_1_i32(loc("u_output_pq").as_ref(), output_pq as i32);
+            gl.active_texture(glow::TEXTURE2);
+            gl.bind_texture(glow::TEXTURE_2D, blur_tex);
+            gl.uniform_1_i32(loc("u_blur").as_ref(), 2);
+            gl.uniform_1_i32(loc("u_has_blur").as_ref(), blur_tex.is_some() as i32);
+            crate::blur::set_rects(gl, self.program, rects);
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, None);
