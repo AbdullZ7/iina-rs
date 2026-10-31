@@ -259,8 +259,16 @@ impl Mpv {
     }
 
     pub fn set_option(&self, name: &str, value: &str) {
-        let (n, v) = (cstr(name), cstr(value));
-        let r = unsafe { (self.api.set_option_string)(self.handle, n.as_ptr(), v.as_ptr()) };
+        let set = |name: &str| {
+            let (n, v) = (cstr(name), cstr(value));
+            unsafe { (self.api.set_option_string)(self.handle, n.as_ptr(), v.as_ptr()) }
+        };
+        let mut r = set(name);
+        if r < 0 {
+            if let Some(old) = old_option_name(name) {
+                r = set(old);
+            }
+        }
         if r < 0 {
             eprintln!("mpv: option {name}={value}: {}", self.err(r));
         }
@@ -307,9 +315,17 @@ impl Mpv {
     }
 
     pub fn set_string(&self, name: &str, v: &str) {
-        let (n, s) = (cstr(name), cstr(v));
-        let mut p = s.as_ptr();
-        unsafe { (self.api.set_property)(self.handle, n.as_ptr(), FORMAT_STRING, &mut p as *mut _ as *mut c_void) };
+        let s = cstr(v);
+        let set = |name: &str| {
+            let n = cstr(name);
+            let mut p = s.as_ptr();
+            unsafe { (self.api.set_property)(self.handle, n.as_ptr(), FORMAT_STRING, &mut p as *mut _ as *mut c_void) }
+        };
+        if set(name) < 0 {
+            if let Some(old) = old_option_name(name) {
+                set(old);
+            }
+        }
     }
 
     pub fn get_string(&self, name: &str) -> Option<String> {
@@ -523,5 +539,15 @@ impl Drop for Mpv {
     fn drop(&mut self) {
         self.free_render_context();
         unsafe { (self.api.terminate_destroy)(self.handle) };
+    }
+}
+
+/// The name an option had before mpv 0.38 (Ubuntu 24.04 and Debian 12
+/// still ship 0.37 and 0.35): the subtitle "border" became "outline".
+fn old_option_name(name: &str) -> Option<&'static str> {
+    match name {
+        "sub-outline-color" => Some("sub-border-color"),
+        "sub-outline-size" => Some("sub-border-size"),
+        _ => None,
     }
 }

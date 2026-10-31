@@ -284,6 +284,7 @@ const AR: &[(&str, &str)] = &[
     ("RTX Video HDR is active now", "يعمل RTX Video HDR الآن"),
     ("Takes effect after a restart", "يسري بعد إعادة التشغيل"),
     ("Close", "أغلق"),
+    ("An independent project, not affiliated with the IINA team.", "مشروع مستقل، لا يتبع فريق IINA."),
     ("Maximize", "كبِّر"),
     ("Minimize", "صغِّر"),
     ("Restore", "استعِد"),

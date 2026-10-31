@@ -8,6 +8,8 @@
 
 مشغّل وسائط لـ **ويندوز** و**لينكس** و**ماك** بروح [IINA](https://github.com/iina/iina)، مكتوب بـ **Rust** ومبني على **libmpv** ([mpv.io](https://mpv.io))، مع ميزات مأخوذة من PotPlayer.
 
+> مشروع مستقل وغير رسمي، لا يتبع فريق IINA ولا يمثّله. لمشكلات IINA-RS افتح بلاغاً [هنا](https://github.com/AbdullZ7/iina-rs/issues)، لا في مستودع IINA. على ماك، IINA الأصلي هو الخيار الأول.
+
 [التنزيل من صفحة الإصدارات](https://github.com/AbdullZ7/iina-rs/releases/latest)
 
 ### لماذا إعادة كتابة وليس تحويلاً؟
@@ -123,6 +125,8 @@ GPL-3.0-or-later مثل IINA. ملفات الاختصارات وأيقونة ا�
 ## English
 
 A media player for **Windows**, **Linux** and **macOS** in the spirit of [IINA](https://github.com/iina/iina), written in **Rust** on top of **libmpv** ([mpv.io](https://mpv.io)), with a few favourites borrowed from PotPlayer.
+
+> An independent, unofficial project, not affiliated with or endorsed by the IINA team. Report IINA-RS problems [here](https://github.com/AbdullZ7/iina-rs/issues), not in IINA's repository. On macOS, the original IINA comes first.
 
 [Download from the releases page](https://github.com/AbdullZ7/iina-rs/releases/latest)
 

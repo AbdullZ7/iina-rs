@@ -100,6 +100,27 @@ struct Gfx {
     vk: Option<VkMode>,
     /// Frosted glass under the HUD panels (None if its shaders failed).
     blur: Option<blur::Blur>,
+    /// The size the GL surface or HDR targets were last made for.
+    target_size: PhysicalSize<u32>,
+}
+
+/// Resizes the GL surface or the HDR presenter and targets to `size`.
+/// Returns true if the video must be rendered again.
+fn resize_targets(gfx: &mut Gfx, size: PhysicalSize<u32>) -> bool {
+    if size.width == 0 || size.height == 0 {
+        return false;
+    }
+    gfx.target_size = size;
+    if let Some(vk) = gfx.vk.as_mut() {
+        let gl = gfx.egui.painter.gl().clone();
+        match vk.presenter.resize(size.width, size.height).and_then(|_| vk.targets.recreate(&gl, &vk.presenter)) {
+            Ok(()) => return true,
+            Err(e) => dbg_log(format!("HDR output resize: {e}")),
+        }
+    } else if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
+        gfx.surface.resize(&gfx.context, w, h);
+    }
+    false
 }
 
 /// Windows and Linux: no system title bar; IINA-RS draws its own, which
@@ -184,6 +205,9 @@ struct App {
     gl_video: Option<(u32, u32, i32, i32)>,
     /// A new video frame since the HUD's blurred copy was made.
     blur_stale: bool,
+    /// macOS: the title bar buttons' current opacity.
+    #[cfg(target_os = "macos")]
+    mac_buttons_alpha: f32,
     /// The offscreen copy works on this GPU / window (else draw directly).
     gl_video_ok: bool,
     /// GPU and OpenGL version (Logs window, error messages).
@@ -391,6 +415,8 @@ impl App {
             video_pending: false,
             gl_video: None,
             blur_stale: true,
+            #[cfg(target_os = "macos")]
+            mac_buttons_alpha: 1.0,
             gl_video_ok: true,
             gl_info: String::new(),
             sub_margin_cur: None,
@@ -465,7 +491,14 @@ impl App {
             use winit::platform::windows::WindowAttributesExtWindows;
             attrs.with_undecorated_shadow(true)
         };
-        self.ui.custom_frame = CUSTOM_FRAME;
+        // macOS: IINA's transparent title bar over the video; its buttons
+        // fade with the controller (mac_title_buttons).
+        #[cfg(target_os = "macos")]
+        let attrs = {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs.with_titlebar_transparent(true).with_fullsize_content_view(true).with_title_hidden(true)
+        };
+        self.ui.custom_frame = true;
         #[cfg(windows)]
         {
             self.ui.rtx.nvidia = dx_present::has_nvidia_gpu();
@@ -539,7 +572,8 @@ impl App {
             }
         }
         let blur = new_blur(egui.painter.gl());
-        self.gfx = Some(Gfx { window, surface, context, egui, vk: None, blur });
+        let target_size = window.inner_size();
+        self.gfx = Some(Gfx { window, surface, context, egui, vk: None, blur, target_size });
         self.after_window_created();
     }
 
@@ -720,12 +754,14 @@ impl App {
         let window = Arc::new(window);
         window.set_visible(true);
         let blur = new_blur(egui.painter.gl());
+        let target_size = window.inner_size();
         Ok(Gfx {
             window,
             surface,
             context,
             egui,
             blur,
+            target_size,
             vk: Some(VkMode { _helper: helper, presenter, targets, display: display_info, video_hdr: None, video_is_hdr: false, video_target: None }),
         })
     }
@@ -2006,6 +2042,10 @@ impl App {
         if size.width == 0 || size.height == 0 {
             return;
         }
+        // Sizes IINA-RS requests can apply without a Resized event (Wayland).
+        if size != gfx.target_size && resize_targets(gfx, size) {
+            self.video_valid = None;
+        }
         let t0 = Instant::now();
         // Only render the video when mpv has a new frame (or the target
         // changed); UI-only redraws (hovering, the controller) reuse the
@@ -2151,6 +2191,11 @@ impl App {
             cmds = ui::draw(ctx, ui_state, player, mpv, guard.as_deref(), history);
         });
         drop(guard);
+        #[cfg(target_os = "macos")]
+        if (self.ui.title_alpha - self.mac_buttons_alpha).abs() > 0.01 {
+            self.mac_buttons_alpha = self.ui.title_alpha;
+            mac_title_buttons(&window, self.ui.title_alpha);
+        }
         let ppp = gfx.egui.egui_ctx.pixels_per_point();
         let glass: Vec<blur::BlurRect> = self
             .ui
@@ -2210,6 +2255,9 @@ impl App {
                 let (w, h) = vk.targets.size();
                 save_snapshot_ex(gl, PhysicalSize::new(w as u32, h as u32), path, false);
             } else {
+                // The window's own framebuffer (a pass may have left another bound).
+                use glow::HasContext;
+                unsafe { gfx.egui.painter.gl().bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
                 save_snapshot(gfx.egui.painter.gl(), size, path);
             }
             if std::env::var_os("IINA_RS_FRAME_TIMES").is_some() {
@@ -3230,15 +3278,8 @@ impl ApplicationHandler<UserEvent> for App {
                 // Handled in about_to_wait (gfx is borrowed here).
                 self.minimized_state = Some(size.width == 0 || size.height == 0 || gfx.window.is_minimized() == Some(true));
                 dbg_log(format!("Resized {}x{} win_fs={} mpv_fs={}", size.width, size.height, gfx.window.fullscreen().is_some(), self.player.fullscreen));
-                if let Some(vk) = gfx.vk.as_mut() {
-                    if size.width > 0 && size.height > 0 {
-                        let gl = gfx.egui.painter.gl().clone();
-                        if let Err(e) = vk.presenter.resize(size.width, size.height).and_then(|_| vk.targets.recreate(&gl, &vk.presenter)).inspect(|_| self.video_valid = None) {
-                            dbg_log(format!("HDR output resize: {e}"));
-                        }
-                    }
-                } else if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
-                    gfx.surface.resize(&gfx.context, w, h);
+                if resize_targets(gfx, size) {
+                    self.video_valid = None;
                 }
                 // Keep mpv's fullscreen flag in sync if the OS changed it
                 // (only meaningful where winit's own fullscreen is used).
@@ -3535,6 +3576,24 @@ fn aspect_name(raw: &str) -> String {
 
 /// The PiP window edge under `cursor` (borderless windows have no system
 /// resize frame, so the edges are handled by hand).
+/// macOS: shows the title bar's close/minimize/zoom buttons at `alpha`.
+#[cfg(target_os = "macos")]
+fn mac_title_buttons(window: &Window, alpha: f32) {
+    use objc2_app_kit::{NSView, NSWindowButton};
+    use winit::raw_window_handle::RawWindowHandle;
+    let Ok(h) = window.window_handle() else { return };
+    let RawWindowHandle::AppKit(h) = h.as_raw() else { return };
+    // SAFETY: winit's content view, alive as long as the window; called on
+    // the main thread (the event loop).
+    let view: &NSView = unsafe { h.ns_view.cast().as_ref() };
+    let Some(win) = view.window() else { return };
+    for b in [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton] {
+        if let Some(button) = win.standardWindowButton(b) {
+            button.setAlphaValue(alpha as f64);
+        }
+    }
+}
+
 /// The window is resized from its edges by IINA-RS (no system frame).
 fn borderless_edges(pip: bool, fullscreen: bool, w: &Window) -> bool {
     pip || (CUSTOM_FRAME && !fullscreen && w.fullscreen().is_none() && !w.is_maximized())
@@ -3561,3 +3620,4 @@ fn pip_edge_at(enabled: bool, window: &Window, cursor: PhysicalPosition<f64>) ->
         _ => return None,
     })
 }
+

@@ -129,6 +129,8 @@ pub struct UiState {
     /// The window has no system frame: IINA-RS draws the title bar.
     pub custom_frame: bool,
     pub maximized: bool,
+    /// The title bar's opacity this frame (macOS fades its buttons with it).
+    pub title_alpha: f32,
     thumb_path: String,
     thumb_tex: HashMap<usize, egui::TextureHandle>,
 }
@@ -186,6 +188,7 @@ impl UiState {
             glass: Vec::new(),
             custom_frame: false,
             maximized: false,
+            title_alpha: 1.0,
             thumb_path: String::new(),
             thumb_tex: HashMap::new(),
         }
@@ -221,8 +224,11 @@ impl UiState {
 const HUD_BG: Color32 = Color32::from_rgba_premultiplied(24, 24, 26, 225);
 /// Over blurred video (IINA's dark HUD material): a lighter tint.
 const HUD_GLASS: Color32 = Color32::from_rgba_premultiplied(22, 22, 24, 115);
-/// Height of IINA-RS's own title bar (windows without the system frame).
-pub const WINDOW_BAR_H: f32 = 32.0;
+/// Glass for panels full of text (sidebar, menus): a denser tint.
+const PANEL_GLASS: Color32 = Color32::from_rgba_premultiplied(24, 24, 26, 185);
+/// Height of the title bar drawn over the video (macOS: the system's,
+/// transparent, as in IINA).
+pub const WINDOW_BAR_H: f32 = if cfg!(target_os = "macos") { 28.0 } else { 32.0 };
 
 impl UiState {
     /// The fill of a HUD panel: tinted glass over blurred video, else opaque.
@@ -846,6 +852,7 @@ pub fn draw(ctx: &egui::Context, ui_state: &mut UiState, pl: &Player, mpv: &Mpv,
     let now = Instant::now();
     let hide_after = Duration::from_secs_f32(ui_state.settings.osc_hide_secs.max(0.5));
     ui_state.glass.clear();
+    ui_state.title_alpha = if ui_state.window_bar() { 0.0 } else { 1.0 };
 
     if pl.idle && !ui_state.pip {
         welcome(ctx, ui_state, &mut cmds);
@@ -1139,16 +1146,22 @@ fn window_bar(ctx: &egui::Context, st: &mut UiState, pl: &Player, alpha: f32, cm
     let maximized = st.maximized;
     let rtl = is_rtl();
     let title = if pl.idle { "IINA-RS".to_string() } else { v(&pl.title) };
+    st.title_alpha = alpha;
+    // macOS: the system's buttons, moving and zooming stay (transparent
+    // title bar); only the title and the glass are drawn here.
+    let mac = cfg!(target_os = "macos");
     egui::Area::new(egui::Id::new("window-bar"))
         .fixed_pos(rect.min)
         .order(egui::Order::Foreground)
+        .interactable(!mac)
         .show(ctx, |ui| {
             ui.multiply_opacity(alpha);
-            let bar = ui.allocate_rect(rect, Sense::click_and_drag());
+            let bar = ui.allocate_rect(rect, if mac { Sense::hover() } else { Sense::click_and_drag() });
             ui.painter().rect_filled(rect, 0.0, fill);
             ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0_f32, Color32::from_white_alpha(14)));
             const BW: f32 = 46.0;
-            for (i, kind) in [WinButton::Close, WinButton::Maximize, WinButton::Minimize].into_iter().enumerate() {
+            let buttons: &[WinButton] = if mac { &[] } else { &[WinButton::Close, WinButton::Maximize, WinButton::Minimize] };
+            for (i, &kind) in buttons.iter().enumerate() {
                 let x = if rtl { rect.left() + i as f32 * BW } else { rect.right() - (i + 1) as f32 * BW };
                 let r = Rect::from_min_size(pos2(x, rect.top()), vec2(BW, WINDOW_BAR_H));
                 let b = ui.interact(r, egui::Id::new(("window-button", i)), Sense::click());
@@ -1509,10 +1522,15 @@ pub fn apply_audio_eq(mpv: &Mpv, gains: &[f32; 10]) {
 
 fn sidebar(ctx: &egui::Context, st: &mut UiState, tab: Tab, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
     let panel = if is_rtl() { egui::SidePanel::left("sidebar") } else { egui::SidePanel::right("sidebar") };
-    panel
+    let panel = panel
         .exact_width(340.0)
         .resizable(false)
-        .frame(egui::Frame::new().fill(Color32::from_rgba_premultiplied(26, 26, 28, 245)).inner_margin(egui::Margin { top: if st.window_bar() { 12 + WINDOW_BAR_H as i8 } else { 12 }, ..egui::Margin::same(12) }))
+        .frame(
+            egui::Frame::new()
+                .fill(if st.blur_ok { PANEL_GLASS } else { Color32::from_rgba_premultiplied(26, 26, 28, 245) })
+                .inner_margin(egui::Margin { top: if st.window_bar() { 12 + WINDOW_BAR_H as i8 } else { 12 }, ..egui::Margin::same(12) }),
+        );
+    let shown = panel
         .show(ctx, |ui| rtl_body(ui, |ui| {
             row(ui, |ui| {
                 let tabs: &[(Tab, &str)] = if matches!(tab, Tab::Playlist | Tab::Chapters) {
@@ -1579,6 +1597,7 @@ fn sidebar(ctx: &egui::Context, st: &mut UiState, tab: Tab, pl: &Player, mpv: &M
                 }
             });
         }));
+    st.glass(shown.response.rect, 0.0, 1.0);
 }
 
 fn playlist_tab(ui: &mut Ui, pl: &Player, mpv: &Mpv, cmds: &mut Vec<String>) {
@@ -1781,12 +1800,14 @@ fn context_menu(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut V
     let menu_id = egui::Id::new("ctx-menu");
     let est_h = ctx.memory(|m| m.area_rect(menu_id)).map(|r| r.height()).unwrap_or(row_h * 25.0 + 60.0).min(screen.height() - 8.0);
     let y = if pos.y + est_h > screen.bottom() { (screen.bottom() - est_h - 4.0).max(screen.top() + 4.0) } else { pos.y };
+    // Frosted like the controller (IINA's menus are vibrant too).
+    let menu_fill = if st.blur_ok { PANEL_GLASS } else { ctx.style().visuals.window_fill };
     let resp = egui::Area::new(menu_id)
         .fixed_pos(pos2(x, y))
         .order(egui::Order::Foreground)
         .constrain(true)
         .show(ctx, |ui| {
-            egui::Frame::menu(ui.style()).show(ui, |ui| {
+            egui::Frame::menu(ui.style()).fill(menu_fill).show(ui, |ui| {
                 ui.set_width(width - 12.0);
                 ui.spacing_mut().interact_size.y = row_h;
                 ui.spacing_mut().item_spacing.y = if row_h < 21.0 { 1.0 } else { 2.0 };
@@ -1839,6 +1860,7 @@ fn context_menu(ctx: &egui::Context, st: &mut UiState, pl: &Player, cmds: &mut V
             });
         })
         .response;
+    st.glass(resp.rect, ctx.style().visuals.menu_corner_radius.nw as f32, 1.0);
     let clicked_elsewhere = ctx.input(|i| i.pointer.any_pressed()) && !resp.contains_pointer() && !ctx.input(|i| i.pointer.secondary_pressed());
     if !cmds.is_empty() || clicked_elsewhere || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         st.context_menu = None;
@@ -2472,6 +2494,7 @@ fn about(ctx: &egui::Context, st: &mut UiState, cmds: &mut Vec<String>) {
                 ui.add_space(6.0);
                 ui.label(t("A Windows & Linux media player in the spirit of IINA,"));
                 ui.label(t("written in Rust and powered by mpv (mpv.io)."));
+                ui.label(RichText::new(t("An independent project, not affiliated with the IINA team.")).size(11.0).color(FG_DIM));
                 if is_rtl() {
                     ui.label(RichText::new(t("Arabic translation follows Arabeyes conventions.")).size(11.0).color(FG_DIM));
                 }

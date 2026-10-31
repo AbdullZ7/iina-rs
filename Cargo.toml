@@ -37,6 +37,11 @@ softbuffer = "0.4.8"
 [target.'cfg(not(windows))'.dependencies]
 souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The title bar's buttons fade with the controller (IINA).
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "NSButton", "NSControl", "NSResponder", "NSView", "NSWindow"] }
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
 windows-sys = { version = "0.60", features = ["Win32_UI_Shell"] }
